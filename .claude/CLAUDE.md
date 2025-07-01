@@ -155,6 +155,73 @@ retro-decode --input file.g00 --output ./result/ --step-by-step --verbose
 - [ ] カスタム画像処理
 - [ ] バッチ処理モード
 
+## 葉鍵ベンチ（パフォーマンス比較システム）
+
+### 概要
+RetroDecode独自のベンチマークシステム。異なる技術手法・制約条件での処理速度を比較し、アルゴリズムの教育的理解を深める。
+
+### Python関連オプション
+```bash
+--numpy          # NumPy使用（デフォルト）
+--no-numpy       # 純Python（リスト・ループのみ）
+--numba          # Numba JIT最適化
+--cupy           # GPU加速NumPy互換
+```
+
+### JavaScript/TypeScript関連オプション
+```bash
+--typed-arrays   # Uint8Array使用（デフォルト）
+--no-typed-arrays # 通常のArray使用
+--wasm           # WebAssembly版を呼び出し
+--worker-threads # Node.js Worker threads使用
+```
+
+### Rust関連オプション
+```bash
+--unsafe         # unsafeポインタ最適化
+--safe-only      # safe Rustのみ（境界チェック有）
+--simd           # SIMD命令使用
+--single-thread  # シングルスレッド強制
+```
+
+### アルゴリズム制約オプション
+```bash
+--no-bulk-io     # 1バイト読み込み強制
+--no-bitwise     # ビット演算禁止（除算・剰余使用）
+--naive-ring     # リングバッファ最適化なし
+--recursive      # 再帰実装（スタック負荷テスト）
+```
+
+### メモリ制約オプション
+```bash
+--memory-limit <MB>  # 使用メモリ上限
+--no-cache           # キャッシュ無効化
+--streaming          # ストリーミング処理強制
+```
+
+### ベンチマーク例
+```bash
+# 基本比較: 最速 vs 最遅
+retro-decode --input file.lf2 --lang rust --unsafe --simd
+retro-decode --input file.lf2 --lang python --no-numpy --recursive
+
+# 言語間パフォーマンス比較
+retro-decode --input file.pdt --lang rust --benchmark
+retro-decode --input file.pdt --lang python --numpy --benchmark
+retro-decode --input file.pdt --lang typescript --typed-arrays --benchmark
+
+# 制約条件での教育的比較
+retro-decode --input archive.pak --no-bulk-io --no-bitwise  # 古典手法
+retro-decode --input archive.pak --memory-limit 64         # 制限環境
+```
+
+### 葉鍵ベンチ結果出力
+- 処理時間詳細（パース・デコード・書き込み別）
+- メモリ使用量推移
+- CPU使用率
+- 最適化手法の効果測定
+- 教育的洞察とレコメンデーション
+
 ## 開発ノート
 
 ### パフォーマンス考慮事項
