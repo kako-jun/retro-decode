@@ -224,7 +224,10 @@ impl PakArchive {
     pub fn extract_with_steps(&mut self, output_dir: &Path, state: &mut DecodingState, config: &DecodeConfig) -> Result<()> {
         state.total_pixels = self.entries.len(); // Use file count as "pixels"
         
-        for (i, entry) in self.entries.iter().enumerate() {
+        // Collect entries to avoid borrow checker issues
+        let entries: Vec<_> = self.entries.iter().cloned().collect();
+        
+        for (i, entry) in entries.iter().enumerate() {
             if config.step_by_step {
                 let step = DecodeStep {
                     step_number: i + 1,

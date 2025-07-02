@@ -85,6 +85,10 @@ logs/
 # Test files
 /test-data/
 /test-output/
+/test_output/
+test_output/
+*_output/
+*_extracted/
 
 # Benchmark results
 /benches/results/

@@ -121,6 +121,8 @@ pub fn process_rust(
         gpu: config.gpu,
         step_by_step: config.step_by_step,
         verbose: config.verbose,
+        benchmark: false, // TODO: Add to main Config
+        no_output: false, // TODO: Add to main Config
     };
 
     match format_type {

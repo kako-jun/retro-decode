@@ -18,7 +18,22 @@ pub mod bridge;
 #[cfg_attr(docsrs, doc(cfg(feature = "gui")))]
 pub mod gui;
 
+use std::path::PathBuf;
+
 pub use formats::{FormatType, DecodeStep, DecodingState};
+
+/// Configuration for the CLI application
+#[derive(Debug)]
+pub struct Config {
+    pub input: Option<PathBuf>,
+    pub output: PathBuf,
+    pub language: String,
+    pub parallel: bool,
+    pub gpu: bool,
+    pub step_by_step: bool,
+    pub verbose: bool,
+    pub gui: bool,
+}
 
 /// Re-export commonly used types
 pub mod prelude {
@@ -34,6 +49,8 @@ pub struct DecodeConfig {
     pub gpu: bool,
     pub step_by_step: bool,
     pub verbose: bool,
+    pub benchmark: bool,
+    pub no_output: bool,
 }
 
 impl Default for DecodeConfig {
@@ -43,6 +60,8 @@ impl Default for DecodeConfig {
             gpu: false,
             step_by_step: false,
             verbose: false,
+            benchmark: false,
+            no_output: false,
         }
     }
 }

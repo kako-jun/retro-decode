@@ -26,7 +26,7 @@ pub fn decode_pdt(
     
     let output_file = output_path.join(
         input_path.file_stem().unwrap_or_default()
-    ).with_extension("png");
+    ).with_extension("bmp");
     
     if config.step_by_step {
         let mut state = DecodingState::new();
@@ -59,7 +59,7 @@ pub fn decode_g00(
     
     let output_file = output_path.join(
         input_path.file_stem().unwrap_or_default()
-    ).with_extension("png");
+    ).with_extension("bmp");
     
     if config.step_by_step {
         let mut state = DecodingState::new();

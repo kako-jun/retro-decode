@@ -2,10 +2,8 @@
 //! Based on lf2dec.c analysis - LEAF256 with LZSS compression
 
 use std::path::Path;
-use std::io::{Read, Cursor};
-use std::fs::File;
 use anyhow::{Result, anyhow};
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::{DecodeConfig, DecodingState, DecodeStep};
 
@@ -94,9 +92,10 @@ impl Lf2Image {
         let total_pixels = (width as usize) * (height as usize);
         let mut pixels = vec![0u8; total_pixels];
         
-        // Ring buffer for LZSS decompression (4KB = 0x1000)
-        let mut ring = [0u8; 0x1000];
-        let mut ring_pos = 0x0fee; // Initial position as per original
+        // Ring buffer for LZSS decompression (4KB = 0x1000)  
+        // Initialize ring buffer to match original C implementation exactly
+        let mut ring = [0x20u8; 0x1000]; // Fill with spaces (0x20) as per original
+        let mut ring_pos = 0x0fee; // Initial position: 4078 (0x0fee)
         
         let mut data_pos = 0;
         let mut pixel_idx = 0;
@@ -150,19 +149,21 @@ impl Lf2Image {
                 let length = ((upper & 0x0f) as usize) + 3;
                 let position = (((upper >> 4) as usize) + ((lower as usize) << 4)) & 0x0fff;
                 
-                // Copy from ring buffer
+                // Copy from ring buffer - match C implementation exactly
+                let mut copy_pos = position;
                 for _ in 0..length {
                     if pixel_idx >= total_pixels {
                         break;
                     }
                     
-                    let pixel = ring[position];
+                    let pixel = ring[copy_pos];
                     
                     // Update ring buffer
                     ring[ring_pos] = pixel;
                     ring_pos = (ring_pos + 1) & 0x0fff;
+                    copy_pos = (copy_pos + 1) & 0x0fff;
                     
-                    // Store in output (with Y-flip)
+                    // Store in output (with Y-flip matching C implementation)
                     let x = pixel_idx % (width as usize);
                     let y = pixel_idx / (width as usize);
                     let flipped_y = (height as usize) - 1 - y;
@@ -191,7 +192,7 @@ impl Lf2Image {
         state.total_pixels = total_pixels;
         state.ring_buffer = vec![0u8; 0x1000];
         
-        let mut ring = [0u8; 0x1000];
+        let mut ring = [0x20u8; 0x1000]; // Initialize with spaces like original C
         let mut ring_pos = 0x0fee;
         
         let mut data_pos = 0;
@@ -316,26 +317,155 @@ impl Lf2Image {
         Ok(pixels)
     }
     
-    /// Convert to RGB image and save as PNG
-    pub fn decode(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
-        let mut rgb_data = Vec::with_capacity(self.pixels.len() * 3);
+    /// Save in multiple formats based on extension
+    pub fn decode(&self, output_path: &Path, config: &DecodeConfig) -> Result<()> {
+        // Skip file output for benchmark mode
+        if config.no_output {
+            return Ok(());
+        }
         
-        // Convert palette indices to RGB
-        for &pixel in &self.pixels {
-            if pixel == self.transparent_color {
-                // Transparent pixel (black with alpha)
-                rgb_data.extend_from_slice(&[0, 0, 0]);
-            } else if (pixel as usize) < self.palette.len() {
-                let color = self.palette[pixel as usize];
-                rgb_data.extend_from_slice(&[color.r, color.g, color.b]);
+        let extension = output_path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("bmp")
+            .to_lowercase();
+            
+        match extension.as_str() {
+            "png" => self.save_as_png(output_path, config),
+            "raw" => self.save_as_raw_rgb(output_path, config),
+            "rgba" => self.save_as_raw_rgba(output_path, config),
+            _ => self.save_as_bmp_8bit(output_path, config),
+        }
+    }
+    
+    /// Save as authentic 8-bit BMP with palette (fastest, no transparency)
+    pub fn save_as_bmp_8bit(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+        
+        let width = self.width as u32;
+        let height = self.height as u32;
+        
+        // Calculate BMP dimensions with proper padding
+        let row_size = ((width + 3) / 4) * 4; // Align to 4 bytes
+        let pixel_data_size = row_size * height;
+        let palette_entries = self.palette.len().max(256); // Always use 256 for compatibility
+        let palette_size = palette_entries * 4; // 4 bytes per color (BGRA)
+        let file_size = 54 + palette_size + pixel_data_size as usize; // Standard header + palette + data
+        
+        let mut file = File::create(output_path)?;
+        
+        // BMP file header (14 bytes)
+        file.write_all(b"BM")?;                    // Signature
+        file.write_all(&(file_size as u32).to_le_bytes())?;     // File size
+        file.write_all(&0u32.to_le_bytes())?;     // Reserved
+        file.write_all(&(54 + palette_size as u32).to_le_bytes())?; // Offset to pixel data
+        
+        // DIB header (40 bytes) - Standard BITMAPINFOHEADER
+        file.write_all(&40u32.to_le_bytes())?;    // Header size
+        file.write_all(&(width as i32).to_le_bytes())?;         // Width
+        file.write_all(&(height as i32).to_le_bytes())?;        // Height
+        file.write_all(&1u16.to_le_bytes())?;     // Planes
+        file.write_all(&8u16.to_le_bytes())?;     // Bits per pixel (8-bit indexed)
+        file.write_all(&0u32.to_le_bytes())?;     // Compression (none)
+        file.write_all(&(pixel_data_size as u32).to_le_bytes())?; // Image size
+        file.write_all(&2835u32.to_le_bytes())?;  // X pixels per meter (72 DPI)
+        file.write_all(&2835u32.to_le_bytes())?;  // Y pixels per meter (72 DPI)
+        file.write_all(&(palette_entries as u32).to_le_bytes())?; // Colors used
+        file.write_all(&0u32.to_le_bytes())?;     // Important colors (0 = all)
+        
+        // Color palette (256 entries × 4 bytes BGRA)
+        for i in 0..palette_entries {
+            if i < self.palette.len() {
+                let color = self.palette[i];
+                file.write_all(&[color.b, color.g, color.r, 0])?; // BGRA format
             } else {
-                // Invalid palette index (black)
-                rgb_data.extend_from_slice(&[0, 0, 0]);
+                file.write_all(&[0, 0, 0, 0])?; // Black for unused entries
             }
         }
         
-        // Use image crate to save as PNG
-        let img = image::RgbImage::from_raw(self.width as u32, self.height as u32, rgb_data)
+        // Pixel data (bottom-up scan order with row padding)
+        for y in (0..height).rev() {
+            for x in 0..width {
+                let idx = (y * width + x) as usize;
+                let pixel = if idx < self.pixels.len() { 
+                    self.pixels[idx] 
+                } else { 
+                    0 
+                };
+                file.write_all(&[pixel])?;
+            }
+            
+            // Pad row to 4-byte boundary
+            for _ in width..row_size {
+                file.write_all(&[0])?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Save as raw RGB (fastest, no header, no transparency)
+    pub fn save_as_raw_rgb(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+        
+        let mut file = File::create(output_path)?;
+        
+        for &pixel_index in &self.pixels {
+            let color = if (pixel_index as usize) < self.palette.len() {
+                self.palette[pixel_index as usize]
+            } else {
+                Rgb { r: 0, g: 0, b: 0 }
+            };
+            
+            // Handle transparency by using black for transparent pixels
+            if pixel_index == self.transparent_color {
+                file.write_all(&[0, 0, 0])?; // Black for transparent
+            } else {
+                file.write_all(&[color.r, color.g, color.b])?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Save as raw RGBA (fast, includes transparency) 
+    pub fn save_as_raw_rgba(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+        
+        let mut file = File::create(output_path)?;
+        
+        for &pixel_index in &self.pixels {
+            let color = if (pixel_index as usize) < self.palette.len() {
+                self.palette[pixel_index as usize]
+            } else {
+                Rgb { r: 0, g: 0, b: 0 }
+            };
+            
+            let alpha = if pixel_index == self.transparent_color { 0 } else { 255 };
+            file.write_all(&[color.r, color.g, color.b, alpha])?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Save as PNG with transparency (slowest due to compression)
+    pub fn save_as_png(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+        let mut rgba_data = Vec::with_capacity(self.pixels.len() * 4);
+        
+        for &pixel_index in &self.pixels {
+            let color = if (pixel_index as usize) < self.palette.len() {
+                self.palette[pixel_index as usize]
+            } else {
+                Rgb { r: 0, g: 0, b: 0 }
+            };
+            
+            let alpha = if pixel_index == self.transparent_color { 0 } else { 255 };
+            rgba_data.extend_from_slice(&[color.r, color.g, color.b, alpha]);
+        }
+        
+        let img = image::RgbaImage::from_raw(self.width as u32, self.height as u32, rgba_data)
             .ok_or_else(|| anyhow!("Failed to create image"))?;
         
         img.save(output_path)?;
