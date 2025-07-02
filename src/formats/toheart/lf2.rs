@@ -31,6 +31,249 @@ pub struct Lf2Image {
 }
 
 impl Lf2Image {
+    /// Create LF2Image from RGB data with quantization
+    pub fn from_rgb_image(
+        width: u16, 
+        height: u16, 
+        rgb_data: &[u8], 
+        max_colors: u8,
+        transparent_color: Option<u8>
+    ) -> Result<Self> {
+        if rgb_data.len() != (width as usize * height as usize * 3) {
+            return Err(anyhow!("RGB data size mismatch: expected {} bytes, got {}", 
+                width as usize * height as usize * 3, rgb_data.len()));
+        }
+        
+        // Create palette from RGB data using simple quantization
+        let (palette, pixels) = Self::quantize_image(rgb_data, width, height, max_colors)?;
+        
+        let transparent_color = transparent_color.unwrap_or(0);
+        
+        Ok(Self {
+            width,
+            height,
+            x_offset: 0,
+            y_offset: 0,
+            transparent_color,
+            color_count: palette.len() as u8,
+            palette,
+            pixels,
+        })
+    }
+    
+    /// Simple color quantization (median cut algorithm would be better)
+    fn quantize_image(rgb_data: &[u8], width: u16, height: u16, max_colors: u8) -> Result<(Vec<Rgb>, Vec<u8>)> {
+        use std::collections::HashMap;
+        
+        let total_pixels = (width as usize) * (height as usize);
+        let mut color_map: HashMap<(u8, u8, u8), usize> = HashMap::new();
+        let mut unique_colors = Vec::new();
+        
+        // Count unique colors
+        for i in 0..total_pixels {
+            let r = rgb_data[i * 3];
+            let g = rgb_data[i * 3 + 1];
+            let b = rgb_data[i * 3 + 2];
+            let color = (r, g, b);
+            
+            if !color_map.contains_key(&color) {
+                if unique_colors.len() >= max_colors as usize {
+                    break; // Simple truncation - could be improved
+                }
+                color_map.insert(color, unique_colors.len());
+                unique_colors.push(Rgb { r, g, b });
+            }
+        }
+        
+        // Create palette
+        let palette = unique_colors;
+        
+        // Map pixels to palette indices
+        let mut pixels = Vec::with_capacity(total_pixels);
+        for i in 0..total_pixels {
+            let r = rgb_data[i * 3];
+            let g = rgb_data[i * 3 + 1]; 
+            let b = rgb_data[i * 3 + 2];
+            let color = (r, g, b);
+            
+            // Find closest color in palette (simple exact match for now)
+            let index = color_map.get(&color)
+                .copied()
+                .unwrap_or_else(|| Self::find_closest_color(&palette, r, g, b));
+            
+            pixels.push(index as u8);
+        }
+        
+        Ok((palette, pixels))
+    }
+    
+    /// Find closest color in palette (simple Euclidean distance)
+    fn find_closest_color(palette: &[Rgb], r: u8, g: u8, b: u8) -> usize {
+        let mut min_distance = u32::MAX;
+        let mut closest_index = 0;
+        
+        for (i, color) in palette.iter().enumerate() {
+            let dr = (r as i32 - color.r as i32).abs() as u32;
+            let dg = (g as i32 - color.g as i32).abs() as u32;
+            let db = (b as i32 - color.b as i32).abs() as u32;
+            let distance = dr * dr + dg * dg + db * db;
+            
+            if distance < min_distance {
+                min_distance = distance;
+                closest_index = i;
+            }
+        }
+        
+        closest_index
+    }
+    
+    /// Save as LF2 format
+    pub fn save_as_lf2<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let lf2_data = self.to_lf2_bytes()?;
+        std::fs::write(path, lf2_data)?;
+        Ok(())
+    }
+    
+    /// Convert to LF2 binary format
+    pub fn to_lf2_bytes(&self) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        
+        // Magic number
+        data.extend_from_slice(LF2_MAGIC);
+        
+        // Header
+        data.extend_from_slice(&self.x_offset.to_le_bytes());
+        data.extend_from_slice(&self.y_offset.to_le_bytes());
+        data.extend_from_slice(&self.width.to_le_bytes());
+        data.extend_from_slice(&self.height.to_le_bytes());
+        
+        // Padding to 0x12
+        data.extend_from_slice(&[0; 2]);
+        
+        // Transparent color at 0x12
+        data.push(self.transparent_color);
+        
+        // Padding to 0x16  
+        data.extend_from_slice(&[0; 3]);
+        
+        // Color count at 0x16
+        data.push(self.color_count);
+        
+        // Padding to 0x18
+        data.push(0);
+        
+        // Palette (BGR format)
+        for color in &self.palette {
+            data.push(color.b); // Blue first (BGR order)
+            data.push(color.g); // Green
+            data.push(color.r); // Red
+        }
+        
+        // Compress pixel data using LZSS
+        let compressed_pixels = self.compress_lzss()?;
+        data.extend_from_slice(&compressed_pixels);
+        
+        Ok(data)
+    }
+    
+    /// LZSS compression (exact reverse of decompression)
+    fn compress_lzss(&self) -> Result<Vec<u8>> {
+        // Prepare pixel data with Y-flip to match decompression input order
+        let total_pixels = (self.width as usize) * (self.height as usize);
+        let mut input_pixels = vec![0u8; total_pixels];
+        
+        // Create the sequence that decompression would process
+        // This is the reverse of the Y-flip that happens during decompression
+        for pixel_idx in 0..total_pixels {
+            let x = pixel_idx % (self.width as usize);
+            let y = pixel_idx / (self.width as usize);
+            let flipped_y = (self.height as usize) - 1 - y;
+            let output_idx = flipped_y * (self.width as usize) + x;
+            
+            if output_idx < self.pixels.len() {
+                input_pixels[pixel_idx] = self.pixels[output_idx];
+            }
+        }
+        
+        let mut compressed = Vec::new();
+        let mut ring = [0x20u8; 0x1000]; // Initialize exactly like decompression
+        let mut ring_pos = 0x0fee; // Same initial position
+        
+        let mut pos = 0;
+        
+        while pos < input_pixels.len() {
+            // Process up to 8 pixels per flag byte
+            let mut flag_byte = 0u8;
+            let mut flag_bits_used = 0;
+            let flag_pos = compressed.len();
+            compressed.push(0); // Placeholder for flag byte
+            
+            while flag_bits_used < 8 && pos < input_pixels.len() {
+                let pixel = input_pixels[pos];
+                
+                // Try to find match in ring buffer (disabled for now for debugging)
+                let (_match_pos, match_len) = self.find_lzss_match(&ring, ring_pos, &input_pixels[pos..]);
+                
+                // Force all pixels as direct for now 
+                if false && match_len >= 3 {
+                    // Ring buffer reference - bit = 0 (don't set bit)
+                    // Implementation when needed
+                } else {
+                    // Direct pixel - set bit (1 = direct)
+                    flag_byte |= 1 << (7 - flag_bits_used);
+                    compressed.push(pixel ^ 0xff);
+                    
+                    // Update ring buffer exactly like decompression
+                    ring[ring_pos] = pixel;
+                    ring_pos = (ring_pos + 1) & 0x0fff;
+                    
+                    pos += 1;
+                }
+                
+                flag_bits_used += 1;
+            }
+            
+            // Store completed flag byte
+            compressed[flag_pos] = flag_byte ^ 0xff;
+        }
+        
+        Ok(compressed)
+    }
+    
+    /// Find the longest match in the ring buffer
+    fn find_lzss_match(&self, ring: &[u8; 0x1000], _ring_pos: usize, remaining: &[u8]) -> (usize, usize) {
+        let mut best_pos = 0;
+        let mut best_len = 0;
+        
+        if remaining.is_empty() {
+            return (0, 0);
+        }
+        
+        // Search ring buffer for matches
+        for start in 0..0x1000 {
+            let mut len = 0;
+            
+            // Max match length is 18 (15 + 3), limited by remaining data
+            let max_len = std::cmp::min(18, remaining.len());
+            
+            for i in 0..max_len {
+                let ring_idx = (start + i) & 0x0fff;
+                if ring[ring_idx] == remaining[i] {
+                    len += 1;
+                } else {
+                    break;
+                }
+            }
+            
+            if len > best_len && len >= 3 {
+                best_len = len;
+                best_pos = start;
+            }
+        }
+        
+        (best_pos, best_len)
+    }
+
     /// Open LF2 file with high-speed implementation
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let data = std::fs::read(path)?;
