@@ -2,25 +2,7 @@ use clap::{Arg, ArgAction, Command};
 use std::path::PathBuf;
 use tracing::{error, info};
 
-mod formats;
-mod bridge;
-
-#[cfg(feature = "gui")]
-mod gui;
-
-use crate::formats::FormatType;
-
-#[derive(Debug)]
-struct Config {
-    input: Option<PathBuf>,
-    output: PathBuf,
-    language: String,
-    parallel: bool,
-    gpu: bool,
-    step_by_step: bool,
-    verbose: bool,
-    gui: bool,
-}
+use retro_decode::{Config, formats::FormatType};
 
 fn main() {
     let matches = Command::new("retro-decode")
@@ -129,24 +111,25 @@ Examples:
         #[cfg(feature = "gui")]
         {
             info!("Launching GUI interface...");
-            if let Err(e) = gui::launch() {
+            if let Err(e) = retro_decode::gui::launch() {
                 error!("Failed to launch GUI: {}", e);
                 std::process::exit(1);
             }
+            return;
         }
         #[cfg(not(feature = "gui"))]
         {
             error!("GUI feature not enabled. Rebuild with --features gui");
             std::process::exit(1);
         }
-        return;
     }
 
     // If no input file specified, show help
-    let input_path = match config.input {
-        Some(path) => path,
+    let input_path = match &config.input {
+        Some(path) => path.clone(),
         None => {
-            println!("{}", matches.get_about().unwrap_or(""));
+            println!("RetroDecode - P⁴ (Pixel by pixel, past preserved)");
+            println!("Educational tool for analyzing retro game image formats");
             println!("\nRun with --help for detailed usage information.");
             return;
         }
@@ -182,15 +165,25 @@ fn run_cli(config: Config, input_path: PathBuf) -> anyhow::Result<()> {
     match config.language.as_str() {
         "rust" => {
             info!("Using Rust engine");
-            formats::process_rust(&input_path, &config.output, format_type, &config)?;
+            retro_decode::formats::process_rust(&input_path, &config.output, format_type, &config)?;
         }
         "python" => {
-            info!("Using Python bridge");
-            bridge::python::process(&input_path, &config.output, format_type, &config)?;
+            #[cfg(feature = "python-bridge")]
+            {
+                info!("Using Python bridge");
+                let bridge_config = retro_decode::bridge::BridgeConfig::from(&config);
+                retro_decode::bridge::python::process(&input_path, &config.output, format_type, &bridge_config)?;
+            }
+            #[cfg(not(feature = "python-bridge"))]
+            {
+                error!("Python bridge feature not enabled. Rebuild with --features python-bridge");
+                std::process::exit(1);
+            }
         }
         "typescript" => {
             info!("Using TypeScript bridge");
-            bridge::typescript::process(&input_path, &config.output, format_type, &config)?;
+            let bridge_config = retro_decode::bridge::BridgeConfig::from(&config);
+            retro_decode::bridge::typescript::process(&input_path, &config.output, format_type, &bridge_config)?;
         }
         _ => unreachable!("Invalid language - should be caught by clap"),
     }

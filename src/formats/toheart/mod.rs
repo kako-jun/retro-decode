@@ -24,7 +24,7 @@ pub fn extract_pak(
 ) -> Result<()> {
     info!("Extracting PAK archive: {:?}", input_path);
     
-    let pak = PakArchive::open(input_path)?;
+    let mut pak = PakArchive::open(input_path)?;
     
     if config.step_by_step {
         let mut state = DecodingState::new();
@@ -55,7 +55,7 @@ pub fn decode_lf2(
     
     let output_file = output_path.join(
         input_path.file_stem().unwrap_or_default()
-    ).with_extension("png");
+    ).with_extension("bmp");
     
     if config.step_by_step {
         let mut state = DecodingState::new();
@@ -84,7 +84,7 @@ pub fn decode_scn(
     
     let output_file = output_path.join(
         input_path.file_stem().unwrap_or_default()
-    ).with_extension("png");
+    ).with_extension("bmp");
     
     if config.step_by_step {
         let mut state = DecodingState::new();

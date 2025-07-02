@@ -2,10 +2,8 @@
 //! Based on deco_pdt.c analysis - 24-bit RGB with LZSS compression
 
 use std::path::Path;
-use std::fs::File;
-use std::io::Read;
 use anyhow::{Result, anyhow};
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::{DecodeConfig, DecodingState, DecodeStep};
 
@@ -76,100 +74,77 @@ impl PdtImage {
         })
     }
     
-    /// High-speed RGB LZSS decompression based on deco_pdt.c
+    /// Simple RGB LZSS decompression
     fn decompress_rgb_lzss(compressed_data: &[u8], width: u32, height: u32) -> Result<Vec<RgbColor>> {
         let total_pixels = (width * height) as usize;
         let mut ring_buffer = [RgbColor::default(); 0x1000]; // 4KB ring buffer
         let mut ring_pos = 0usize;
-        let mut output_pos = 0usize;
+        let mut pixels = vec![RgbColor::default(); total_pixels];
+        let mut pixel_idx = 0;
         
         let mut data_pos = 0;
         let mut flag = 0u8;
         let mut flag_count = 0;
-        let mut line_count = 0usize;
         
-        // Output is processed line by line
-        let mut output_lines: Vec<Vec<RgbColor>> = vec![vec![RgbColor::default(); width as usize]; height as usize];
-        let mut current_line = 0;
-        
-        while current_line < height && data_pos < compressed_data.len() {
-            // Process one line
-            line_count = 0;
+        while pixel_idx < total_pixels && data_pos < compressed_data.len() {
+            // Read flag byte every 8 operations
+            if flag_count == 0 {
+                if data_pos >= compressed_data.len() {
+                    break;
+                }
+                flag = compressed_data[data_pos];
+                data_pos += 1;
+                flag_count = 8;
+            }
             
-            while line_count < width as usize && data_pos < compressed_data.len() {
-                // Read flag byte every 8 operations
-                if flag_count == 0 {
-                    if data_pos >= compressed_data.len() {
-                        break;
-                    }
-                    flag = compressed_data[data_pos];
-                    data_pos += 1;
-                    flag_count = 8;
+            if (flag & 0x80) != 0 {
+                // Direct RGB pixel (3 bytes) - BGR order in file
+                if data_pos + 2 >= compressed_data.len() {
+                    break;
                 }
                 
-                if (flag & 0x80) != 0 {
-                    // Direct RGB pixel (3 bytes)
-                    if data_pos + 2 >= compressed_data.len() {
+                let color = RgbColor {
+                    b: compressed_data[data_pos],
+                    g: compressed_data[data_pos + 1],
+                    r: compressed_data[data_pos + 2],
+                };
+                data_pos += 3;
+                
+                // Store in ring buffer and output
+                ring_buffer[ring_pos] = color;
+                ring_pos = (ring_pos + 1) & 0x0fff;
+                pixels[pixel_idx] = color;
+                pixel_idx += 1;
+            } else {
+                // Reference to ring buffer (2 bytes)
+                if data_pos + 1 >= compressed_data.len() {
+                    break;
+                }
+                
+                let word = u16::from_le_bytes([compressed_data[data_pos], compressed_data[data_pos + 1]]);
+                data_pos += 2;
+                
+                let copy_length = ((word & 0x0f) as usize) + 1;
+                let copy_position = ((word >> 4) as usize) & 0x0fff;
+                let mut back_pos = (ring_pos.wrapping_sub(copy_position).wrapping_sub(1)) & 0x0fff;
+                
+                // Copy from ring buffer
+                for _ in 0..copy_length {
+                    if pixel_idx >= total_pixels {
                         break;
                     }
                     
-                    let color = RgbColor {
-                        b: compressed_data[data_pos],
-                        g: compressed_data[data_pos + 1],
-                        r: compressed_data[data_pos + 2],
-                    };
-                    data_pos += 3;
-                    
-                    // Store in ring buffer
+                    let color = ring_buffer[back_pos];
                     ring_buffer[ring_pos] = color;
                     ring_pos = (ring_pos + 1) & 0x0fff;
-                    line_count += 1;
-                } else {
-                    // Reference to ring buffer (2 bytes)
-                    if data_pos + 1 >= compressed_data.len() {
-                        break;
-                    }
-                    
-                    let word = u16::from_le_bytes([compressed_data[data_pos], compressed_data[data_pos + 1]]);
-                    data_pos += 2;
-                    
-                    let copy_length = ((word & 0x0f) as usize) + 1;
-                    let copy_position = ((word >> 4) as usize) & 0x0fff;
-                    let back_offset = (ring_pos as isize - copy_position as isize - 1) & 0x0fff;
-                    
-                    // Copy from ring buffer
-                    for _ in 0..copy_length {
-                        if line_count >= width as usize {
-                            break;
-                        }
-                        
-                        let src_pos = (back_offset as usize + (line_count - output_pos)) & 0x0fff;
-                        let color = ring_buffer[src_pos];
-                        
-                        ring_buffer[ring_pos] = color;
-                        ring_pos = (ring_pos + 1) & 0x0fff;
-                        line_count += 1;
-                    }
+                    back_pos = (back_pos + 1) & 0x0fff;
+                    pixels[pixel_idx] = color;
+                    pixel_idx += 1;
                 }
-                
-                flag <<= 1;
-                flag_count -= 1;
             }
             
-            // Copy completed line from ring buffer to output
-            for x in 0..width as usize {
-                if output_pos < ring_buffer.len() {
-                    output_lines[current_line as usize][x] = ring_buffer[(output_pos + x) & 0x0fff];
-                }
-            }
-            output_pos = (output_pos + width as usize) & 0x0fff;
-            current_line += 1;
-        }
-        
-        // Flatten output lines
-        let mut pixels = Vec::with_capacity(total_pixels);
-        for line in output_lines {
-            pixels.extend(line);
+            flag <<= 1;
+            flag_count -= 1;
         }
         
         Ok(pixels)
@@ -242,8 +217,28 @@ impl PdtImage {
         Ok(pixels)
     }
     
-    /// Convert to RGBA and save as PNG
-    pub fn decode(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+    /// Save in multiple formats based on extension (like LF2)
+    pub fn decode(&self, output_path: &Path, config: &DecodeConfig) -> Result<()> {
+        // Skip file output for benchmark mode
+        if config.no_output {
+            return Ok(());
+        }
+        
+        let extension = output_path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("bmp")
+            .to_lowercase();
+            
+        match extension.as_str() {
+            "png" => self.save_as_png(output_path, config),
+            "raw" => self.save_as_raw_rgb(output_path, config),
+            "rgba" => self.save_as_raw_rgba(output_path, config),
+            _ => self.save_as_bmp_32bit(output_path, config),
+        }
+    }
+    
+    /// Save as 32-bit BGRA BMP (original format, includes transparency)
+    pub fn save_as_bmp_32bit(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
         let mut rgba_data = Vec::with_capacity(self.pixels.len() * 4);
         
         // Convert RGB + Alpha to RGBA
@@ -261,9 +256,62 @@ impl PdtImage {
             rgba_data.push(alpha);
         }
         
-        // Save as PNG
+        // Save as RGBA BMP
         let img = image::RgbaImage::from_raw(self.width, self.height, rgba_data)
             .ok_or_else(|| anyhow!("Failed to create RGBA image"))?;
+        
+        img.save(output_path)?;
+        Ok(())
+    }
+    
+    /// Save as raw RGB (fastest, no transparency)
+    pub fn save_as_raw_rgb(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+        
+        let mut file = File::create(output_path)?;
+        
+        for &pixel in &self.pixels {
+            file.write_all(&[pixel.r, pixel.g, pixel.b])?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Save as raw RGBA (fast, includes transparency) 
+    pub fn save_as_raw_rgba(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+        
+        let mut file = File::create(output_path)?;
+        
+        for (i, &pixel) in self.pixels.iter().enumerate() {
+            let alpha = if i < self.alpha_mask.len() {
+                self.alpha_mask[i]
+            } else {
+                255
+            };
+            file.write_all(&[pixel.r, pixel.g, pixel.b, alpha])?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Save as PNG with transparency (slowest due to compression)
+    pub fn save_as_png(&self, output_path: &Path, _config: &DecodeConfig) -> Result<()> {
+        let mut rgba_data = Vec::with_capacity(self.pixels.len() * 4);
+        
+        for (i, &pixel) in self.pixels.iter().enumerate() {
+            let alpha = if i < self.alpha_mask.len() {
+                self.alpha_mask[i]
+            } else {
+                255
+            };
+            rgba_data.extend_from_slice(&[pixel.r, pixel.g, pixel.b, alpha]);
+        }
+        
+        let img = image::RgbaImage::from_raw(self.width, self.height, rgba_data)
+            .ok_or_else(|| anyhow!("Failed to create image"))?;
         
         img.save(output_path)?;
         Ok(())
