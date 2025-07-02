@@ -83,6 +83,14 @@ all = ["gui", "gpu", "python-bridge"]
 name = "retro-decode"
 path = "src/main.rs"
 
+[[example]]
+name = "transparency_demo"
+path = "examples/transparency_demo.rs"
+
+[[example]]
+name = "generate_test_assets"
+path = "examples/generate_test_assets.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
