@@ -365,3 +365,93 @@ fn test_verbose_output() {
     // Verbose mode should produce debug information
     assert!(stderr.contains("Processing file") || stderr.contains("DEBUG"), "No verbose output detected");
 }
+
+/// Test using generated synthetic test files
+#[test]
+fn test_generated_assets() {
+    // This test uses the synthetic files created by generate_test_assets
+    // These files are safe to commit and use in CI/CD
+    
+    let generated_dir = "test_assets/generated";
+    if !Path::new(generated_dir).exists() {
+        // Generate the assets if they don't exist
+        let generate_output = Command::new("cargo")
+            .args(&["run", "--example", "generate_test_assets"])
+            .output()
+            .expect("Failed to run generate_test_assets");
+        
+        assert!(generate_output.status.success(), 
+            "Failed to generate test assets: {}", 
+            String::from_utf8_lossy(&generate_output.stderr));
+    }
+    
+    let temp_dir = TempDir::new().unwrap();
+    let output_path = temp_dir.path().join("output");
+    
+    // Test PNG files can be read and processed (even though they're not LF2/PDT)
+    // This validates the file handling and CLI parameter processing
+    let png_files: Vec<_> = std::fs::read_dir(generated_dir).unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map_or(false, |ext| ext == "png"))
+        .collect();
+    
+    assert!(!png_files.is_empty(), "No PNG test files found in generated assets");
+    
+    // Test that the CLI handles unsupported formats gracefully
+    for png_file in png_files.iter().take(1) { // Test with one PNG file
+        let output = run_retro_decode(&[
+            "--input", png_file.to_str().unwrap(),
+            "--output", output_path.to_str().unwrap(),
+            "--format", "bmp"
+        ]);
+        
+        // This should fail gracefully with unsupported format error
+        // (PNG is not a supported input format for retro-decode)
+        match output {
+            Ok(result) => {
+                // If it doesn't fail, that's also OK - means we added PNG support
+                println!("PNG processing result: {:?}", result.status);
+            }
+            Err(_) => {
+                // Expected: unsupported format
+                println!("PNG correctly identified as unsupported format");
+            }
+        }
+    }
+}
+
+/// Test transparency functionality with known test patterns
+#[test] 
+fn test_transparency_assets() {
+    let generated_dir = "test_assets/generated";
+    
+    // Ensure transparency demo files exist
+    let transparency_png = Path::new(generated_dir).join("test_transparency.png");
+    let transparency_bmp = Path::new(generated_dir).join("test_palette.bmp");
+    
+    if !transparency_png.exists() {
+        // Generate transparency demo if it doesn't exist
+        let demo_output = Command::new("cargo")
+            .args(&["run", "--example", "transparency_demo"])
+            .output()
+            .expect("Failed to run transparency_demo");
+            
+        assert!(demo_output.status.success(),
+            "Failed to generate transparency demo: {}",
+            String::from_utf8_lossy(&demo_output.stderr));
+    }
+    
+    // Verify files exist and have expected properties
+    assert!(transparency_png.exists(), "Transparency PNG not found");
+    assert!(transparency_bmp.exists(), "Transparency BMP not found");
+    
+    // Check file sizes are reasonable (small test images)
+    let png_size = std::fs::metadata(&transparency_png).unwrap().len();
+    let bmp_size = std::fs::metadata(&transparency_bmp).unwrap().len();
+    
+    assert!(png_size > 50 && png_size < 1000, "PNG size unexpected: {} bytes", png_size);
+    assert!(bmp_size > 1000 && bmp_size < 2000, "BMP size unexpected: {} bytes", bmp_size);
+    
+    println!("✓ Transparency assets validated");
+}

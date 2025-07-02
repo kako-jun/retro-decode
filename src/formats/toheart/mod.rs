@@ -12,6 +12,8 @@ pub mod pak;
 pub mod lf2;
 pub mod scn;
 
+pub mod test_transparency;
+
 pub use pak::PakArchive;
 pub use lf2::Lf2Image;
 pub use scn::ScnScene;

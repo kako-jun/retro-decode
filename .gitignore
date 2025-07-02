@@ -102,7 +102,7 @@ test_output/
 .env.test.local
 .env.production.local
 
-# Game files (should not be committed)
+# Game files (should not be committed due to copyright)
 *.pak
 *.PAK
 *.lf2
@@ -113,6 +113,17 @@ test_output/
 *.PDT
 *.g00
 *.G00
+
+# Test assets - copyrighted game files
+/test_assets/lf2/*
+/test_assets/pdt/*
+/test_assets/pak/*
+!/test_assets/lf2/.gitkeep
+!/test_assets/pdt/.gitkeep
+!/test_assets/pak/.gitkeep
+
+# Keep generated test files (safe to commit)
+!/test_assets/generated/*
 
 # Examples (keep structure but not actual game files)
 /examples/*.pak
