@@ -112,7 +112,7 @@ impl Default for DecodingState {
 /// Main processing function for Rust engine
 pub fn process_rust(
     input_path: &Path,
-    output_path: &Path,
+    output_file: &Path,
     format_type: FormatType,
     config: &crate::Config,
 ) -> Result<()> {
@@ -121,25 +121,27 @@ pub fn process_rust(
         gpu: config.gpu,
         step_by_step: config.step_by_step,
         verbose: config.verbose,
-        benchmark: false, // TODO: Add to main Config
-        no_output: false, // TODO: Add to main Config
+        benchmark: config.benchmark,
+        no_output: false, // TODO: Add to main Config if needed
     };
 
     match format_type {
         FormatType::ToHeartPak => {
-            toheart::extract_pak(input_path, output_path, &decode_config)
+            // For PAK archives, use parent directory of output_file
+            let output_dir = output_file.parent().unwrap_or(Path::new("./"));
+            toheart::extract_pak(input_path, output_dir, &decode_config)
         }
         FormatType::ToHeartLf2 => {
-            toheart::decode_lf2(input_path, output_path, &decode_config)
+            toheart::decode_lf2_direct(input_path, output_file, &decode_config)
         }
         FormatType::ToHeartScn => {
-            toheart::decode_scn(input_path, output_path, &decode_config)
+            toheart::decode_scn_direct(input_path, output_file, &decode_config)
         }
         FormatType::KanonPdt => {
-            kanon::decode_pdt(input_path, output_path, &decode_config)
+            kanon::decode_pdt_direct(input_path, output_file, &decode_config)
         }
         FormatType::KanonG00 => {
-            kanon::decode_g00(input_path, output_path, &decode_config)
+            kanon::decode_g00_direct(input_path, output_file, &decode_config)
         }
     }
 }

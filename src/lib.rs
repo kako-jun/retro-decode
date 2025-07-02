@@ -1,7 +1,7 @@
 //! RetroDecode - P⁴ (Pixel by pixel, past preserved)
 //! 
 //! An educational tool for analyzing and visualizing image decoding processes 
-//! from classic Japanese games.
+//! from Japanese retro games.
 //! 
 //! This library provides:
 //! - Multi-format support for ToHeart, Kanon, and Kizuato image formats
@@ -26,13 +26,16 @@ pub use formats::{FormatType, DecodeStep, DecodingState};
 #[derive(Debug)]
 pub struct Config {
     pub input: Option<PathBuf>,
+    pub input_dir: Option<PathBuf>,
     pub output: PathBuf,
+    pub format: String,
     pub language: String,
     pub parallel: bool,
     pub gpu: bool,
     pub step_by_step: bool,
     pub verbose: bool,
     pub gui: bool,
+    pub benchmark: bool,
 }
 
 /// Re-export commonly used types

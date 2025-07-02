@@ -43,54 +43,72 @@ pub fn extract_pak(
     Ok(())
 }
 
-/// Decode LF2 image
+/// Decode LF2 image (legacy - directory output)
 pub fn decode_lf2(
     input_path: &Path,
     output_path: &Path,
+    config: &DecodeConfig,
+) -> Result<()> {
+    let output_file = output_path.join(
+        input_path.file_stem().unwrap_or_default()
+    ).with_extension("bmp");
+    
+    decode_lf2_direct(input_path, &output_file, config)
+}
+
+/// Decode LF2 image to specific file
+pub fn decode_lf2_direct(
+    input_path: &Path,
+    output_file: &Path,
     config: &DecodeConfig,
 ) -> Result<()> {
     info!("Decoding LF2 image: {:?}", input_path);
     
     let lf2 = Lf2Image::open(input_path)?;
     
-    let output_file = output_path.join(
-        input_path.file_stem().unwrap_or_default()
-    ).with_extension("bmp");
-    
     if config.step_by_step {
         let mut state = DecodingState::new();
-        lf2.decode_with_steps(&output_file, &mut state, config)?;
+        lf2.decode_with_steps(output_file, &mut state, config)?;
         
         if config.verbose {
             info!("Decoding completed in {} steps", state.steps.len());
             info!("Ring buffer size: {}", state.ring_buffer.len());
         }
     } else {
-        lf2.decode(&output_file, config)?;
+        lf2.decode(output_file, config)?;
     }
     
     Ok(())
 }
 
-/// Decode SCN scene file
+/// Decode SCN scene file (legacy - directory output)
 pub fn decode_scn(
     input_path: &Path,
     output_path: &Path,
+    config: &DecodeConfig,
+) -> Result<()> {
+    let output_file = output_path.join(
+        input_path.file_stem().unwrap_or_default()
+    ).with_extension("bmp");
+    
+    decode_scn_direct(input_path, &output_file, config)
+}
+
+/// Decode SCN scene file to specific file
+pub fn decode_scn_direct(
+    input_path: &Path,
+    output_file: &Path,
     config: &DecodeConfig,
 ) -> Result<()> {
     info!("Decoding SCN scene: {:?}", input_path);
     
     let scn = ScnScene::open(input_path)?;
     
-    let output_file = output_path.join(
-        input_path.file_stem().unwrap_or_default()
-    ).with_extension("bmp");
-    
     if config.step_by_step {
         let mut state = DecodingState::new();
-        scn.decode_with_steps(&output_file, &mut state, config)?;
+        scn.decode_with_steps(output_file, &mut state, config)?;
     } else {
-        scn.decode(&output_file, config)?;
+        scn.decode(output_file, config)?;
     }
     
     Ok(())

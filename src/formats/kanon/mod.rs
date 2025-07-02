@@ -14,23 +14,32 @@ pub mod g00;
 pub use pdt::PdtImage;
 pub use g00::G00Image;
 
-/// Decode PDT image
+/// Decode PDT image (legacy - directory output)
 pub fn decode_pdt(
     input_path: &Path,
     output_path: &Path,
+    config: &DecodeConfig,
+) -> Result<()> {
+    let output_file = output_path.join(
+        input_path.file_stem().unwrap_or_default()
+    ).with_extension("bmp");
+    
+    decode_pdt_direct(input_path, &output_file, config)
+}
+
+/// Decode PDT image to specific file
+pub fn decode_pdt_direct(
+    input_path: &Path,
+    output_file: &Path,
     config: &DecodeConfig,
 ) -> Result<()> {
     info!("Decoding PDT image: {:?}", input_path);
     
     let pdt = PdtImage::open(input_path)?;
     
-    let output_file = output_path.join(
-        input_path.file_stem().unwrap_or_default()
-    ).with_extension("bmp");
-    
     if config.step_by_step {
         let mut state = DecodingState::new();
-        pdt.decode_with_steps(&output_file, &mut state, config)?;
+        pdt.decode_with_steps(output_file, &mut state, config)?;
         
         if config.verbose {
             info!("PDT decoding completed in {} steps", state.steps.len());
@@ -41,29 +50,38 @@ pub fn decode_pdt(
             );
         }
     } else {
-        pdt.decode(&output_file, config)?;
+        pdt.decode(output_file, config)?;
     }
     
     Ok(())
 }
 
-/// Decode G00 image
+/// Decode G00 image (legacy - directory output)
 pub fn decode_g00(
     input_path: &Path,
     output_path: &Path,
+    config: &DecodeConfig,
+) -> Result<()> {
+    let output_file = output_path.join(
+        input_path.file_stem().unwrap_or_default()
+    ).with_extension("bmp");
+    
+    decode_g00_direct(input_path, &output_file, config)
+}
+
+/// Decode G00 image to specific file
+pub fn decode_g00_direct(
+    input_path: &Path,
+    output_file: &Path,
     config: &DecodeConfig,
 ) -> Result<()> {
     info!("Decoding G00 image: {:?}", input_path);
     
     let g00 = G00Image::open(input_path)?;
     
-    let output_file = output_path.join(
-        input_path.file_stem().unwrap_or_default()
-    ).with_extension("bmp");
-    
     if config.step_by_step {
         let mut state = DecodingState::new();
-        g00.decode_with_steps(&output_file, &mut state, config)?;
+        g00.decode_with_steps(output_file, &mut state, config)?;
         
         if config.verbose {
             info!("G00 decoding completed in {} steps", state.steps.len());
@@ -72,7 +90,7 @@ pub fn decode_g00(
             );
         }
     } else {
-        g00.decode(&output_file, config)?;
+        g00.decode(output_file, config)?;
     }
     
     Ok(())
