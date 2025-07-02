@@ -57,7 +57,7 @@ impl Lf2Image {
         let transparent_color = data[0x12];
         let color_count = data[0x16];
         
-        debug!("LF2: {}x{} at ({},{}) with {} colors", width, height, x_offset, y_offset, color_count);
+        debug!("LF2: {}x{} at ({},{}) with {} colors, transparent_color: {}", width, height, x_offset, y_offset, color_count, transparent_color);
         
         // Read palette (optimized bulk copy)
         let mut palette = Vec::with_capacity(color_count as usize);
@@ -419,7 +419,7 @@ impl Lf2Image {
             };
             
             // Handle transparency by using black for transparent pixels
-            if pixel_index == self.transparent_color {
+            if pixel_index == self.transparent_color || (pixel_index as usize) >= self.palette.len() {
                 file.write_all(&[0, 0, 0])?; // Black for transparent
             } else {
                 file.write_all(&[color.r, color.g, color.b])?;
@@ -443,7 +443,7 @@ impl Lf2Image {
                 Rgb { r: 0, g: 0, b: 0 }
             };
             
-            let alpha = if pixel_index == self.transparent_color { 0 } else { 255 };
+            let alpha = if pixel_index == self.transparent_color || (pixel_index as usize) >= self.palette.len() { 0 } else { 255 };
             file.write_all(&[color.r, color.g, color.b, alpha])?;
         }
         
@@ -461,7 +461,7 @@ impl Lf2Image {
                 Rgb { r: 0, g: 0, b: 0 }
             };
             
-            let alpha = if pixel_index == self.transparent_color { 0 } else { 255 };
+            let alpha = if pixel_index == self.transparent_color || (pixel_index as usize) >= self.palette.len() { 0 } else { 255 };
             rgba_data.extend_from_slice(&[color.r, color.g, color.b, alpha]);
         }
         

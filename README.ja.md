@@ -4,7 +4,7 @@
 
 ## P⁴ (Pixel by pixel, past preserved)
 
-*クラシック日本ゲームの画像デコード過程を解析・可視化する教育ツール*
+*日本のレトロゲームの画像デコード過程を解析・可視化する教育ツール*
 
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/tauri-%2324C8DB.svg?style=for-the-badge&logo=tauri&logoColor=%23FFFFFF)](https://tauri.app/)
@@ -16,7 +16,7 @@
 
 ## 概要
 
-RetroDecodeは、クラシック日本のビジュアルノベルで使用された歴史的な画像圧縮・暗号化技術を実演するインタラクティブな教育ツールです。デコード過程の段階的可視化を提供し、限られたハードウェアで使用された巧妙なメモリ最適化手法を理解できます。
+RetroDecodeは、日本のレトロビジュアルノベルで使用された歴史的な画像圧縮・暗号化技術を実演するインタラクティブな教育ツールです。デコード過程の段階的可視化を提供し、限られたハードウェアで使用された巧妙なメモリ最適化手法を理解できます。
 
 **主要機能:**
 - 🎮 **マルチフォーマット対応**: ToHeart (PAK/LF2/SCN)、Kanon (PDT/G00)、痕
@@ -46,22 +46,25 @@ cargo build --release
 retro-decode
 
 # 単一ファイルをデコード（拡張子から形式を自動判定）
-retro-decode --input image.lf2
+retro-decode --input image.lf2 --output results --format png
+
+# ディレクトリ内の全ファイルを一括処理
+retro-decode --input-dir images/ --output results --format bmp
 
 # PAKアーカイブを展開
 retro-decode --input archive.pak --output ./extracted/
 
 # GPU加速でPythonエンジンを使用
-retro-decode --input file.pdt --lang python --gpu
+retro-decode --input file.pdt --output results --lang python --gpu
 
 # パフォーマンス比較のため並列処理を有効化
-retro-decode --input data.g00 --parallel
+retro-decode --input data.g00 --output results --parallel
 
 # GUIインターフェースを起動
 retro-decode --gui
 
 # 教育的可視化のための段階的モード
-retro-decode --input file.lf2 --step-by-step --verbose
+retro-decode --input file.lf2 --output results --step-by-step --verbose
 ```
 
 ## サポート形式
@@ -90,14 +93,71 @@ retro-decode --input file.lf2 --step-by-step --verbose
 
 ## CLIリファレンス
 
-### 必須引数
-- `--input <file>`: 入力ファイルパス（`--gui`使用時以外は必須）
-
-### オプション引数
-- `--output <path>`: 出力ディレクトリ（デフォルト: `./output/`）
-- `--lang <engine>`: 処理エンジン（`rust`|`python`|`typescript`、デフォルト: `rust`）
+### 入力オプション（いずれか選択）
+- `--input <file>`: 単一入力ファイルパス
+- `--input-dir <dir>`: バッチ処理用入力ディレクトリ
 - `--gui`: Tauri GUIインターフェースを起動
+
+### 出力オプション
+- `--output <dir>`: 出力ディレクトリ（デフォルト: `./`）
+- `--format <format>`: 出力形式（`bmp`|`png`|`raw`|`rgba`、デフォルト: `bmp`）
+
+### 処理オプション
+- `--lang <engine>`: 処理エンジン（`rust`|`python`|`typescript`、デフォルト: `rust`）
+- `--parallel`: 並列処理を有効化
+- `--gpu`: GPU加速を使用
 - `--step-by-step`: 教育的段階実行モードを有効化
+- `--benchmark`: 構造化ベンチマーク情報を出力
+- `--verbose`: 詳細出力
+- `--help`: ヘルプ情報を表示
+
+## 応用例
+
+### ベンチマークとパフォーマンス解析
+
+```bash
+# 単一ファイルベンチマーク
+retro-decode --input image.lf2 --benchmark
+
+# デコード時間でソートしたバッチベンチマーク
+retro-decode --input-dir images/ --benchmark | grep decode_time_ms | sort -k2 -n
+
+# 平均処理時間を計算
+retro-decode --input-dir images/ --benchmark | awk '/decode_time_ms/ {sum+=$2; count++} END {print "Average:", sum/count "ms"}'
+
+# 高圧縮率ファイルを検索
+retro-decode --input-dir images/ --benchmark | awk '/compression_ratio/ && $2 > 80 {print prev} {prev=$0}' | grep file:
+```
+
+### バッチ処理ワークフロー
+
+```bash
+# ディレクトリ内の全LF2ファイルをPNGに変換
+retro-decode --input-dir game_assets/ --output converted/ --format png
+
+# 並列処理で全ファイルを変換
+retro-decode --input-dir images/ --output results/ --format bmp --parallel
+
+# Pythonエンジンで詳細出力付き処理
+retro-decode --input-dir assets/ --output python_results/ --lang python --verbose
+```
+
+### Unixパイプライン統合
+
+```bash
+# 再帰的に全LF2ファイルを検索し処理
+find game_data/ -name "*.lf2" -exec retro-decode --input {} --output results/ --format png \;
+
+# ファイルを処理し統計を収集
+retro-decode --input-dir images/ --benchmark > stats.txt
+cat stats.txt | grep transparent_pixels | awk '{sum+=$2} END {print "Total transparent pixels:", sum}'
+
+# サイズでファイルをフィルタし処理
+retro-decode --input-dir images/ --benchmark | awk '/size/ && $2 > 50000 {print prev}' | grep file: | while read -r line; do
+  file=$(echo $line | cut -d' ' -f2)
+  retro-decode --input "$file" --output large_files/ --format rgba
+done
+```
 - `--parallel`: 並列処理を有効化
 - `--gpu`: GPU加速を使用（利用可能な場合）
 - `--verbose`: 詳細ログ出力

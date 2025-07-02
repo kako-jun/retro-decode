@@ -4,7 +4,7 @@
 
 ## P⁴ (Pixel by pixel, past preserved)
 
-*An educational tool for analyzing and visualizing image decoding processes from classic Japanese games*
+*An educational tool for analyzing and visualizing image decoding processes from Japanese retro games*
 
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/tauri-%2324C8DB.svg?style=for-the-badge&logo=tauri&logoColor=%23FFFFFF)](https://tauri.app/)
@@ -16,7 +16,7 @@
 
 ## Overview
 
-RetroDecode is an interactive educational tool that demonstrates historical image compression and encryption techniques used in classic Japanese visual novels. The project provides step-by-step visualization of decoding processes, allowing users to understand the ingenious memory optimization methods employed on limited hardware.
+RetroDecode is an interactive educational tool that demonstrates historical image compression and encryption techniques used in Japanese retro visual novels. The project provides step-by-step visualization of decoding processes, allowing users to understand the ingenious memory optimization methods employed on limited hardware.
 
 **Key Features:**
 - 🎮 **Multi-format support**: ToHeart (PAK/LF2/SCN), Kanon (PDT/G00), Kizuato
@@ -46,22 +46,25 @@ cargo build --release
 retro-decode
 
 # Decode a single file (auto-detects format from extension)
-retro-decode --input image.lf2
+retro-decode --input image.lf2 --output results --format png
+
+# Batch process all files in a directory
+retro-decode --input-dir images/ --output results --format bmp
 
 # Extract PAK archive
 retro-decode --input archive.pak --output ./extracted/
 
 # Use Python engine with GPU acceleration
-retro-decode --input file.pdt --lang python --gpu
+retro-decode --input file.pdt --output results --lang python --gpu
 
 # Enable parallel processing for performance comparison
-retro-decode --input data.g00 --parallel
+retro-decode --input data.g00 --output results --parallel
 
 # Launch GUI interface
 retro-decode --gui
 
 # Step-by-step mode for educational visualization
-retro-decode --input file.lf2 --step-by-step --verbose
+retro-decode --input file.lf2 --output results --step-by-step --verbose
 ```
 
 ## Supported Formats
@@ -90,18 +93,89 @@ retro-decode --input file.lf2 --step-by-step --verbose
 
 ## CLI Reference
 
-### Required Arguments
-- `--input <file>`: Input file path (required unless using `--gui`)
-
-### Optional Arguments
-- `--output <path>`: Output directory (default: `./output/`)
-- `--lang <engine>`: Processing engine (`rust`|`python`|`typescript`, default: `rust`)
+### Input Options (choose one)
+- `--input <file>`: Single input file path
+- `--input-dir <dir>`: Input directory for batch processing
 - `--gui`: Launch Tauri GUI interface
-- `--step-by-step`: Enable educational step-by-step mode
+
+### Output Options
+- `--output <dir>`: Output directory (default: `./`)
+- `--format <format>`: Output format (`bmp`|`png`|`raw`|`rgba`, default: `bmp`)
+
+### Processing Options
+- `--lang <engine>`: Processing engine (`rust`|`python`|`typescript`, default: `rust`)
 - `--parallel`: Enable parallel processing
-- `--gpu`: Use GPU acceleration (if available)
-- `--verbose`: Detailed logging output
+- `--gpu`: Use GPU acceleration
+- `--step-by-step`: Enable educational step-by-step mode
+- `--benchmark`: Output structured benchmark information
+- `--verbose`: Verbose output
 - `--help`: Show help information
+
+## Advanced Examples
+
+### Benchmarking and Performance Analysis
+
+```bash
+# Single file benchmark
+retro-decode --input image.lf2 --benchmark
+
+# Batch benchmarking with sorting by decode time
+retro-decode --input-dir images/ --benchmark | grep decode_time_ms | sort -k2 -n
+
+# Calculate average processing time
+retro-decode --input-dir images/ --benchmark | awk '/decode_time_ms/ {sum+=$2; count++} END {print "Average:", sum/count "ms"}'
+
+# Find files with high compression ratios
+retro-decode --input-dir images/ --benchmark | awk '/compression_ratio/ && $2 > 80 {print prev} {prev=$0}' | grep file:
+```
+
+### Batch Processing Workflows
+
+```bash
+# Process all LF2 files in directory to PNG
+retro-decode --input-dir game_assets/ --output converted/ --format png
+
+# Convert all files with parallel processing
+retro-decode --input-dir images/ --output results/ --format bmp --parallel
+
+# Process using Python engine with verbose output
+retro-decode --input-dir assets/ --output python_results/ --lang python --verbose
+```
+
+### Unix Pipeline Integration
+
+```bash
+# Find and process all LF2 files recursively
+find game_data/ -name "*.lf2" -exec retro-decode --input {} --output results/ --format png \;
+
+# Process files and collect statistics
+retro-decode --input-dir images/ --benchmark > stats.txt
+cat stats.txt | grep transparent_pixels | awk '{sum+=$2} END {print "Total transparent pixels:", sum}'
+
+# Filter files by size and process
+retro-decode --input-dir images/ --benchmark | awk '/size/ && $2 > 50000 {print prev}' | grep file: | while read -r line; do
+  file=$(echo $line | cut -d' ' -f2)
+  retro-decode --input "$file" --output large_files/ --format rgba
+done
+```
+
+### Format-Specific Workflows
+
+```bash
+# Extract PAK archive and process all LF2 files
+retro-decode --input game.pak --output extracted/
+retro-decode --input-dir extracted/ --output images/ --format png
+
+# Compare different output formats for transparency
+retro-decode --input sprite.lf2 --output test/ --format bmp
+retro-decode --input sprite.lf2 --output test/ --format png
+retro-decode --input sprite.lf2 --output test/ --format rgba
+
+# Benchmark different engines
+retro-decode --input large_image.pdt --benchmark --lang rust > rust_benchmark.txt
+retro-decode --input large_image.pdt --benchmark --lang python > python_benchmark.txt
+diff rust_benchmark.txt python_benchmark.txt
+```
 
 ### Examples
 
