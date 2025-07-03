@@ -1,0 +1,292 @@
+{
+  "feature_importance": [
+    0.13102633171511427,
+    0.12904565982751579,
+    0.11093315281210758,
+    0.09437482374153695,
+    0.10116550412186566,
+    0.09448790153143763,
+    0.07440512810400506,
+    0.14616861842979031,
+    0.11079607647540399,
+    0.29225340183122683,
+    0.08587780068411592,
+    0.16145768488631662,
+    0.1440478754575317,
+    0.17129382720913214,
+    0.16671610629884062,
+    0.2272223664926192,
+    0.2629706511435604,
+    0.24169745135743845,
+    0.32531719766444406,
+    0.2529351671111103,
+    0.28879920724010183,
+    0.29400397437495407,
+    0.2471535040536783,
+    0.4935695688305964,
+    0.5691080843520084,
+    0.5035381554209174,
+    0.3803915961402049,
+    0.4961942695103414,
+    0.45725965402014057,
+    0.6307451100259124,
+    1.0262455012474876,
+    2.1095617773515594,
+    1.7218705876823435,
+    27.36176317541411,
+    0.19902312709324427,
+    16.576135845118838,
+    0.06776041225920813,
+    0.07143877644810351,
+    0.09858032807138582
+  ],
+  "importance_ranking": [
+    {
+      "feature_idx": 33,
+      "feature_name": "compression_progress",
+      "importance": 27.36176317541411
+    },
+    {
+      "feature_idx": 35,
+      "feature_name": "estimated_y",
+      "importance": 16.576135845118838
+    },
+    {
+      "feature_idx": 31,
+      "feature_name": "ring_buffer_31",
+      "importance": 2.1095617773515594
+    },
+    {
+      "feature_idx": 32,
+      "feature_name": "ring_position",
+      "importance": 1.7218705876823435
+    },
+    {
+      "feature_idx": 30,
+      "feature_name": "ring_buffer_30",
+      "importance": 1.0262455012474876
+    },
+    {
+      "feature_idx": 29,
+      "feature_name": "ring_buffer_29",
+      "importance": 0.6307451100259124
+    },
+    {
+      "feature_idx": 24,
+      "feature_name": "ring_buffer_24",
+      "importance": 0.5691080843520084
+    },
+    {
+      "feature_idx": 25,
+      "feature_name": "ring_buffer_25",
+      "importance": 0.5035381554209174
+    },
+    {
+      "feature_idx": 27,
+      "feature_name": "ring_buffer_27",
+      "importance": 0.4961942695103414
+    },
+    {
+      "feature_idx": 23,
+      "feature_name": "ring_buffer_23",
+      "importance": 0.4935695688305964
+    },
+    {
+      "feature_idx": 28,
+      "feature_name": "ring_buffer_28",
+      "importance": 0.45725965402014057
+    },
+    {
+      "feature_idx": 26,
+      "feature_name": "ring_buffer_26",
+      "importance": 0.3803915961402049
+    },
+    {
+      "feature_idx": 18,
+      "feature_name": "ring_buffer_18",
+      "importance": 0.32531719766444406
+    },
+    {
+      "feature_idx": 21,
+      "feature_name": "ring_buffer_21",
+      "importance": 0.29400397437495407
+    },
+    {
+      "feature_idx": 9,
+      "feature_name": "ring_buffer_9",
+      "importance": 0.29225340183122683
+    },
+    {
+      "feature_idx": 20,
+      "feature_name": "ring_buffer_20",
+      "importance": 0.28879920724010183
+    },
+    {
+      "feature_idx": 16,
+      "feature_name": "ring_buffer_16",
+      "importance": 0.2629706511435604
+    },
+    {
+      "feature_idx": 19,
+      "feature_name": "ring_buffer_19",
+      "importance": 0.2529351671111103
+    },
+    {
+      "feature_idx": 22,
+      "feature_name": "ring_buffer_22",
+      "importance": 0.2471535040536783
+    },
+    {
+      "feature_idx": 17,
+      "feature_name": "ring_buffer_17",
+      "importance": 0.24169745135743845
+    },
+    {
+      "feature_idx": 15,
+      "feature_name": "ring_buffer_15",
+      "importance": 0.2272223664926192
+    },
+    {
+      "feature_idx": 34,
+      "feature_name": "estimated_x",
+      "importance": 0.19902312709324427
+    },
+    {
+      "feature_idx": 13,
+      "feature_name": "ring_buffer_13",
+      "importance": 0.17129382720913214
+    },
+    {
+      "feature_idx": 14,
+      "feature_name": "ring_buffer_14",
+      "importance": 0.16671610629884062
+    },
+    {
+      "feature_idx": 11,
+      "feature_name": "ring_buffer_11",
+      "importance": 0.16145768488631662
+    },
+    {
+      "feature_idx": 7,
+      "feature_name": "ring_buffer_7",
+      "importance": 0.14616861842979031
+    },
+    {
+      "feature_idx": 12,
+      "feature_name": "ring_buffer_12",
+      "importance": 0.1440478754575317
+    },
+    {
+      "feature_idx": 0,
+      "feature_name": "ring_buffer_0",
+      "importance": 0.13102633171511427
+    },
+    {
+      "feature_idx": 1,
+      "feature_name": "ring_buffer_1",
+      "importance": 0.12904565982751579
+    },
+    {
+      "feature_idx": 2,
+      "feature_name": "ring_buffer_2",
+      "importance": 0.11093315281210758
+    },
+    {
+      "feature_idx": 8,
+      "feature_name": "ring_buffer_8",
+      "importance": 0.11079607647540399
+    },
+    {
+      "feature_idx": 4,
+      "feature_name": "ring_buffer_4",
+      "importance": 0.10116550412186566
+    },
+    {
+      "feature_idx": 38,
+      "feature_name": "long_matches",
+      "importance": 0.09858032807138582
+    },
+    {
+      "feature_idx": 5,
+      "feature_name": "ring_buffer_5",
+      "importance": 0.09448790153143763
+    },
+    {
+      "feature_idx": 3,
+      "feature_name": "ring_buffer_3",
+      "importance": 0.09437482374153695
+    },
+    {
+      "feature_idx": 10,
+      "feature_name": "ring_buffer_10",
+      "importance": 0.08587780068411592
+    },
+    {
+      "feature_idx": 6,
+      "feature_name": "ring_buffer_6",
+      "importance": 0.07440512810400506
+    },
+    {
+      "feature_idx": 37,
+      "feature_name": "medium_matches",
+      "importance": 0.07143877644810351
+    },
+    {
+      "feature_idx": 36,
+      "feature_name": "short_matches",
+      "importance": 0.06776041225920813
+    }
+  ],
+  "top_10_features": [
+    {
+      "feature_idx": 33,
+      "feature_name": "compression_progress",
+      "importance": 27.36176317541411
+    },
+    {
+      "feature_idx": 35,
+      "feature_name": "estimated_y",
+      "importance": 16.576135845118838
+    },
+    {
+      "feature_idx": 31,
+      "feature_name": "ring_buffer_31",
+      "importance": 2.1095617773515594
+    },
+    {
+      "feature_idx": 32,
+      "feature_name": "ring_position",
+      "importance": 1.7218705876823435
+    },
+    {
+      "feature_idx": 30,
+      "feature_name": "ring_buffer_30",
+      "importance": 1.0262455012474876
+    },
+    {
+      "feature_idx": 29,
+      "feature_name": "ring_buffer_29",
+      "importance": 0.6307451100259124
+    },
+    {
+      "feature_idx": 24,
+      "feature_name": "ring_buffer_24",
+      "importance": 0.5691080843520084
+    },
+    {
+      "feature_idx": 25,
+      "feature_name": "ring_buffer_25",
+      "importance": 0.5035381554209174
+    },
+    {
+      "feature_idx": 27,
+      "feature_name": "ring_buffer_27",
+      "importance": 0.4961942695103414
+    },
+    {
+      "feature_idx": 23,
+      "feature_name": "ring_buffer_23",
+      "importance": 0.4935695688305964
+    }
+  ]
+}

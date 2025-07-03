@@ -1,0 +1,34 @@
+{
+  "direct_pixel_conditions": [],
+  "match_selection_rules": [
+    {
+      "condition": "ring_buffer_31 pattern matching",
+      "importance": 2.1095617773515594,
+      "rule": "\u30ea\u30f3\u30b0\u30d0\u30c3\u30d5\u30a1\u30d1\u30bf\u30fc\u30f3\u304c\u985e\u4f3c\u3057\u3066\u3044\u308b\u5834\u5408\u3001\u30de\u30c3\u30c1\u30f3\u30b0\u3092\u512a\u5148"
+    },
+    {
+      "condition": "ring_position based selection",
+      "importance": 1.7218705876823435,
+      "rule": "\u753b\u50cf\u5185\u4f4d\u7f6e\u306b\u57fa\u3065\u304f\u5727\u7e2e\u6226\u7565\u8abf\u6574"
+    },
+    {
+      "condition": "ring_buffer_30 pattern matching",
+      "importance": 1.0262455012474876,
+      "rule": "\u30ea\u30f3\u30b0\u30d0\u30c3\u30d5\u30a1\u30d1\u30bf\u30fc\u30f3\u304c\u985e\u4f3c\u3057\u3066\u3044\u308b\u5834\u5408\u3001\u30de\u30c3\u30c1\u30f3\u30b0\u3092\u512a\u5148"
+    }
+  ],
+  "feature_thresholds": {},
+  "statistical_patterns": {
+    "total_decisions_analyzed": 2465637,
+    "avg_decisions_per_file": 4723.442528735633,
+    "model_confidence": 0.7528,
+    "recommended_match_strategy": {
+      "ring_buffer_weight": 5.828962466738823,
+      "position_weight": 1.7218705876823435,
+      "match_candidate_weight": 0.0,
+      "recommended_approach": "hybrid",
+      "primary_factor": "ring_buffer_state",
+      "recommendation": "\u30ea\u30f3\u30b0\u30d0\u30c3\u30d5\u30a1\u72b6\u614b\u3092\u6700\u91cd\u8996\u3057\u305f\u30de\u30c3\u30c1\u30f3\u30b0"
+    }
+  }
+}
