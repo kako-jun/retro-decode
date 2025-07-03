@@ -22,7 +22,8 @@
       "Bash(cp:*)",
       "Bash(git rm:*)",
       "Bash(nvidia-smi:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(poetry run:*)"
     ],
     "deny": []
   },

@@ -1,0 +1,10 @@
+{
+  "training_samples": 2465637,
+  "files_processed": 522,
+  "avg_decisions_per_file": 4723.442528735633,
+  "feature_dimensions": 39,
+  "model_parameters": 447685,
+  "final_epoch": 20,
+  "final_accuracy": 0.7528,
+  "gpu_info": "NVIDIA GeForce GTX 1050 Ti"
+}

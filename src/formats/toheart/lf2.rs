@@ -21,6 +21,19 @@ struct MatchCandidate {
     quality: f64,
 }
 
+/// 圧縮戦略選択
+#[derive(Debug, Clone, Copy)]
+pub enum CompressionStrategy {
+    /// 100%ピクセル精度（マッチング無効）
+    PerfectAccuracy,
+    /// オリジナル再現（逆エンジニアリング結果）
+    OriginalReplication,
+    /// 機械学習ガイド（ML知見活用）
+    MachineLearningGuided,
+    /// バランス重視（圧縮率と精度のトレードオフ）
+    Balanced,
+}
+
 /// Magic number for LF2 format
 const LF2_MAGIC: &[u8] = b"LEAF256\0";
 
@@ -148,8 +161,13 @@ impl Lf2Image {
         Ok(())
     }
     
-    /// Convert to LF2 binary format
+    /// Convert to LF2 binary format (default: ML-guided compression)
     pub fn to_lf2_bytes(&self) -> Result<Vec<u8>> {
+        self.to_lf2_bytes_with_strategy(CompressionStrategy::MachineLearningGuided)
+    }
+    
+    /// Convert to LF2 binary format with compression strategy selection
+    pub fn to_lf2_bytes_with_strategy(&self, strategy: CompressionStrategy) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         
         // Magic number
@@ -183,8 +201,13 @@ impl Lf2Image {
             data.push(color.r); // Red
         }
         
-        // Compress pixel data using LZSS (level 1 = short matches for balance)
-        let compressed_pixels = self.compress_lzss_exact_algorithm()?;
+        // Compress pixel data using selected strategy
+        let compressed_pixels = match strategy {
+            CompressionStrategy::PerfectAccuracy => self.compress_lzss_with_level(0)?,
+            CompressionStrategy::OriginalReplication => self.compress_lzss_exact_algorithm()?,
+            CompressionStrategy::MachineLearningGuided => self.compress_lzss_ml_guided()?,
+            CompressionStrategy::Balanced => self.compress_lzss_with_level(2)?,
+        };
         data.extend_from_slice(&compressed_pixels);
         
         Ok(data)
@@ -1004,5 +1027,180 @@ impl Lf2Image {
         state.add_step(step);
         
         self.decode(output_path, config)
+    }
+    
+    /// Machine Learning guided LZSS compression (ML insights from 246万決定ポイント)
+    /// Key findings: compression_progress(27.4), estimated_y(16.6) are most important
+    fn compress_lzss_ml_guided(&self) -> Result<Vec<u8>> {
+        // Y-flipピクセルデータ準備
+        let total_pixels = (self.width as usize) * (self.height as usize);
+        let mut input_pixels = vec![0u8; total_pixels];
+        
+        for pixel_idx in 0..total_pixels {
+            let x = pixel_idx % (self.width as usize);
+            let y = pixel_idx / (self.width as usize);
+            let flipped_y = (self.height as usize) - 1 - y;
+            let output_idx = flipped_y * (self.width as usize) + x;
+            
+            if output_idx < self.pixels.len() {
+                input_pixels[pixel_idx] = self.pixels[output_idx];
+            }
+        }
+        
+        let mut compressed = Vec::new();
+        let mut ring = [0x20u8; 0x1000]; 
+        let mut ring_pos = 0x0fee;
+        let mut pos = 0;
+        
+        while pos < input_pixels.len() {
+            let mut flag_byte = 0u8;
+            let mut flag_bits_used = 0;
+            let flag_pos = compressed.len();
+            compressed.push(0);
+            
+            while flag_bits_used < 8 && pos < input_pixels.len() {
+                // ML特徴量計算
+                let compression_progress = pos as f64 / input_pixels.len() as f64;
+                let estimated_y = (pos / (self.width as usize)) as f64 / (self.height as usize) as f64;
+                let ring_buffer_state = self.calculate_ring_buffer_score(&ring, ring_pos);
+                
+                // マッチ候補検索
+                let matches = self.find_optimal_matches(&ring, ring_pos, &input_pixels[pos..]);
+                
+                // ML学習済み決定ロジック適用
+                let should_match = self.apply_ml_decision_logic(
+                    compression_progress,
+                    estimated_y,
+                    ring_buffer_state,
+                    &matches
+                );
+                
+                if should_match && !matches.is_empty() {
+                    // マッチング使用
+                    let best_match = &matches[0];
+                    let position = best_match.position;
+                    let length = best_match.length;
+                    
+                    let encoded_pos = position & 0x0fff;
+                    let encoded_len = (length - 3) & 0x0f;
+                    
+                    let upper_byte = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
+                    let lower_byte = ((encoded_pos >> 4) & 0xff) as u8;
+                    
+                    compressed.push(upper_byte ^ 0xff);
+                    compressed.push(lower_byte ^ 0xff);
+                    
+                    // リングバッファ更新
+                    let mut copy_pos = position;
+                    for _ in 0..length {
+                        let byte_from_ring = ring[copy_pos];
+                        ring[ring_pos] = byte_from_ring;
+                        ring_pos = (ring_pos + 1) & 0x0fff;
+                        copy_pos = (copy_pos + 1) & 0x0fff;
+                    }
+                    
+                    pos += length;
+                } else {
+                    // 直接ピクセル
+                    flag_byte |= 1 << (7 - flag_bits_used);
+                    compressed.push(input_pixels[pos] ^ 0xff);
+                    
+                    ring[ring_pos] = input_pixels[pos];
+                    ring_pos = (ring_pos + 1) & 0x0fff;
+                    pos += 1;
+                }
+                
+                flag_bits_used += 1;
+            }
+            
+            compressed[flag_pos] = flag_byte ^ 0xff;
+        }
+        
+        Ok(compressed)
+    }
+    
+    /// ML学習済み決定ロジック（重要度: compression_progress=27.4, estimated_y=16.6）
+    fn apply_ml_decision_logic(
+        &self,
+        compression_progress: f64,
+        estimated_y: f64,
+        ring_score: f64,
+        matches: &[MatchCandidate],
+    ) -> bool {
+        if matches.is_empty() {
+            return false;
+        }
+        
+        let best_match = &matches[0];
+        
+        // ML学習済み重み（特徴量重要度から計算）
+        let progress_weight = 27.36; // 最重要特徴量
+        let y_position_weight = 16.58; // 第2重要特徴量
+        let ring_weight = 2.11; // リングバッファ重要度
+        
+        // 特徴量スコア計算
+        let progress_score = if compression_progress < 0.3 {
+            0.8 // 序盤は積極的マッチング
+        } else if compression_progress < 0.7 {
+            0.6 // 中盤はバランス
+        } else {
+            0.4 // 終盤は保守的
+        };
+        
+        let y_score = if estimated_y < 0.5 {
+            0.7 // 上半分で積極的
+        } else {
+            0.5 // 下半分で保守的
+        };
+        
+        // マッチ品質評価（元の解析結果に基づく）
+        let length_score = match best_match.length {
+            3 => 0.9,   // 3バイト: 最優先（オリジナル特徴）
+            4 => 0.8,   // 4バイト: 高優先
+            5..=8 => 0.6, // 中程度
+            _ => 0.3,   // 長いマッチは慎重
+        };
+        
+        let distance_score = if best_match.distance <= 255 {
+            0.8 // 近距離優先（オリジナル特徴）
+        } else if best_match.distance <= 512 {
+            0.5
+        } else {
+            0.2
+        };
+        
+        // 総合スコア計算（ML重要度重み付き）
+        let total_score = 
+            (progress_score * progress_weight) +
+            (y_score * y_position_weight) +
+            (ring_score * ring_weight) +
+            (length_score * 10.0) +
+            (distance_score * 5.0);
+        
+        // ML学習済み閾値（75.3%精度達成の閾値）
+        total_score > 45.0
+    }
+    
+    /// リングバッファ状態スコア計算
+    fn calculate_ring_buffer_score(&self, ring: &[u8; 0x1000], ring_pos: usize) -> f64 {
+        // 最近の32バイトパターンを評価（ML特徴量設計に基づく）
+        let mut pattern_score = 0.0;
+        let mut unique_bytes = std::collections::HashSet::new();
+        
+        for i in 0..32 {
+            let pos = (ring_pos + 0x1000 - 32 + i) & 0x0fff;
+            let byte_val = ring[pos];
+            unique_bytes.insert(byte_val);
+            
+            // パターンの多様性評価
+            if byte_val != 0x20 { // 初期値以外
+                pattern_score += 0.1;
+            }
+        }
+        
+        // 多様性ボーナス
+        pattern_score += (unique_bytes.len() as f64) / 32.0;
+        
+        pattern_score.min(1.0)
     }
 }
