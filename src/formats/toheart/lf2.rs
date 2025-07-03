@@ -169,15 +169,16 @@ impl Lf2Image {
             data.push(color.r); // Red
         }
         
-        // Compress pixel data using LZSS
-        let compressed_pixels = self.compress_lzss()?;
+        // Compress pixel data using LZSS (level 0 = no matching for maximum accuracy)
+        let compressed_pixels = self.compress_lzss_with_level(0)?;
         data.extend_from_slice(&compressed_pixels);
         
         Ok(data)
     }
     
-    /// LZSS compression (exact reverse of decompression)
-    fn compress_lzss(&self) -> Result<Vec<u8>> {
+    /// LZSS compression with configurable matching level
+    /// level: 0=無効, 1=短いマッチのみ, 2=標準, 3=最大
+    fn compress_lzss_with_level(&self, match_level: u8) -> Result<Vec<u8>> {
         // Prepare pixel data with Y-flip to match decompression input order
         let total_pixels = (self.width as usize) * (self.height as usize);
         let mut input_pixels = vec![0u8; total_pixels];
@@ -211,13 +212,45 @@ impl Lf2Image {
             while flag_bits_used < 8 && pos < input_pixels.len() {
                 let pixel = input_pixels[pos];
                 
-                // Try to find match in ring buffer (disabled for now for debugging)
-                let (_match_pos, match_len) = self.find_lzss_match(&ring, ring_pos, &input_pixels[pos..]);
+                // Try to find match in ring buffer
+                let (match_pos, match_len) = self.find_lzss_match(&ring, ring_pos, &input_pixels[pos..]);
                 
-                // Force all pixels as direct for now 
-                if false && match_len >= 3 {
-                    // Ring buffer reference - bit = 0 (don't set bit)
-                    // Implementation when needed
+                // Use match based on level
+                let use_match = match match_level {
+                    0 => false, // 無効
+                    1 => match_len == 3, // 3バイトのみ
+                    2 => match_len >= 3 && match_len <= 5, // 短いマッチ
+                    3 => match_len >= 3 && match_len <= 8, // 中程度
+                    4 => match_len >= 3 && match_len <= 12, // 標準
+                    _ => match_len >= 3 && match_len <= 18, // 最大
+                };
+                
+                if use_match {
+                    // Ring buffer reference - bit = 0 (don't set bit in flag)
+                    // Encode to match decompression format:
+                    // upper = (length-3) | (position & 0x0f)
+                    // lower = (position >> 4) & 0xff
+                    let encoded_pos = match_pos & 0x0fff;
+                    let encoded_len = (match_len - 3) & 0x0f;
+                    
+                    let upper_byte = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
+                    let lower_byte = ((encoded_pos >> 4) & 0xff) as u8;
+                    
+                    compressed.push(upper_byte ^ 0xff);
+                    compressed.push(lower_byte ^ 0xff);
+                    
+                    // Update ring buffer exactly like decompression (one byte at a time)
+                    // This mimics the copy process in decompression where bytes are read from 
+                    // ring buffer one by one and written back
+                    let mut copy_pos = match_pos;
+                    for _ in 0..match_len {
+                        let byte_from_ring = ring[copy_pos];
+                        ring[ring_pos] = byte_from_ring;
+                        ring_pos = (ring_pos + 1) & 0x0fff;
+                        copy_pos = (copy_pos + 1) & 0x0fff;
+                    }
+                    
+                    pos += match_len;
                 } else {
                     // Direct pixel - set bit (1 = direct)
                     flag_byte |= 1 << (7 - flag_bits_used);
@@ -240,8 +273,8 @@ impl Lf2Image {
         Ok(compressed)
     }
     
-    /// Find the longest match in the ring buffer
-    fn find_lzss_match(&self, ring: &[u8; 0x1000], _ring_pos: usize, remaining: &[u8]) -> (usize, usize) {
+    /// Find the longest match in the ring buffer (optimized)
+    fn find_lzss_match(&self, ring: &[u8; 0x1000], ring_pos: usize, remaining: &[u8]) -> (usize, usize) {
         let mut best_pos = 0;
         let mut best_len = 0;
         
@@ -249,25 +282,47 @@ impl Lf2Image {
             return (0, 0);
         }
         
-        // Search ring buffer for matches
-        for start in 0..0x1000 {
-            let mut len = 0;
+        let first_byte = remaining[0];
+        let max_len = std::cmp::min(18, remaining.len());
+        
+        // Minimum match length to be useful
+        if max_len < 3 {
+            return (0, 0);
+        }
+        
+        // Search recent history first (better locality)
+        // Look backwards from current position
+        let search_distance = std::cmp::min(0x1000, ring_pos + 0x1000);
+        
+        for offset in 1..=search_distance {
+            let start = (ring_pos + 0x1000 - offset) & 0x0fff;
             
-            // Max match length is 18 (15 + 3), limited by remaining data
-            let max_len = std::cmp::min(18, remaining.len());
+            // Quick first-byte check
+            if ring[start] != first_byte {
+                continue;
+            }
             
-            for i in 0..max_len {
-                let ring_idx = (start + i) & 0x0fff;
-                if ring[ring_idx] == remaining[i] {
+            let mut len = 1;
+            
+            // Check how many bytes match
+            while len < max_len {
+                let ring_idx = (start + len) & 0x0fff;
+                if ring[ring_idx] == remaining[len] {
                     len += 1;
                 } else {
                     break;
                 }
             }
             
-            if len > best_len && len >= 3 {
+            // Only consider matches of 3 or more bytes
+            if len >= 3 && len > best_len {
                 best_len = len;
                 best_pos = start;
+                
+                // If we found a perfect match, use it
+                if len == max_len {
+                    break;
+                }
             }
         }
         
@@ -525,14 +580,16 @@ impl Lf2Image {
                 state.add_step(step);
                 step_number += 1;
                 
+                let mut copy_pos = position;
                 for _ in 0..length {
                     if pixel_idx >= total_pixels {
                         break;
                     }
                     
-                    let pixel = ring[position];
+                    let pixel = ring[copy_pos];
                     ring[ring_pos] = pixel;
                     ring_pos = (ring_pos + 1) & 0x0fff;
+                    copy_pos = (copy_pos + 1) & 0x0fff;
                     
                     let x = pixel_idx % (width as usize);
                     let y = pixel_idx / (width as usize);
