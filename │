@@ -1,0 +1,7 @@
+error: invalid table header
+duplicate key `dependencies` in document root
+   --> Cargo.toml:119:1
+    |
+119 | [dependencies]
+    | ^
+    |

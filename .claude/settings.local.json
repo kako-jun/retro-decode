@@ -23,7 +23,8 @@
       "Bash(git rm:*)",
       "Bash(nvidia-smi:*)",
       "Bash(python3:*)",
-      "Bash(poetry run:*)"
+      "Bash(poetry run:*)",
+      "Bash(timeout 120 cargo run --example deep_search_optimization 2>/dev/null)"
     ],
     "deny": []
   },

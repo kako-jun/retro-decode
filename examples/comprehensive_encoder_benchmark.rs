@@ -42,6 +42,7 @@ fn main() -> Result<()> {
         ("Original Replication", CompressionStrategy::OriginalReplication), 
         ("ML Guided", CompressionStrategy::MachineLearningGuided),
         ("Balanced", CompressionStrategy::Balanced),
+        ("Perfect Original", CompressionStrategy::PerfectOriginalReplication),
     ];
     
     let mut all_results = Vec::new();
@@ -168,6 +169,7 @@ fn print_summary(results: &[BenchmarkResult]) {
         CompressionStrategy::OriginalReplication,
         CompressionStrategy::MachineLearningGuided,
         CompressionStrategy::Balanced,
+        CompressionStrategy::PerfectOriginalReplication,
     ];
     
     for strategy in strategies.iter() {
