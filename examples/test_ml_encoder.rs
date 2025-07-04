@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         ("Original Replication", CompressionStrategy::OriginalReplication), 
         ("ML Guided", CompressionStrategy::MachineLearningGuided),
         ("Balanced", CompressionStrategy::Balanced),
+        ("Perfect Original", CompressionStrategy::PerfectOriginalReplication),
     ];
     
     for (name, strategy) in strategies.iter() {
