@@ -70,11 +70,12 @@
   }
 
   .explanation-text {
-    background: #0f3460;
+    background: #f8f9fa;
     padding: 15px;
     border-radius: 8px;
     border-left: 4px solid #667eea;
     line-height: 1.6;
+    color: #2c3e50;
   }
 
   .explanation-text p {
@@ -88,21 +89,23 @@
   }
 
   .detail-item {
-    background: #0f3460;
+    background: #f8f9fa;
     padding: 10px;
     border-radius: 6px;
+    border: 1px solid #e1e8ed;
   }
 
   .detail-item strong {
-    color: #a0a0ff;
+    color: #667eea;
   }
 
   .bytes {
     font-family: 'Courier New', monospace;
-    background: #1a1a2e;
+    background: #ecf0f1;
     padding: 4px 8px;
     border-radius: 4px;
     display: inline-block;
     margin-left: 8px;
+    color: #2c3e50;
   }
 </style>

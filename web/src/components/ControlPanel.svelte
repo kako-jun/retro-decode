@@ -100,10 +100,11 @@
     display: flex;
     flex-direction: column;
     gap: 15px;
-    background: #16213e;
+    background: #ffffff;
     padding: 20px;
     border-radius: 12px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    border: 1px solid #e1e8ed;
   }
 
   .playback-controls {
@@ -154,7 +155,7 @@
     width: 100%;
     height: 10px;
     border-radius: 5px;
-    background: #0f3460;
+    background: #e1e8ed;
     outline: none;
     -webkit-appearance: none;
   }
@@ -178,6 +179,7 @@
     text-align: center;
     font-size: 1.1rem;
     font-weight: bold;
+    color: #2c3e50;
   }
 
   .speed-control {
@@ -195,9 +197,13 @@
     width: 150px;
     height: 6px;
     border-radius: 3px;
-    background: #0f3460;
+    background: #e1e8ed;
     outline: none;
     -webkit-appearance: none;
+  }
+
+  .speed-control label {
+    color: #2c3e50;
   }
 
   .speed-slider::-webkit-slider-thumb {
