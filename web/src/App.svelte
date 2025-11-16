@@ -8,6 +8,8 @@
   import FileLoader from './components/FileLoader.svelte';
   import { mockSteps } from './mockData.js';
   import { parseLF2File } from './lf2Parser.js';
+  import { encodeToLF2 } from './lf2Encoder.js';
+  import ImageFileLoader from './components/ImageFileLoader.svelte';
 
   // Current step index
   let currentStep = writable(0);
@@ -15,12 +17,14 @@
   let playSpeed = writable(1);
   let steps = mockSteps; // モックデータ
   let loadedFileName = '';
+  let mode = 'decode'; // 'decode' or 'encode'
 
   $: currentStepData = steps[$currentStep] || {};
 
   async function handleFileLoad(fileData, fileName) {
     console.log(`Loading file: ${fileName} (${fileData.length} bytes)`);
     loadedFileName = fileName;
+    mode = 'decode';
 
     try {
       // Parse LF2 file and generate steps
@@ -35,6 +39,32 @@
       alert(`ファイルの解析に失敗しました: ${error.message}`);
     }
   }
+
+  async function handleImageLoad(imageData, width, height, fileName) {
+    console.log(`画像読み込み: ${fileName} (${width}x${height})`);
+    loadedFileName = fileName;
+    mode = 'encode';
+
+    try {
+      const result = encodeToLF2(imageData, width, height);
+      steps = result.steps;
+      currentStep.set(0);
+      console.log(`エンコード完了: ${result.steps.length} ステップ`);
+      console.log(`圧縮率: ${result.compressionRatio}%`);
+
+      // Allow download of encoded LF2
+      const blob = new Blob([result.lf2Data], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName.replace(/\.(png|jpg|jpeg)$/i, '.lf2');
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('エンコードエラー:', error);
+      alert(`エンコードに失敗しました: ${error.message}`);
+    }
+  }
 </script>
 
 <div class="app-container">
@@ -44,6 +74,7 @@
   </header>
 
   <FileLoader onFileLoad={handleFileLoad} />
+  <ImageFileLoader onImageLoad={handleImageLoad} />
 
   {#if loadedFileName}
     <div class="loaded-indicator">
