@@ -1,6 +1,6 @@
 <script>
   import { writable } from 'svelte/store';
-  import CompressedDataPanel from './components/CompressedDataPanel.svelte';
+  import BinaryViewer from './components/BinaryViewer.svelte';
   import RingBufferPanel from './components/RingBufferPanel.svelte';
   import ImagePanel from './components/ImagePanel.svelte';
   import ExplanationPanel from './components/ExplanationPanel.svelte';
@@ -53,10 +53,11 @@
 
   <main class="visualization-grid">
     <div class="panel compressed-data">
-      <h2>圧縮データ</h2>
-      <CompressedDataPanel
-        data={currentStepData.raw_bytes}
-        offset={currentStepData.data_offset}
+      <h2>📄 バイナリビュー</h2>
+      <BinaryViewer
+        data={currentStepData.raw_bytes || []}
+        offset={currentStepData.data_offset || 0}
+        currentOffset={currentStepData.data_offset || 0}
       />
     </div>
 
@@ -99,8 +100,12 @@
     margin: 0;
     padding: 0;
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    background: #1a1a2e;
-    color: #eee;
+    background: #f5f7fa;
+    color: #2c3e50;
+  }
+
+  :global(*) {
+    box-sizing: border-box;
   }
 
   .app-container {
@@ -133,18 +138,46 @@
 
   .visualization-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr 1.5fr;
+    grid-template-columns: 1.2fr 1fr 1.3fr;
     grid-template-rows: 1fr;
     gap: 15px;
     flex: 1;
     min-height: 0;
   }
 
+  /* タブレット対応 */
+  @media (max-width: 1200px) {
+    .visualization-grid {
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto;
+    }
+
+    .panel.compressed-data {
+      grid-column: 1 / -1;
+    }
+  }
+
+  /* モバイル対応 */
+  @media (max-width: 768px) {
+    .app-container {
+      padding: 10px;
+    }
+
+    h1 {
+      font-size: 1.8rem;
+    }
+
+    .subtitle {
+      font-size: 0.85rem;
+    }
+  }
+
   .panel {
-    background: #16213e;
+    background: #ffffff;
     border-radius: 12px;
     padding: 15px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    border: 1px solid #e1e8ed;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -155,14 +188,16 @@
     font-size: 1.2rem;
     border-bottom: 2px solid #667eea;
     padding-bottom: 8px;
+    color: #2c3e50;
   }
 
   .explanation-area {
     margin-top: 15px;
-    background: #16213e;
+    background: #ffffff;
     border-radius: 12px;
     padding: 15px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    border: 1px solid #e1e8ed;
   }
 
   .controls {
@@ -180,10 +215,14 @@
     box-shadow: 0 4px 6px rgba(40, 167, 69, 0.3);
   }
 
-  @media (max-width: 1024px) {
+  @media (max-width: 640px) {
     .visualization-grid {
       grid-template-columns: 1fr;
       grid-template-rows: auto auto auto;
+    }
+
+    .panel {
+      min-height: 250px;
     }
   }
 </style>

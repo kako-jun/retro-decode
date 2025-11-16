@@ -64,9 +64,11 @@
   .position-info {
     margin-top: 10px;
     padding: 8px;
-    background: #0f3460;
+    background: #f8f9fa;
     border-radius: 4px;
     font-family: 'Courier New', monospace;
     font-size: 0.9rem;
+    color: #2c3e50;
+    border: 1px solid #e1e8ed;
   }
 </style>

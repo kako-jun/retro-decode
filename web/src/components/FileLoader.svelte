@@ -53,9 +53,11 @@
     align-items: center;
     gap: 15px;
     padding: 15px;
-    background: #16213e;
+    background: #ffffff;
     border-radius: 12px;
     margin-bottom: 15px;
+    border: 1px solid #e1e8ed;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
   }
 
   .load-button {
