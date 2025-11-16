@@ -3,6 +3,7 @@
 use std::fmt;
 use std::path::Path;
 use anyhow::{anyhow, Result};
+use serde::{Serialize, Deserialize};
 
 pub mod toheart;
 pub mod kanon;
@@ -56,19 +57,45 @@ impl FormatType {
 }
 
 /// Represents a single step in the decoding process
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecodeStep {
     pub step_number: usize,
+    /// Short description of the step
     pub description: String,
+    /// Detailed educational explanation (for popups/subtitles)
+    pub explanation: String,
+    /// Type of operation
+    pub operation_type: StepOperationType,
+    /// Raw data bytes involved in this step
+    pub raw_bytes: Vec<u8>,
     pub data_offset: usize,
     pub data_length: usize,
     pub pixels_decoded: usize,
+    /// Current ring buffer state (showing relevant portion)
     pub memory_state: Vec<u8>,
+    /// Ring buffer position
+    pub ring_position: usize,
+    /// Partial decoded image at this step
     pub partial_image: Option<Vec<u8>>,
 }
 
+/// Type of decoding operation
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StepOperationType {
+    /// Reading a flag byte that controls next 8 operations
+    FlagByte,
+    /// Direct pixel copy (literal)
+    DirectPixel { palette_index: u8 },
+    /// LZSS match (reference to ring buffer)
+    LzssMatch { distance: usize, length: usize },
+    /// Header parsing
+    Header,
+    /// Palette data
+    Palette,
+}
+
 /// State of the decoding process
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecodingState {
     pub steps: Vec<DecodeStep>,
     pub current_step: usize,
