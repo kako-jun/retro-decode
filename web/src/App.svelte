@@ -5,15 +5,36 @@
   import ImagePanel from './components/ImagePanel.svelte';
   import ExplanationPanel from './components/ExplanationPanel.svelte';
   import ControlPanel from './components/ControlPanel.svelte';
+  import FileLoader from './components/FileLoader.svelte';
   import { mockSteps } from './mockData.js';
+  import { parseLF2File } from './lf2Parser.js';
 
   // Current step index
   let currentStep = writable(0);
   let isPlaying = writable(false);
   let playSpeed = writable(1);
   let steps = mockSteps; // モックデータ
+  let loadedFileName = '';
 
   $: currentStepData = steps[$currentStep] || {};
+
+  async function handleFileLoad(fileData, fileName) {
+    console.log(`Loading file: ${fileName} (${fileData.length} bytes)`);
+    loadedFileName = fileName;
+
+    try {
+      // Parse LF2 file and generate steps
+      const parsedSteps = parseLF2File(fileData);
+      if (parsedSteps && parsedSteps.length > 0) {
+        steps = parsedSteps;
+        currentStep.set(0);
+        console.log(`Parsed ${steps.length} steps from ${fileName}`);
+      }
+    } catch (error) {
+      console.error('Failed to parse file:', error);
+      alert(`ファイルの解析に失敗しました: ${error.message}`);
+    }
+  }
 </script>
 
 <div class="app-container">
@@ -21,6 +42,14 @@
     <h1>🎮 RetroDecode - LZSS可視化エンジン</h1>
     <p class="subtitle">P⁴ — Pixel by pixel, past preserved</p>
   </header>
+
+  <FileLoader onFileLoad={handleFileLoad} />
+
+  {#if loadedFileName}
+    <div class="loaded-indicator">
+      ✅ ファイル読み込み済み: {loadedFileName} ({steps.length} ステップ)
+    </div>
+  {/if}
 
   <main class="visualization-grid">
     <div class="panel compressed-data">
@@ -138,6 +167,17 @@
 
   .controls {
     margin-top: 15px;
+  }
+
+  .loaded-indicator {
+    padding: 10px;
+    background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+    color: white;
+    font-weight: bold;
+    border-radius: 8px;
+    text-align: center;
+    margin-bottom: 15px;
+    box-shadow: 0 4px 6px rgba(40, 167, 69, 0.3);
   }
 
   @media (max-width: 1024px) {
