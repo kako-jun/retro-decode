@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RetroDecode Extension</title>
+  <style>
+    body {
+      width: 320px;
+      padding: 16px;
+      margin: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+
+    h1 {
+      margin: 0 0 12px 0;
+      font-size: 1.4rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .logo {
+      font-size: 2rem;
+    }
+
+    .tagline {
+      font-size: 0.85rem;
+      opacity: 0.9;
+      font-style: italic;
+      margin-bottom: 16px;
+    }
+
+    .info-box {
+      background: rgba(255, 255, 255, 0.15);
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      backdrop-filter: blur(10px);
+    }
+
+    .info-box h2 {
+      margin: 0 0 8px 0;
+      font-size: 1rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+      padding-bottom: 6px;
+    }
+
+    .info-box ul {
+      margin: 8px 0 0 0;
+      padding-left: 20px;
+    }
+
+    .info-box li {
+      margin: 4px 0;
+      font-size: 0.9rem;
+    }
+
+    .format-badge {
+      display: inline-block;
+      background: rgba(255, 255, 255, 0.25);
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 0.85rem;
+      margin: 4px 4px 4px 0;
+      font-weight: 600;
+    }
+
+    .links {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .link-button {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.2);
+      color: white;
+      text-decoration: none;
+      padding: 10px;
+      border-radius: 6px;
+      text-align: center;
+      font-size: 0.85rem;
+      transition: all 0.2s;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+    }
+
+    .link-button:hover {
+      background: rgba(255, 255, 255, 0.3);
+      transform: translateY(-2px);
+    }
+
+    .footer {
+      margin-top: 12px;
+      text-align: center;
+      font-size: 0.75rem;
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <h1>
+    <span class="logo">🎮</span>
+    RetroDecode
+  </h1>
+  <p class="tagline">P⁴ — Pixel by pixel, past preserved</p>
+
+  <div class="info-box">
+    <h2>📦 対応形式</h2>
+    <div>
+      <span class="format-badge">LF2 (ToHeart)</span>
+      <span class="format-badge">PDT (Kanon)</span>
+    </div>
+  </div>
+
+  <div class="info-box">
+    <h2>✨ 使い方</h2>
+    <ul>
+      <li>LF2/PDT画像が自動的にPNGに変換</li>
+      <li>&lt;img src="image.lf2"&gt; が動作</li>
+      <li>動的に追加される画像にも対応</li>
+    </ul>
+  </div>
+
+  <div class="links">
+    <a href="https://github.com/kako-jun/retro-decode" target="_blank" class="link-button">
+      GitHub
+    </a>
+    <a href="https://kako-jun.github.io/retro-decode/" target="_blank" class="link-button">
+      Web版
+    </a>
+  </div>
+
+  <div class="footer">
+    RetroDecode v1.0.0<br>
+    教育目的・歴史保存
+  </div>
+</body>
+</html>
