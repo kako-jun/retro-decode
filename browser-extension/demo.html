@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RetroDecode Browser Extension - Demo</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f7fa;
+      color: #2c3e50;
+    }
+
+    header {
+      text-align: center;
+      padding: 2rem 1rem;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border-radius: 12px;
+      margin-bottom: 2rem;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 2.5rem;
+    }
+
+    .subtitle {
+      margin: 0.5rem 0 0 0;
+      font-style: italic;
+      opacity: 0.9;
+    }
+
+    .alert {
+      background: #fff3cd;
+      border: 2px solid #ffc107;
+      color: #856404;
+      padding: 1rem;
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+    }
+
+    .alert strong {
+      display: block;
+      margin-bottom: 0.5rem;
+      font-size: 1.1rem;
+    }
+
+    .alert ul {
+      margin: 0.5rem 0;
+      padding-left: 1.5rem;
+    }
+
+    .section {
+      background: white;
+      padding: 1.5rem;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+      margin-bottom: 1.5rem;
+    }
+
+    .section h2 {
+      margin: 0 0 1rem 0;
+      color: #667eea;
+      border-bottom: 2px solid #667eea;
+      padding-bottom: 0.5rem;
+    }
+
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+      margin-top: 1rem;
+    }
+
+    .image-card {
+      border: 2px solid #e1e8ed;
+      border-radius: 8px;
+      padding: 1rem;
+      background: #f8f9fa;
+    }
+
+    .image-card h3 {
+      margin: 0 0 0.5rem 0;
+      font-size: 1.1rem;
+      color: #2c3e50;
+    }
+
+    .image-card img {
+      width: 100%;
+      height: auto;
+      border: 1px solid #dee2e6;
+      border-radius: 4px;
+      background: #fff;
+      display: block;
+      margin: 0.5rem 0;
+    }
+
+    .image-card .filename {
+      font-family: 'Courier New', monospace;
+      background: #e9ecef;
+      padding: 0.3rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      margin-bottom: 0.5rem;
+      display: inline-block;
+    }
+
+    .image-card .status {
+      font-size: 0.85rem;
+      color: #6c757d;
+      margin-top: 0.5rem;
+    }
+
+    .code-block {
+      background: #2c3e50;
+      color: #ecf0f1;
+      padding: 1rem;
+      border-radius: 6px;
+      font-family: 'Courier New', monospace;
+      font-size: 0.9rem;
+      overflow-x: auto;
+      margin: 1rem 0;
+    }
+
+    .code-block code {
+      color: #3498db;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .btn {
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-decoration: none;
+      display: inline-block;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    }
+
+    .btn-secondary {
+      background: #6c757d;
+      color: white;
+    }
+
+    .btn-secondary:hover {
+      background: #5a6268;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🎮 RetroDecode Browser Extension</h1>
+    <p class="subtitle">レトロゲーム画像を自動デコード</p>
+  </header>
+
+  <div class="alert">
+    <strong>⚠️ 拡張機能のインストールが必要です</strong>
+    <p>このページで画像を表示するには、RetroDecode ブラウザ拡張をインストールしてください。</p>
+    <ul>
+      <li><strong>Chrome/Edge</strong>: chrome://extensions/ で「デベロッパーモード」を有効にし、「パッケージ化されていない拡張機能を読み込む」から <code>browser-extension</code> フォルダを選択</li>
+      <li><strong>Firefox</strong>: about:debugging#/runtime/this-firefox で「一時的なアドオンを読み込む」から <code>manifest.json</code> を選択</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>📖 使い方</h2>
+    <p>拡張をインストールすると、通常のWebページで <code>&lt;img&gt;</code> タグに LF2/PDT ファイルを指定できます：</p>
+    <div class="code-block">
+&lt;!-- ToHeart LF2形式 --&gt;
+&lt;<code>img</code> src="image.lf2" alt="キャラクター画像"&gt;
+
+&lt;!-- Kanon PDT形式 --&gt;
+&lt;<code>img</code> src="background.pdt" alt="背景画像"&gt;
+    </div>
+    <p>拡張が自動的にPNG形式に変換して表示します。</p>
+  </div>
+
+  <div class="section">
+    <h2>🖼️ デモ画像</h2>
+    <p>以下の画像は拡張がインストールされていると自動的にデコードされます：</p>
+
+    <div class="image-grid">
+      <div class="image-card">
+        <h3>📁 LF2サンプル（仮想）</h3>
+        <div class="filename">sample.lf2</div>
+        <img src="sample.lf2" alt="LF2サンプル画像" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+        <div class="status" style="display:none; color: #e74c3c;">
+          ❌ ファイルが見つかりません。実際のLF2ファイルを配置してください。
+        </div>
+        <p class="status">
+          拡張がインストールされている場合、自動的にデコードされます。
+        </p>
+      </div>
+
+      <div class="image-card">
+        <h3>📁 PDTサンプル（仮想）</h3>
+        <div class="filename">background.pdt</div>
+        <img src="background.pdt" alt="PDTサンプル画像" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+        <div class="status" style="display:none; color: #e74c3c;">
+          ❌ ファイルが見つかりません。実際のPDTファイルを配置してください。
+        </div>
+        <p class="status">
+          PDT形式も対応しています（基礎実装）。
+        </p>
+      </div>
+    </div>
+
+    <div class="alert" style="background: #d1ecf1; border-color: #bee5eb; color: #0c5460;">
+      <strong>💡 テスト方法</strong>
+      <p>実際のLF2/PDTファイルをこのフォルダに配置して、上記の <code>sample.lf2</code> や <code>background.pdt</code> を実際のファイル名に変更してください。</p>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>🧪 動的追加テスト</h2>
+    <p>JavaScript で動的に追加される画像も自動的にデコードされます：</p>
+    <div class="button-group">
+      <button class="btn btn-primary" onclick="addDynamicImage()">
+        画像を動的追加
+      </button>
+      <button class="btn btn-secondary" onclick="clearDynamicImages()">
+        クリア
+      </button>
+    </div>
+    <div id="dynamic-container" style="margin-top: 1rem;"></div>
+  </div>
+
+  <div class="section">
+    <h2>🔬 技術詳細</h2>
+    <ul>
+      <li><strong>デコード方式</strong>: LZSS圧縮（LF2）、RLE圧縮（PDT基礎実装）</li>
+      <li><strong>実装</strong>: Content Script + MutationObserver</li>
+      <li><strong>変換</strong>: Canvas API でPNG data URLに変換</li>
+      <li><strong>対応</strong>: Chrome, Firefox, Edge 等のモダンブラウザ</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>🔗 リンク</h2>
+    <div class="button-group">
+      <a href="https://github.com/kako-jun/retro-decode" target="_blank" class="btn btn-primary">
+        GitHub リポジトリ
+      </a>
+      <a href="https://kako-jun.github.io/retro-decode/" target="_blank" class="btn btn-primary">
+        Web版デコーダ
+      </a>
+    </div>
+  </div>
+
+  <script>
+    let dynamicCounter = 0;
+
+    function addDynamicImage() {
+      const container = document.getElementById('dynamic-container');
+      const div = document.createElement('div');
+      div.className = 'image-card';
+      div.style.marginTop = '1rem';
+
+      const filename = `dynamic-${++dynamicCounter}.lf2`;
+      div.innerHTML = `
+        <h3>動的追加 #${dynamicCounter}</h3>
+        <div class="filename">${filename}</div>
+        <img src="${filename}" alt="動的追加画像 ${dynamicCounter}" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+        <div class="status" style="display:none; color: #e74c3c;">
+          ❌ ファイルが見つかりません
+        </div>
+        <p class="status">JavaScriptで動的に追加されました</p>
+      `;
+
+      container.appendChild(div);
+    }
+
+    function clearDynamicImages() {
+      document.getElementById('dynamic-container').innerHTML = '';
+      dynamicCounter = 0;
+    }
+  </script>
+</body>
+</html>

@@ -231,11 +231,18 @@ impl PakArchive {
             if config.step_by_step {
                 let step = DecodeStep {
                     step_number: i + 1,
-                    description: format!("Extracting {}", entry.name),
+                    description: format!("展開中: {}", entry.name),
+                    explanation: format!(
+                        "ファイル: {}\nオフセット: 0x{:08x}\nサイズ: {} バイト",
+                        entry.name, entry.position, entry.length
+                    ),
+                    operation_type: crate::formats::StepOperationType::Header,
+                    raw_bytes: vec![],
                     data_offset: entry.position as usize,
                     data_length: entry.length as usize,
                     pixels_decoded: i + 1,
                     memory_state: self.decryption_key.to_vec(),
+                    ring_position: 0,
                     partial_image: None,
                 };
                 state.add_step(step);

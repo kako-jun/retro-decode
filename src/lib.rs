@@ -18,6 +18,10 @@ pub mod bridge;
 #[cfg_attr(docsrs, doc(cfg(feature = "gui")))]
 pub mod gui;
 
+#[cfg(feature = "wasm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "wasm")))]
+pub mod wasm;
+
 use std::path::PathBuf;
 
 pub use formats::{FormatType, DecodeStep, DecodingState};

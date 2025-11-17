@@ -930,11 +930,21 @@ impl Lf2Image {
                 // Add step for flag reading
                 let step = DecodeStep {
                     step_number,
-                    description: format!("Read flag byte: 0x{:02x}", flag),
+                    description: format!("フラグバイト: 0x{:02x}", flag),
+                    explanation: format!(
+                        "フラグバイト 0x{:02x} を読み込みました。このバイトの各ビットが次の8つの操作を制御します。\n\
+                         ビット=1: 直接ピクセル（リテラル）\n\
+                         ビット=0: LZSSマッチ（リングバッファ参照）\n\
+                         現在の進捗: {}/{} ピクセル",
+                        flag, pixel_idx, total_pixels
+                    ),
+                    operation_type: crate::formats::StepOperationType::FlagByte,
+                    raw_bytes: vec![compressed_data[data_pos - 1]],
                     data_offset: data_pos - 1,
                     data_length: 1,
                     pixels_decoded: pixel_idx,
                     memory_state: ring[..32].to_vec(), // Show first 32 bytes of ring buffer
+                    ring_position: ring_pos,
                     partial_image: None,
                 };
                 state.add_step(step);
@@ -964,11 +974,21 @@ impl Lf2Image {
                 // Add step for direct pixel
                 let step = DecodeStep {
                     step_number,
-                    description: format!("Direct pixel: {} at ({},{})", pixel, x, y),
+                    description: format!("直接ピクセル: #{} 位置({},{})", pixel, x, y),
+                    explanation: format!(
+                        "直接ピクセルデータ: パレットインデックス {} (0x{:02x})\n\
+                         座標: ({}, {}) → 出力位置 {}\n\
+                         リングバッファ位置 0x{:03x} に書き込み\n\
+                         この操作では圧縮されていない生のピクセル値を直接出力します。",
+                        pixel, pixel, x, y, output_idx, ring_pos - 1
+                    ),
+                    operation_type: crate::formats::StepOperationType::DirectPixel { palette_index: pixel },
+                    raw_bytes: vec![compressed_data[data_pos - 1]],
                     data_offset: data_pos - 1,
                     data_length: 1,
                     pixels_decoded: pixel_idx + 1,
                     memory_state: ring[..32].to_vec(),
+                    ring_position: ring_pos,
                     partial_image: Some(pixels[..std::cmp::min(pixels.len(), (pixel_idx + 1) * 3)].to_vec()),
                 };
                 state.add_step(step);
@@ -986,14 +1006,45 @@ impl Lf2Image {
                 
                 let length = ((upper & 0x0f) as usize) + 3;
                 let position = (((upper >> 4) as usize) + ((lower as usize) << 4)) & 0x0fff;
-                
+                let distance = if ring_pos >= position {
+                    ring_pos - position
+                } else {
+                    0x1000 - position + ring_pos
+                };
+
                 let step = DecodeStep {
                     step_number,
-                    description: format!("Ring buffer copy: {} bytes from position 0x{:03x}", length, position),
+                    description: format!("LZSSマッチ: 距離{}, 長さ{}", distance, length),
+                    explanation: format!(
+                        "LZSSマッチング（LZSS Match）\n\
+                         生バイト: [0x{:02x}, 0x{:02x}]\n\
+                         → 長さ: {} バイト (0x{:01x} + 3)\n\
+                         → 位置: 0x{:03x}\n\
+                         → 距離: {} バイト前\n\n\
+                         リングバッファの位置 0x{:03x} から {} バイトをコピーします。\n\
+                         これにより {}バイトを2バイトで表現できます（圧縮率: {:.1}%）。\n\
+                         現在リングバッファ位置: 0x{:03x}",
+                        upper ^ 0xff, lower ^ 0xff,
+                        length, upper & 0x0f,
+                        position,
+                        distance,
+                        position, length, length,
+                        (1.0 - 2.0 / length as f32) * 100.0,
+                        ring_pos
+                    ),
+                    operation_type: crate::formats::StepOperationType::LzssMatch {
+                        distance,
+                        length
+                    },
+                    raw_bytes: vec![
+                        compressed_data[data_pos - 2],
+                        compressed_data[data_pos - 1]
+                    ],
                     data_offset: data_pos - 2,
                     data_length: 2,
                     pixels_decoded: pixel_idx,
                     memory_state: ring[..32].to_vec(),
+                    ring_position: ring_pos,
                     partial_image: None,
                 };
                 state.add_step(step);
@@ -1201,11 +1252,15 @@ impl Lf2Image {
         // Add final step
         let step = DecodeStep {
             step_number: 1,
-            description: "LF2 decompression completed".to_string(),
+            description: "LF2デコード完了".to_string(),
+            explanation: format!("LF2画像のデコードが完了しました。合計 {} ピクセルを処理しました。", self.pixels.len()),
+            operation_type: crate::formats::StepOperationType::Header,
+            raw_bytes: vec![],
             data_offset: 0,
             data_length: self.pixels.len(),
             pixels_decoded: self.pixels.len(),
             memory_state: vec![],
+            ring_position: 0,
             partial_image: None,
         };
         state.add_step(step);

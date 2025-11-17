@@ -335,11 +335,21 @@ impl PdtImage {
         // Add step
         let step = DecodeStep {
             step_number: 1,
-            description: "PDT decompression completed".to_string(),
+            description: "PDTデコード完了".to_string(),
+            explanation: format!(
+                "PDT画像のデコードが完了しました。\n\
+                 サイズ: {}x{}\n\
+                 ピクセル数: {}\n\
+                 圧縮率: {:.2}%",
+                self.width, self.height, self.pixels.len(), compression_ratio
+            ),
+            operation_type: crate::formats::StepOperationType::Header,
+            raw_bytes: vec![],
             data_offset: 32,
             data_length: self.pixels.len() * 3,
             pixels_decoded: self.pixels.len(),
             memory_state: vec![], // Ring buffer state would go here
+            ring_position: 0,
             partial_image: None,
         };
         state.add_step(step);
