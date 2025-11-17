@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "RetroDecode Image Decoder",
+  "version": "1.0.0",
+  "description": "レトロゲーム画像形式（LF2/PDT）をブラウザで自動デコード",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "decoder/lf2Decoder.js",
+        "decoder/pdtDecoder.js",
+        "decoder/imageConverter.js",
+        "content-script.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}
