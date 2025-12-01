@@ -136,5 +136,8 @@ test_output/
 # Temporary files
 *.tmp
 *.temp
-.cache/.claude/settings.local.json
+.cache/
+
+# Claude/Serena
+.claude/settings.local.json
 .serena/
