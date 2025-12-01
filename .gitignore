@@ -136,4 +136,4 @@ test_output/
 # Temporary files
 *.tmp
 *.temp
-.cache/
+.cache/.claude/settings.local.json
