@@ -137,3 +137,4 @@ test_output/
 *.tmp
 *.temp
 .cache/.claude/settings.local.json
+.serena/
