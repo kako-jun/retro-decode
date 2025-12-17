@@ -141,3 +141,4 @@ test_output/
 # Claude/Serena
 .claude/settings.local.json
 .serena/
+.mcp.json
