@@ -239,7 +239,93 @@ impl Lf2Image {
         
         Ok(data)
     }
-    
+
+    /// 奥村晴彦 lzss.c (1989) 二分木版 Encode を用いた再エンコード（研究用途）。
+    ///
+    /// 既存の `compress_lzss_*` は一切触らず並存させる。Issue
+    /// kako-jun/retro-decode#3 の仮説検証用のベータ品質実装。
+    /// `CompressionStrategy` への統合は Issue #3 の完全バイナリ一致達成後に
+    /// 検討する（現時点ではペイロード一致率 31.6% にとどまるため研究フェーズ）。
+    ///
+    /// 戻り値は LF2 完全ファイルバイト列（ヘッダ+パレット+圧縮ペイロード）。
+    pub fn to_lf2_bytes_okumura(&self) -> Result<Vec<u8>> {
+        use super::okumura_lzss::{compress_okumura as okumura_encode, Token};
+
+        // ヘッダ・パレットは既存と同じ組み立て（to_lf2_bytes_with_strategy を参照）
+        let mut data = Vec::new();
+        data.extend_from_slice(LF2_MAGIC);
+        data.extend_from_slice(&self.x_offset.to_le_bytes());
+        data.extend_from_slice(&self.y_offset.to_le_bytes());
+        data.extend_from_slice(&self.width.to_le_bytes());
+        data.extend_from_slice(&self.height.to_le_bytes());
+        data.extend_from_slice(&[0; 2]);
+        data.push(self.transparent_color);
+        data.extend_from_slice(&[0; 3]);
+        data.push(self.color_count);
+        data.push(0);
+        for color in &self.palette {
+            data.push(color.b);
+            data.push(color.g);
+            data.push(color.r);
+        }
+
+        // Y-flip 前処理（既存 compress_lzss_ml_guided と同じ）。
+        // デコーダは Y 反転後のバイト列を展開するので、エンコーダ側も
+        // Y 反転後のバイト列を圧縮する必要がある。
+        let total_pixels = (self.width as usize) * (self.height as usize);
+        let mut input_pixels = vec![0u8; total_pixels];
+        for pixel_idx in 0..total_pixels {
+            let x = pixel_idx % (self.width as usize);
+            let y = pixel_idx / (self.width as usize);
+            let flipped_y = (self.height as usize) - 1 - y;
+            let output_idx = flipped_y * (self.width as usize) + x;
+            if output_idx < self.pixels.len() {
+                input_pixels[pixel_idx] = self.pixels[output_idx];
+            }
+        }
+
+        let tokens = okumura_encode(&input_pixels);
+
+        // トークン列を LF2 framing に詰める:
+        // - 8 トークンごとに flag byte（リテラル=1, マッチ=0, MSB ファースト）
+        // - リテラル:   pixel
+        // - マッチ:     upper = (len-3) | ((pos & 0x0f) << 4)
+        //              lower = (pos >> 4) & 0xff
+        // - 全出力バイトに XOR 0xff
+        let mut compressed: Vec<u8> = Vec::new();
+        let mut i = 0usize;
+        while i < tokens.len() {
+            let flag_pos = compressed.len();
+            compressed.push(0); // placeholder
+
+            let mut flag_byte: u8 = 0;
+            let mut bits_used = 0;
+            while bits_used < 8 && i < tokens.len() {
+                match tokens[i] {
+                    Token::Literal(b) => {
+                        flag_byte |= 1 << (7 - bits_used);
+                        compressed.push(b ^ 0xff);
+                    }
+                    Token::Match { pos, len } => {
+                        let encoded_pos = (pos as usize) & 0x0fff;
+                        let encoded_len = ((len as usize) - 3) & 0x0f;
+                        let upper = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
+                        let lower = ((encoded_pos >> 4) & 0xff) as u8;
+                        compressed.push(upper ^ 0xff);
+                        compressed.push(lower ^ 0xff);
+                    }
+                }
+                bits_used += 1;
+                i += 1;
+            }
+
+            compressed[flag_pos] = flag_byte ^ 0xff;
+        }
+
+        data.extend_from_slice(&compressed);
+        Ok(data)
+    }
+
     /// LZSS compression with configurable matching level
     /// level: 0=無効, 1=短いマッチのみ, 2=標準, 3=最大
     fn compress_lzss_with_level(&self, match_level: u8) -> Result<Vec<u8>> {
