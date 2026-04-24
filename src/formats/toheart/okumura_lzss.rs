@@ -122,7 +122,7 @@ impl Okumura {
                 i += 1;
             }
 
-            if i > self.match_length as usize {
+            if (i as i32) > self.match_length {
                 self.match_position = p;
                 self.match_length = i as i32;
                 if i >= F {
@@ -230,8 +230,8 @@ pub fn compress_okumura(input: &[u8]) -> Vec<Token> {
         return out;
     }
 
-    // 最初に F-1 個のダミー挿入（奥村原典 for i=1..=F-1 の InsertNode(r-i)）
-    for i in 1..=(F - 1) {
+    // 最初に F 個のダミー挿入（奥村原典 for (i = 1; i <= F; i++) InsertNode(r - i)）
+    for i in 1..=F {
         st.insert_node(r - i as i32);
     }
     // 最初の本挿入
@@ -248,6 +248,7 @@ pub fn compress_okumura(input: &[u8]) -> Vec<Token> {
             st.match_length = 1;
             out.push(Token::Literal(st.text_buf[r as usize]));
         } else {
+            // match_position は InsertNode 内で必ず 0..N の範囲に収まる（ring index）
             out.push(Token::Match {
                 pos: (st.match_position as u16) & ((N as u16) - 1),
                 len: st.match_length as u8,
