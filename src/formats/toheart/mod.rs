@@ -11,6 +11,7 @@ use crate::{DecodeConfig, DecodingState};
 pub mod pak;
 pub mod lf2;
 pub mod scn;
+pub mod okumura_lzss;
 
 pub mod test_transparency;
 
