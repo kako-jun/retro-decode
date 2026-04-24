@@ -199,9 +199,65 @@ pub fn enumerate_match_candidates(
     out
 }
 
+/// write-back を考慮した候補列挙版。
+///
+/// `distance < len` の自己参照マッチでは、コピーしながら ring buffer へ
+/// 書き戻したバイトをそのまま続きで読む。snapshot のみを見る単純列挙では
+/// この種の候補を過小検出するため、decoder と同じ write-back を模擬する。
+pub fn enumerate_match_candidates_with_writeback(
+    ring: &[u8; 0x1000],
+    input: &[u8],
+    s: usize,
+    r: usize,
+) -> Vec<MatchCandidate> {
+    let mut out: Vec<MatchCandidate> = Vec::new();
+    if s >= input.len() {
+        return out;
+    }
+    let remaining = input.len() - s;
+    let max_len_by_input = remaining.min(18);
+    if max_len_by_input < 3 {
+        return out;
+    }
+
+    for pos in 0..0x1000usize {
+        let mut tmp_ring = *ring;
+        let mut tmp_r = r & 0x0fff;
+        let mut copy_pos = pos;
+        let mut l = 0usize;
+
+        while l < max_len_by_input {
+            let rb = tmp_ring[copy_pos];
+            let ib = input[s + l];
+            if rb != ib {
+                break;
+            }
+            tmp_ring[tmp_r] = rb;
+            tmp_r = (tmp_r + 1) & 0x0fff;
+            copy_pos = (copy_pos + 1) & 0x0fff;
+            l += 1;
+        }
+
+        if l >= 3 {
+            for len in 3..=l {
+                out.push(MatchCandidate {
+                    pos: pos as u16,
+                    len: len as u8,
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.pos.cmp(&b.pos).then(a.len.cmp(&b.len)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::toheart::lf2::Lf2Image;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn decompress_to_tokens_roundtrip_trivial() {
@@ -280,5 +336,50 @@ mod tests {
         let input = vec![0x20, 0x20];
         let cands = enumerate_match_candidates(&ring, &input, 0);
         assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn enumerate_candidates_with_writeback_finds_self_reference_run() {
+        let mut ring = [0x00u8; 0x1000];
+        let r = 0x0feeusize;
+        let pos = (r + 0x1000 - 1) & 0x0fff;
+        ring[pos] = b'A';
+        let input = b"AAAAAA".to_vec();
+
+        let snapshot = enumerate_match_candidates(&ring, &input, 0);
+        assert!(
+            !snapshot.iter().any(|c| c.pos as usize == pos && c.len == 6),
+            "snapshot-only enumeration should miss self-reference len=6"
+        );
+
+        let with_writeback =
+            enumerate_match_candidates_with_writeback(&ring, &input, 0, r);
+        assert!(with_writeback
+            .iter()
+            .any(|c| c.pos as usize == pos && c.len == 6));
+    }
+
+    #[test]
+    fn ring_input_matches_decompress_lzss_after_unflipping_rows() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_assets/generated/debug_compression.lf2");
+        let data = fs::read(&path).expect("read test LF2");
+        let width = u16::from_le_bytes([data[12], data[13]]);
+        let height = u16::from_le_bytes([data[14], data[15]]);
+        let color_count = data[0x16];
+        let payload_start = 0x18 + (color_count as usize) * 3;
+
+        let decoded =
+            decompress_to_tokens(&data[payload_start..], width, height).expect("token decode");
+        let image = Lf2Image::open(&path).expect("lf2 open");
+
+        let mut unflipped = Vec::with_capacity(image.pixels.len());
+        for y in (0..height as usize).rev() {
+            let row_start = y * width as usize;
+            let row_end = row_start + width as usize;
+            unflipped.extend_from_slice(&image.pixels[row_start..row_end]);
+        }
+
+        assert_eq!(decoded.ring_input, unflipped);
     }
 }

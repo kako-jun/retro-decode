@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use retro_decode::formats::toheart::lf2_tokens::{
-    decompress_to_tokens, enumerate_match_candidates, LeafToken, MatchCandidate,
+    decompress_to_tokens, enumerate_match_candidates_with_writeback, LeafToken, MatchCandidate,
 };
 use retro_decode::formats::toheart::okumura_lzss::{compress_okumura, Token as OkuToken};
 
@@ -254,7 +254,8 @@ fn find_first_divergence(
 }
 
 struct AnalyzeResult {
-    payload_match: bool,
+    token_match: bool,
+    byte_match: bool,
     divergence: Option<DivergenceResult>,
 }
 
@@ -262,9 +263,38 @@ struct DivergenceResult {
     info: DivergenceInfo,
     candidates: Vec<MatchCandidate>,
     leaf_in_candidates: bool,
+    is_tail_overrun: bool,
     max_candidate_len: u8,
     same_len_different_pos_count: usize,
     longer_than_leaf_count: usize,
+}
+
+fn encode_okumura_tokens(tokens: &[OkuToken]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let block = &tokens[i..tokens.len().min(i + 8)];
+        let mut flag = 0u8;
+        for (bit, token) in block.iter().enumerate() {
+            if matches!(token, OkuToken::Literal(_)) {
+                flag |= 1 << (7 - bit);
+            }
+        }
+        out.push(flag ^ 0xff);
+        for token in block {
+            match token {
+                OkuToken::Literal(b) => out.push(*b ^ 0xff),
+                OkuToken::Match { pos, len } => {
+                    let upper = ((len - 3) & 0x0f) | (((pos & 0x0f) as u8) << 4);
+                    let lower = ((pos >> 4) & 0xff) as u8;
+                    out.push(upper ^ 0xff);
+                    out.push(lower ^ 0xff);
+                }
+            }
+        }
+        i += block.len();
+    }
+    out
 }
 
 fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
@@ -273,8 +303,8 @@ fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
     let leaf_decode = decompress_to_tokens(payload, hdr.width, hdr.height)?;
     let oku_tokens = compress_okumura(&leaf_decode.ring_input);
 
-    // 完全一致判定: 全トークン一致
-    let same_tokens = leaf_decode.tokens.len() == oku_tokens.len()
+    let byte_match = payload == encode_okumura_tokens(&oku_tokens);
+    let token_match = leaf_decode.tokens.len() == oku_tokens.len()
         && leaf_decode
             .tokens
             .iter()
@@ -288,10 +318,11 @@ fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
                     && lu.len == ou.len
             });
 
-    if same_tokens {
+    if token_match {
         return Ok((
             AnalyzeResult {
-                payload_match: true,
+                token_match: true,
+                byte_match,
                 divergence: None,
             },
             hdr,
@@ -305,7 +336,8 @@ fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
             // ここに来るのは同じ長さ・同じ内容なはず。ここに落ちたら内部矛盾
             return Ok((
                 AnalyzeResult {
-                    payload_match: true,
+                    token_match: true,
+                    byte_match,
                     divergence: None,
                 },
                 hdr,
@@ -314,7 +346,12 @@ fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
     };
 
     // 候補列挙
-    let candidates = enumerate_match_candidates(&*div.ring, &leaf_decode.ring_input, div.s);
+    let candidates = enumerate_match_candidates_with_writeback(
+        &*div.ring,
+        &leaf_decode.ring_input,
+        div.s,
+        div.ring_r,
+    );
 
     let leaf_in_candidates = if div.leaf.is_match {
         candidates.iter().any(|c| c.pos == div.leaf.pos && c.len == div.leaf.len)
@@ -322,6 +359,8 @@ fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
         // リテラルなら「候補集合に含まれる」という問いは不適切。false 扱い
         false
     };
+    let remaining = leaf_decode.ring_input.len().saturating_sub(div.s);
+    let is_tail_overrun = div.leaf.is_match && (div.leaf.len as usize) > remaining;
     let max_candidate_len = candidates.iter().map(|c| c.len).max().unwrap_or(0);
     let same_len_different_pos_count = if div.leaf.is_match {
         candidates
@@ -339,11 +378,13 @@ fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
 
     Ok((
         AnalyzeResult {
-            payload_match: false,
+            token_match: false,
+            byte_match,
             divergence: Some(DivergenceResult {
                 info: div,
                 candidates,
                 leaf_in_candidates,
+                is_tail_overrun,
                 max_candidate_len,
                 same_len_different_pos_count,
                 longer_than_leaf_count,
@@ -368,7 +409,8 @@ fn print_single(path: &Path) -> anyhow::Result<()> {
 
     println!("File: {}", name);
     println!("Image: {}x{}, color_count={}", hdr.width, hdr.height, hdr.color_count);
-    println!("Payload match: {}", if res.payload_match { "YES" } else { "NO" });
+    println!("Token match: {}", if res.token_match { "YES" } else { "NO" });
+    println!("Byte match:  {}", if res.byte_match { "YES" } else { "NO" });
 
     let div = match res.divergence {
         None => {
@@ -425,9 +467,12 @@ fn print_single(path: &Path) -> anyhow::Result<()> {
 
     println!();
     println!(
-        "Leaf's choice in candidate set: {}",
+        "Leaf's choice in candidate set ((pos,len) exact): {}",
         if div.leaf_in_candidates { "YES" } else { "NO" }
     );
+    if div.is_tail_overrun {
+        println!("Tail overrun: YES (Leaf len extends past EOF; decoder clamps at image end)");
+    }
     if div.info.leaf.is_match && div.info.oku.is_match {
         println!(
             "Same position as Okumura? {}",
@@ -460,18 +505,20 @@ fn run_histogram(dir: &Path) -> anyhow::Result<()> {
         .collect();
     entries.sort();
 
-    println!("filename,token_index,byte_offset,x,y,ring_r,leaf_kind,leaf_pos,leaf_len,oku_kind,oku_pos,oku_len,leaf_in_candidates,num_candidates,max_candidate_len,same_len_different_pos_count,longer_than_leaf_count");
-
     let mut total = 0usize;
-    let mut perfect = 0usize;
+    let mut token_perfect = 0usize;
+    let mut byte_perfect = 0usize;
     let mut errored = 0usize;
     let mut divergent = 0usize;
     let mut leaf_in = 0usize;
-    let mut leaf_out = 0usize;
+    let mut leaf_out_match = 0usize;
+    let mut leaf_out_literal = 0usize;
+    let mut tail_overrun = 0usize;
 
     let mut kind_dist: BTreeMap<(bool, bool), usize> = BTreeMap::new(); // (leaf_is_match, oku_is_match)
     let mut len_delta: BTreeMap<i32, usize> = BTreeMap::new();
     let mut pos_sign: BTreeMap<i8, usize> = BTreeMap::new(); // -1 / 0 / +1
+    let mut rows: Vec<String> = Vec::new();
 
     for path in &entries {
         total += 1;
@@ -492,11 +539,16 @@ fn run_histogram(dir: &Path) -> anyhow::Result<()> {
                 continue;
             }
         };
-        if res.payload_match {
-            perfect += 1;
+        if res.token_match {
+            token_perfect += 1;
+            if res.byte_match {
+                byte_perfect += 1;
+            }
             continue;
         }
-        let div = res.divergence.unwrap();
+        let Some(div) = res.divergence else {
+            continue;
+        };
         divergent += 1;
         let x = div.info.s % (hdr.width as usize);
         let y = div.info.s / (hdr.width as usize);
@@ -512,8 +564,11 @@ fn run_histogram(dir: &Path) -> anyhow::Result<()> {
             ("-".to_string(), format!("lit:0x{:02x}", div.info.oku.lit))
         };
 
-        println!(
-            "{},{},{},{},{},0x{:03x},{},{},{},{},{},{},{},{},{},{},{}",
+        if div.is_tail_overrun {
+            tail_overrun += 1;
+        }
+        rows.push(format!(
+            "{},{},{},{},{},0x{:03x},{},{},{},{},{},{},{},{},{},{},{},{}",
             name,
             div.info.token_index,
             div.info.byte_offset,
@@ -527,21 +582,21 @@ fn run_histogram(dir: &Path) -> anyhow::Result<()> {
             oku_pos_s,
             oku_len_s,
             if div.leaf_in_candidates { 1 } else { 0 },
+            if div.is_tail_overrun { 1 } else { 0 },
             div.candidates.len(),
             div.max_candidate_len,
             div.same_len_different_pos_count,
             div.longer_than_leaf_count
-        );
+        ));
 
         if div.info.leaf.is_match {
             if div.leaf_in_candidates {
                 leaf_in += 1;
             } else {
-                leaf_out += 1;
+                leaf_out_match += 1;
             }
         } else {
-            // リテラル選択は候補集合論の対象外だが、集計の都合で leaf_out にまとめる
-            leaf_out += 1;
+            leaf_out_literal += 1;
         }
 
         *kind_dist
@@ -562,21 +617,51 @@ fn run_histogram(dir: &Path) -> anyhow::Result<()> {
         }
     }
 
+    println!(
+        "# total={},token_perfect={},byte_perfect={},divergent={}",
+        total, token_perfect, byte_perfect, divergent
+    );
+    println!("filename,token_index,byte_offset,x,y,ring_r,leaf_kind,leaf_pos,leaf_len,oku_kind,oku_pos,oku_len,leaf_in_candidates,is_tail_overrun,num_candidates,max_candidate_len,same_len_different_pos_count,longer_than_leaf_count");
+    for row in rows {
+        println!("{row}");
+    }
     eprintln!("---");
     eprintln!("Total files: {}", total);
-    eprintln!("Perfect match: {}", perfect);
+    eprintln!("Token-perfect: {}", token_perfect);
+    eprintln!("Byte-perfect: {}", byte_perfect);
     eprintln!("Divergent: {}", divergent);
     eprintln!("Errors: {}", errored);
     if divergent > 0 {
+        let match_divergent = leaf_in + leaf_out_match;
         eprintln!(
-            "  Leaf's choice in candidate set: {} ({:.1}%)",
+            "  Leaf's choice in candidate set (all divergent): {} ({:.1}%)",
             leaf_in,
             100.0 * leaf_in as f64 / divergent as f64
         );
         eprintln!(
-            "  Leaf's choice NOT in candidate set (incl. literal picks): {} ({:.1}%)",
-            leaf_out,
-            100.0 * leaf_out as f64 / divergent as f64
+            "  Leaf's choice in candidate set (match tokens only): {} / {} ({:.1}%)",
+            leaf_in,
+            match_divergent,
+            if match_divergent > 0 {
+                100.0 * leaf_in as f64 / match_divergent as f64
+            } else {
+                0.0
+            }
+        );
+        eprintln!(
+            "  Leaf match not in candidate set: {} ({:.1}%)",
+            leaf_out_match,
+            100.0 * leaf_out_match as f64 / divergent as f64
+        );
+        eprintln!(
+            "  Leaf literal while Okumura matched: {} ({:.1}%)",
+            leaf_out_literal,
+            100.0 * leaf_out_literal as f64 / divergent as f64
+        );
+        eprintln!(
+            "  Tail overrun cases: {} ({:.1}%)",
+            tail_overrun,
+            100.0 * tail_overrun as f64 / divergent as f64
         );
     }
     eprintln!();
