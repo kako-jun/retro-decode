@@ -1,0 +1,128 @@
+# 奥村晴彦 lzss.c 二分木版の忠実移植 — 計測結果
+
+Issue: [kako-jun/retro-decode#3](https://github.com/kako-jun/retro-decode/issues/3)
+
+## 実装概要
+
+### 仮説
+
+1997 年当時の日本のゲーム会社が LZSS を書くとき、奥村晴彦 lzss.c
+（1989, fj.sources 公開, public domain）の二分木実装をそのまま流用するのが
+圧倒的多数派だった。Leaf もほぼ確実にこれ。現行 `lf2.rs` の
+`find_lzss_match` は線形走査で、同じ長さのマッチが複数あったとき返す位置が
+奥村の木と違う。このタイブレイク差が累積して数千 diffs を生んでいる可能性が
+高い。
+
+### 何をやったか
+
+1. `src/formats/toheart/okumura_lzss.rs` を新規追加し、奥村 lzss.c
+   二分木版（`InitTree` / `InsertNode` / `DeleteNode` / `Encode`）を Rust に
+   逐語移植した。
+
+   - 定数: `N=4096, F=18, THRESHOLD=2, NIL=N`
+   - `text_buf: [u8; N+F-1]`、`lson: [i32; N+1]`、`rson: [i32; N+257]`、
+     `dad: [i32; N+1]`
+   - 変数名・制御フロー・NIL ガード有無を原典に揃える（`dad[lson[p]]=r` の
+     ような NIL ガードなしの書き込みも、配列サイズ N+1 でゴミスロットに
+     吸収する形で再現）
+   - 初期リング値は LF2 に合わせて `0x20`、初期書き込み位置 `r = N-F = 4078`
+   - 戻り値はトークン列 `Vec<Token>`（`Literal(u8)` / `Match { pos, len }`、
+     `pos` は 0..N の絶対リング位置、奥村原典の `match_position` をそのまま）
+
+2. `Lf2Image::compress_okumura(&self) -> Result<Vec<u8>>` を追加。
+   既存 `compress_lzss_*` は一切触らず並存させた。入力は既存と同じ Y-flip 済み
+   ピクセルデータ、出力は LF2 framing（XOR 0xff、リテラル=1/マッチ=0 MSB ファースト、
+   `upper = (len-3) | ((pos & 0x0f) << 4)`、`lower = (pos >> 4) & 0xff`）。
+
+3. `src/bin/lf2_okumura_bench.rs` を追加。
+   指定ディレクトリの `.LF2` を全件デコード→`compress_okumura()` 再エンコード→
+   元バイト列と比較し、1 ファイル 1 行 CSV を stdout に出す。サマリは stderr。
+
+4. 原典との対応表:
+
+   | 奥村原典 | Rust 側 |
+   |---|---|
+   | `InitTree()` | `Okumura::init_tree` |
+   | `InsertNode(int r)` | `Okumura::insert_node` |
+   | `DeleteNode(int p)` | `Okumura::delete_node` |
+   | `Encode()` の本体ループ | `compress_okumura` |
+   | `text_buf[N+F-1]` | `st.text_buf: [u8; N+F-1]` |
+   | `lson/rson/dad` | 同名フィールド |
+   | `match_position/match_length` | 同名フィールド |
+
+## ベンチ実行
+
+```
+cargo run --release --bin lf2_okumura_bench /tmp/lvns3_extract/out/ \
+    > /tmp/okumura_bench.csv 2> /tmp/okumura_bench_summary.txt
+```
+
+対象: LVNS3DAT.PAK 展開済み LF2 ファイル **522 本**。
+
+### サマリ
+
+| 指標 | 値 |
+|---|---|
+| 対象ファイル数 | 522 |
+| ファイル全体バイナリ一致 | 0 / 522 (0.00%) |
+| **LZSS ペイロードのみ一致** | **165 / 522 (31.61%)** |
+| 先頭 diff オフセット（全件） | 0x10 (16) |
+| ペイロード不一致時の平均 diff バイト | 15,329.12 |
+
+### ペイロード diff バイト数分布
+
+| バケツ | 件数 | 割合 |
+|---|---|---|
+| 0（完全一致） | 165 | 31.6% |
+| 1–10 | 133 | 25.5% |
+| 11–100 | 105 | 20.1% |
+| 101–1000 | 21 | 4.0% |
+| 1001+ | 98 | 18.8% |
+
+合計 **57.1%** が「ペイロード完全一致 or 10 バイト以内の差」で、奥村二分木版の
+タイブレイクを忠実に再現するだけで大半のファイルが原典出力に極めて近くなる
+ことが裏付けられた。
+
+### 先頭 diff オフセットが常に 16 の理由
+
+LF2 ヘッダの 0x10 / 0x11 / 0x13 / 0x14 / 0x15 / 0x17 はパーサが捨てている
+「未使用」領域だが、原典ファイルにはゼロ以外の値（例: `0xa8 0x00` at 0x10）が
+入っている。現 `Lf2Image` 構造体に保持されないので再エンコード時に必ず
+ゼロで埋まる。**本 Issue のスコープ外**なので、比較は「ペイロードのみ」を
+正規の指標とした。
+
+## 考察
+
+### よかった点
+
+- **何もチューニングせずに 31.6% のペイロード完全一致**。現行 `compress_lzss_*`
+  系（`ml_guided` / `exact_algorithm` / `with_level`）はサイズ最適化や ML 学習を
+  入れても 0 件しか完全一致しないため、奥村二分木の忠実移植という方向性は
+  明らかに有望。
+- 「ファイルサイズ完全一致」が多い（C0101 22200→22200、C0102 21651→21651…）。
+  ほとんどのファイルでトークン構成まで一致しており、残る diff は末端に
+  散らばるタイブレイク差または別の要因による少数バイトにとどまる。
+
+### 残差の性質と、次に調べるべきこと (Issue #4 へ)
+
+1. **先頭マッチ位置のゼロオフセット扱い** — 奥村原典は
+   `match_position & (N-1)` を position として出力するため `position == 0`
+   は 0 として扱われる。一部のファイルは `position == 0` を別符号
+   （例: NIL マーカ代わりの特殊値）として扱っている可能性がある。
+2. **1 バイト diff 多数のファイル群（70〜77 バイト級）** — 末端付近の
+   flag bit の最後のパディング処理が原典と微妙に違う可能性。奥村原典の
+   `Encode` 末尾の `if (code_buf_ptr > 1)` 部分に相当する挙動を LF2 側は
+   どう処理しているかを調査する必要がある。
+3. **1000+ バイト diff の外れ値（98 件）** — `F=18` でなく別の上限を
+   使っている、あるいは `THRESHOLD` が違う可能性。個別にヘックスで
+   トークン列を突き合わせると判明する見込み。
+4. **ヘッダ 0x10 等の未使用領域** — `Lf2Image` 構造体にオリジナルバイト列を
+   保持するフィールドを足せばファイル全体バイナリ一致が可能になる（別 Issue で
+   扱う）。
+
+## 参照
+
+- 原典: https://oku.edu.mie-u.ac.jp/~okumura/compression/lzss.c
+  （"LZSS.C -- A Data Compression Program" by Haruhiko Okumura, 1989,
+   public domain）
+- 既存 LF2 デコーダ: `src/formats/toheart/lf2.rs` `decompress_lzss`
