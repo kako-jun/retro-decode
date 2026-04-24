@@ -81,7 +81,7 @@ fn main() -> ExitCode {
             }
         };
 
-        let reenc = match lf2.compress_okumura() {
+        let reenc = match lf2.to_lf2_bytes_okumura() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("reenc fail {}: {}", name, e);
@@ -121,14 +121,16 @@ fn main() -> ExitCode {
         };
 
         // payload-only compare: skip header (0x18 + color_count*3 bytes)
-        let color_count = if original_bytes.len() > 0x16 {
-            original_bytes[0x16] as usize
-        } else {
-            0
-        };
+        if orig_len <= 0x16 {
+            eprintln!("skip {}: file too small for header (len={})", name, orig_len);
+            errored += 1;
+            continue;
+        }
+        let color_count = original_bytes[0x16] as usize;
         let payload_start = 0x18 + color_count * 3;
+        // 下限チェック: 最低 1 バイトのペイロードが存在すること
         let (payload_match, payload_diff) =
-            if payload_start <= orig_len && payload_start <= re_len {
+            if payload_start + 1 <= orig_len && payload_start + 1 <= re_len {
                 let a = &original_bytes[payload_start..];
                 let b = &reenc[payload_start..];
                 if a == b {

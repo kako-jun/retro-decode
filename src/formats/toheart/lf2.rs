@@ -240,14 +240,16 @@ impl Lf2Image {
         Ok(data)
     }
 
-    /// 奥村晴彦 lzss.c (1989) 二分木版 Encode を用いた再エンコード。
+    /// 奥村晴彦 lzss.c (1989) 二分木版 Encode を用いた再エンコード（研究用途）。
     ///
     /// 既存の `compress_lzss_*` は一切触らず並存させる。Issue
-    /// kako-jun/retro-decode#3 の仮説検証用。
+    /// kako-jun/retro-decode#3 の仮説検証用のベータ品質実装。
+    /// `CompressionStrategy` への統合は Issue #3 の完全バイナリ一致達成後に
+    /// 検討する（現時点ではペイロード一致率 31.6% にとどまるため研究フェーズ）。
     ///
     /// 戻り値は LF2 完全ファイルバイト列（ヘッダ+パレット+圧縮ペイロード）。
-    pub fn compress_okumura(&self) -> Result<Vec<u8>> {
-        use super::okumura_lzss::{compress_okumura as okumura_encode, Token, N as OKU_N};
+    pub fn to_lf2_bytes_okumura(&self) -> Result<Vec<u8>> {
+        use super::okumura_lzss::{compress_okumura as okumura_encode, Token};
 
         // ヘッダ・パレットは既存と同じ組み立て（to_lf2_bytes_with_strategy を参照）
         let mut data = Vec::new();
@@ -267,7 +269,9 @@ impl Lf2Image {
             data.push(color.r);
         }
 
-        // Y-flip 前処理（既存 compress_lzss_* と同じ）
+        // Y-flip 前処理（既存 compress_lzss_ml_guided と同じ）。
+        // デコーダは Y 反転後のバイト列を展開するので、エンコーダ側も
+        // Y 反転後のバイト列を圧縮する必要がある。
         let total_pixels = (self.width as usize) * (self.height as usize);
         let mut input_pixels = vec![0u8; total_pixels];
         for pixel_idx in 0..total_pixels {
@@ -288,7 +292,6 @@ impl Lf2Image {
         // - マッチ:     upper = (len-3) | ((pos & 0x0f) << 4)
         //              lower = (pos >> 4) & 0xff
         // - 全出力バイトに XOR 0xff
-        let _ = OKU_N; // ドキュメント用
         let mut compressed: Vec<u8> = Vec::new();
         let mut i = 0usize;
         while i < tokens.len() {
