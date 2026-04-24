@@ -94,6 +94,10 @@ all = ["gui", "gpu", "python-bridge", "wasm"]
 name = "retro-decode"
 path = "src/main.rs"
 
+[[bin]]
+name = "lf2_okumura_bench"
+path = "src/bin/lf2_okumura_bench.rs"
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
