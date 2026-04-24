@@ -319,12 +319,51 @@ mod tests {
     fn run_of_spaces_matches_initial_ring() {
         // ring が 0x20 (' ') で埋まっているので、先頭からスペース連続は
         // 長い一致として返るはず。
+        // 注: 入力 20 バイト全部スペースだと初期リング全体と一致するため
+        //     F-1 と F のどちらでも通ってしまい原典忠実性の検証には弱い。
+        //     must-1 の off-by-one 検証は下の `abc_then_reuse_pins_tiebreak`
+        //     テストで行う。
         let input = vec![b' '; 20];
         let toks = compress_okumura(&input);
-        // 最初のトークンは長さ 18 (=F) のマッチ
         match toks[0] {
             Token::Match { len, .. } => assert_eq!(len, F as u8),
             _ => panic!("expected match, got {:?}", toks[0]),
+        }
+    }
+
+    /// 非自明な決定的入力で最初のマッチの pos/len を pin する。
+    /// "ABC..Z" を 100 文字分繰り返した入力を圧縮したとき、奥村原典を
+    /// 忠実に移植できていれば token26 が Match { pos=4078, len=18 } になる。
+    ///
+    /// 期待値の根拠:
+    /// - r は N-F=4078 から書き始め、26 バイトのリテラル後に ring が十分
+    ///   埋まる。その直後、ちょうど最初の "ABCDEFG..." (26 バイト) に
+    ///   マッチして F=18 分の参照が返る。
+    /// - must-1 の off-by-one (F-1 個ダミー) と F 個ダミーでは初期木の
+    ///   形が異なり、同じ長さの候補があるときにどのノードを返すかが変わる。
+    ///   本期待値は F 個ダミー（奥村原典）の実装で得られた値を pin している。
+    #[test]
+    fn abc_then_reuse_pins_tiebreak() {
+        let input: Vec<u8> = (0..100u32).map(|i| b'A' + (i % 26) as u8).collect();
+        let toks = compress_okumura(&input);
+
+        // 先頭 26 バイトは辞書（初期 0x20 のみ）と一致しないのでリテラル
+        for (i, t) in toks.iter().take(26).enumerate() {
+            match t {
+                Token::Literal(b) => {
+                    assert_eq!(*b, b'A' + (i as u8 % 26), "token {} expected literal", i);
+                }
+                other => panic!("token {} expected literal, got {:?}", i, other),
+            }
+        }
+
+        // token 26 が最初の Match
+        match toks.get(26) {
+            Some(Token::Match { pos, len }) => {
+                assert_eq!(*pos, 4078, "first match pos pinned to奥村原典実装の出力");
+                assert_eq!(*len, F as u8, "first match len pinned to F=18");
+            }
+            other => panic!("token 26 expected Match {{ pos=4078, len=18 }}, got {:?}", other),
         }
     }
 }
