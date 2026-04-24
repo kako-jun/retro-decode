@@ -98,6 +98,10 @@ path = "src/main.rs"
 name = "lf2_okumura_bench"
 path = "src/bin/lf2_okumura_bench.rs"
 
+[[bin]]
+name = "lf2_first_diff"
+path = "src/bin/lf2_first_diff.rs"
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
