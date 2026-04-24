@@ -140,6 +140,65 @@ pub fn decompress_to_tokens(
     Ok(LeafDecode { tokens, ring_input })
 }
 
+/// `(pos, len)` マッチ候補 1 件。`pos` は 0..4096 の絶対リングバッファ位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchCandidate {
+    pub pos: u16,
+    pub len: u8,
+}
+
+/// 与えられた ring buffer 状態と input 位置に対して、長さ 3..=18 の全マッチ
+/// 候補を列挙する。
+///
+/// 奥村の `text_buf` は `[u8; N + F - 1]` で末尾 F-1 が overlap 領域になっている
+/// が、本関数はあくまで「ring buffer の各位置から始めて input[s..] と最長
+/// どれだけ一致するか」を総当たりする。wrap-around は `& 0x0fff` で処理。
+///
+/// ring buffer 上の同じ系列に対して、長さ L が成立すれば 3..=L も自動的に
+/// 候補となる（奥村エンコーダは 3..=L の中から L を選ぶが、別エンコーダが
+/// 短い L' を返すこともあるので両方候補集合に入れる）。
+///
+/// 戻り値は `(pos, len)` の並び。重複 `(pos, len)` ペアは 1 度だけ。
+/// 出力順序は pos 昇順 → len 昇順。
+pub fn enumerate_match_candidates(
+    ring: &[u8; 0x1000],
+    input: &[u8],
+    s: usize,
+) -> Vec<MatchCandidate> {
+    let mut out: Vec<MatchCandidate> = Vec::new();
+    if s >= input.len() {
+        return out;
+    }
+    let remaining = input.len() - s;
+    let max_len_by_input = remaining.min(18);
+    if max_len_by_input < 3 {
+        return out;
+    }
+
+    for pos in 0..0x1000usize {
+        let mut l = 0usize;
+        while l < max_len_by_input {
+            let rb = ring[(pos + l) & 0x0fff];
+            let ib = input[s + l];
+            if rb != ib {
+                break;
+            }
+            l += 1;
+        }
+        if l >= 3 {
+            for len in 3..=l {
+                out.push(MatchCandidate {
+                    pos: pos as u16,
+                    len: len as u8,
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.pos.cmp(&b.pos).then(a.len.cmp(&b.len)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +222,63 @@ mod tests {
         assert_eq!(decoded.tokens[0], LeafToken::Literal(0x10));
         assert_eq!(decoded.tokens[3], LeafToken::Literal(0x40));
         assert_eq!(decoded.ring_input, vec![0x10, 0x20, 0x30, 0x40]);
+    }
+
+    #[test]
+    fn enumerate_candidates_finds_initial_space_run() {
+        // ring が 0x20 で埋まっているとき、input 先頭の 0x20 連続に対して
+        // 多数の候補が見つかるはず。
+        let ring = [0x20u8; 0x1000];
+        let input = vec![0x20u8; 30];
+        let cands = enumerate_match_candidates(&ring, &input, 0);
+        // 各 pos (0..4096) について長さ 3..=18 が候補になるはず
+        assert_eq!(cands.len(), 4096 * (18 - 3 + 1));
+        // 最大長は 18 で打ち切られている
+        assert!(cands.iter().all(|c| c.len <= 18));
+        // 3 未満は出ない
+        assert!(cands.iter().all(|c| c.len >= 3));
+    }
+
+    #[test]
+    fn enumerate_candidates_no_match_returns_empty() {
+        let mut ring = [0x00u8; 0x1000];
+        ring[100] = 0xAA; // 単発なので 3 バイト連続一致は取れない
+        let input = vec![0xAA, 0xAA, 0xAA, 0xAA];
+        let cands = enumerate_match_candidates(&ring, &input, 0);
+        assert!(cands.is_empty(), "no 3-byte run should give no candidates");
+    }
+
+    #[test]
+    fn enumerate_candidates_exact_3byte_match() {
+        let mut ring = [0x00u8; 0x1000];
+        ring[10] = 0xDE;
+        ring[11] = 0xAD;
+        ring[12] = 0xBE;
+        let input = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let cands = enumerate_match_candidates(&ring, &input, 0);
+        // pos=10 で len=3 のみ
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0], MatchCandidate { pos: 10, len: 3 });
+    }
+
+    #[test]
+    fn enumerate_candidates_wrap_around() {
+        let mut ring = [0x00u8; 0x1000];
+        ring[0x0fff] = 0x11;
+        ring[0x0000] = 0x22;
+        ring[0x0001] = 0x33;
+        let input = vec![0x11, 0x22, 0x33];
+        let cands = enumerate_match_candidates(&ring, &input, 0);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0], MatchCandidate { pos: 0x0fff, len: 3 });
+    }
+
+    #[test]
+    fn enumerate_candidates_respect_input_end() {
+        // input が短くて 3 バイトないときは何も返らない
+        let ring = [0x20u8; 0x1000];
+        let input = vec![0x20, 0x20];
+        let cands = enumerate_match_candidates(&ring, &input, 0);
+        assert!(cands.is_empty());
     }
 }
