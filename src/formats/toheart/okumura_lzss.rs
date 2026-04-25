@@ -34,6 +34,210 @@ pub enum Token {
     Match { pos: u16, len: u8 },
 }
 
+/// タイブレイク挙動を指定する。
+///
+/// - `StrictGt`: 奥村原典 `>`。同一長候補は最初に見つかった (BST 訪問順) を採用
+/// - `AllowEq`:  `>=`。同一長候補は最後に訪れたノードで上書き
+/// - `DistanceTie`: `>` だが、同一長のときに ring write head `r` への距離が
+///                  近いほうを採用（Leaf 系エンコーダの観測されたバイアス）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TieMode {
+    StrictGt,
+    AllowEq,
+    DistanceTie,
+}
+
+/// 奥村エンコード途中のステートを丸ごと持ち出すためのスナップショット。
+/// `lf2_first_div_inspect` バイナリ専用のデバッグ用構造体。
+pub struct OkumuraSnapshot {
+    pub tokens: Vec<Token>,
+    pub text_buf: Box<[u8; N + F - 1]>,
+    pub lson: Box<[i32; N + 1]>,
+    pub rson: Box<[i32; N + 257]>,
+    pub dad: Box<[i32; N + 1]>,
+    pub r: i32,
+    pub s: i32,
+    pub len: usize,
+    pub input_idx: usize,
+    /// この時点で次に出されるはずだった token のため insert_node を 1 回回した直後の
+    /// match_position / match_length（つまり stop_at_token 番目の token を出す直前の状態）
+    pub next_match_position: i32,
+    pub next_match_length: i32,
+}
+
+/// BST のうち dad != NIL のノードを並べた一覧を整形する。
+/// pos, dad, lson, rson, ring 上の (cur_r - pos) & (N-1) 距離, 先頭3バイトを出す。
+pub fn format_bst_dump(snap: &OkumuraSnapshot, max_nodes: usize) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mask = (N as i32) - 1;
+    let cur_r = snap.r;
+    let mut count = 0usize;
+    let _ = writeln!(
+        s,
+        "BST nodes (dad != NIL), cur_r = 0x{:03x}, max {} shown:",
+        cur_r as u16, max_nodes
+    );
+    let _ = writeln!(
+        s,
+        "    pos    dad    lson   rson   dist   bytes[0..3]"
+    );
+    for pos in 0..N {
+        if snap.dad[pos] == NIL {
+            continue;
+        }
+        if count >= max_nodes {
+            let _ = writeln!(s, "    ... (truncated)");
+            break;
+        }
+        let dist = (cur_r - pos as i32) & mask;
+        let b0 = snap.text_buf[pos];
+        let b1 = snap.text_buf[pos + 1];
+        let b2 = snap.text_buf[pos + 2];
+        let _ = writeln!(
+            s,
+            "    0x{:03x}  0x{:04x} 0x{:04x} 0x{:04x} 0x{:03x}  {:02x} {:02x} {:02x}",
+            pos as u16,
+            snap.dad[pos],
+            snap.lson[pos],
+            snap.rson[pos],
+            dist as u16,
+            b0,
+            b1,
+            b2
+        );
+        count += 1;
+    }
+    let _ = writeln!(s, "    ({} nodes total in tree)", count);
+    s
+}
+
+/// 奥村エンコードを stop_at_token 番目の token を**出す直前**で停止させ、
+/// その時点のステートを返す。
+///
+/// stop_at_token=0 は「先読み + 初期 InsertNode を済ませただけで、
+/// まだ何も output していない」状態。
+pub fn compress_okumura_inspect(input: &[u8], stop_at_token: usize) -> OkumuraSnapshot {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return OkumuraSnapshot {
+            tokens: out,
+            text_buf: Box::new(st.text_buf),
+            lson: Box::new(st.lson),
+            rson: Box::new(st.rson),
+            dad: Box::new(st.dad),
+            r,
+            s,
+            len,
+            input_idx,
+            next_match_position: 0,
+            next_match_length: 0,
+        };
+    }
+
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        // ここで out.len() == stop_at_token なら、まさにこの token を出す直前。
+        if out.len() >= stop_at_token {
+            return OkumuraSnapshot {
+                tokens: out,
+                text_buf: Box::new(st.text_buf),
+                lson: Box::new(st.lson),
+                rson: Box::new(st.rson),
+                dad: Box::new(st.dad),
+                r,
+                s,
+                len,
+                input_idx,
+                next_match_position: st.match_position,
+                next_match_length: st.match_length,
+            };
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    OkumuraSnapshot {
+        tokens: out,
+        text_buf: Box::new(st.text_buf),
+        lson: Box::new(st.lson),
+        rson: Box::new(st.rson),
+        dad: Box::new(st.dad),
+        r,
+        s,
+        len,
+        input_idx,
+        next_match_position: st.match_position,
+        next_match_length: st.match_length,
+    }
+}
+
 /// 奥村 lzss.c の `Encode` に相当するステート。
 struct Okumura {
     /// ring buffer (+F-1 でマッチ検索用に末尾に overlap 領域)
@@ -48,6 +252,11 @@ struct Okumura {
     match_position: i32,
     /// 直近の `InsertNode` で確定したマッチ長
     match_length: i32,
+    /// タイブレイク挙動
+    tie_mode: TieMode,
+    /// `InsertNode` 内で参照する現在の ring write head `r`。
+    /// `DistanceTie` モードのときに距離計算に使う。
+    cur_r: i32,
 }
 
 impl Okumura {
@@ -59,6 +268,8 @@ impl Okumura {
             dad: [0; N + 1],
             match_position: 0,
             match_length: 0,
+            tie_mode: TieMode::StrictGt,
+            cur_r: 0,
         }
     }
 
@@ -88,6 +299,7 @@ impl Okumura {
         self.rson[r as usize] = NIL;
         self.lson[r as usize] = NIL;
         self.match_length = 0;
+        self.cur_r = r;
 
         loop {
             if cmp >= 0 {
@@ -122,7 +334,23 @@ impl Okumura {
                 i += 1;
             }
 
-            if (i as i32) > self.match_length {
+            let take = match self.tie_mode {
+                TieMode::StrictGt => (i as i32) > self.match_length,
+                TieMode::AllowEq => (i as i32) >= self.match_length,
+                TieMode::DistanceTie => {
+                    if (i as i32) > self.match_length {
+                        true
+                    } else if (i as i32) == self.match_length {
+                        let mask = N as i32 - 1;
+                        let cur_dist = (self.cur_r - p) & mask;
+                        let best_dist = (self.cur_r - self.match_position) & mask;
+                        cur_dist > 0 && (best_dist == 0 || cur_dist < best_dist)
+                    } else {
+                        false
+                    }
+                }
+            };
+            if take {
                 self.match_position = p;
                 self.match_length = i as i32;
                 if i >= F {
@@ -208,7 +436,393 @@ impl Okumura {
 /// `match_position` は 0..N のリングバッファ絶対位置で返る（LF2 decoder の
 /// `position` と同じ表現）。
 pub fn compress_okumura(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl(input, TieMode::StrictGt)
+}
+
+/// タイブレイク挙動をパラメータ化した版。
+///
+/// `allow_equal=false` は奥村原典 (`>`)。`true` のとき、同一長候補が見つかったら
+/// BST パス上で**最後に**訪れたノードを `match_position` にする (`>=`)。
+pub fn compress_okumura_with_tie(input: &[u8], allow_equal: bool) -> Vec<Token> {
+    compress_okumura_impl(
+        input,
+        if allow_equal { TieMode::AllowEq } else { TieMode::StrictGt },
+    )
+}
+
+/// 距離タイブレイク版。同一長のとき `r` に近い (back distance が小さい) 候補を採用。
+pub fn compress_okumura_distance_tie(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl(input, TieMode::DistanceTie)
+}
+
+/// dummy_rev variant
+pub fn compress_okumura_dummy_rev(input: &[u8]) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    for i in (1..=F).rev() {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// 奥村原典の "lazy matching" 拡張版。
+///
+/// 各ステップで `insert_node(r)` 直後の最長一致 `(pos1, len1)` を保存し、
+/// もし `len1 > THRESHOLD`（=Match を出すつもり）なら 1 バイトだけ先に
+/// ring を進めて `insert_node(r+1)` を実行し、新しい最長一致 `len2` を見る。
+/// `len2 > len1` なら、`r` のマッチを捨てて Literal(text_buf[r]) を出し、
+/// `r+1` のマッチをそのまま次の反復に持ち越す（既に 1 バイト進んでいるので
+/// 自然に正しい位置にいる）。
+///
+/// `len2 <= len1` なら元のマッチを採用する。既に 1 バイト進めているので、
+/// あと `len1 - 1` バイト進めて元のマッチを消費する。
+///
+/// `compress_okumura` の greedy 版とは独立した関数として動作する。
+pub fn compress_okumura_lazy(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    // 直前の insert_node(r) の結果を (pos1, len1) として保持する。
+    // 反復の頭で「現在 r の match 情報は (st.match_position, st.match_length)」と
+    // いう不変条件が成り立っていることに注意。
+
+    loop {
+        // フレーム残量 len で丸める
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        let pos1 = st.match_position;
+        let len1 = st.match_length as usize;
+
+        // Match を出す予定なら 1-step lazy lookahead
+        // ただし：
+        //  - len1 == len (フレーム末尾まで届いている) なら lazy しても得しない
+        //  - 入力が尽きていて peek できない可能性も考慮
+        let mut take_lazy = false;
+        if len1 > THRESHOLD && len1 < len {
+            // 1 バイト進めて peek。これは元の loop の advance 1-step と同じ操作。
+            let saved_byte_at_r = st.text_buf[r as usize];
+
+            // advance step
+            let advanced;
+            if input_idx < input.len() {
+                st.delete_node(s);
+                let c = input[input_idx];
+                input_idx += 1;
+                st.text_buf[s as usize] = c;
+                if (s as usize) < F - 1 {
+                    st.text_buf[s as usize + N] = c;
+                }
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                st.insert_node(r);
+                advanced = true;
+            } else {
+                // 入力枯渇。元の loop の「len を減らす」分岐と同じ。
+                st.delete_node(s);
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                len -= 1;
+                if len > 0 {
+                    st.insert_node(r);
+                } else {
+                    // len2 を計算する材料がないので fall back
+                    st.match_length = 0;
+                }
+                advanced = true;
+            }
+
+            let _ = advanced;
+
+            // 残量で丸めて len2 を確定
+            if st.match_length as usize > len {
+                st.match_length = len as i32;
+            }
+            let len2 = st.match_length as usize;
+
+            if len2 > len1 {
+                // lazy 採用：元のマッチを捨てて Literal(saved_byte_at_r) を出す。
+                // ring は既に 1 バイト進んだ状態で、そこの match 情報 (st.match_position,
+                // st.match_length) = (pos2, len2) も計算済み。次の反復にそのまま渡る。
+                out.push(Token::Literal(saved_byte_at_r));
+                take_lazy = true;
+            } else {
+                // lazy 不採用：元のマッチ (pos1, len1) を出力し、残り len1-1 バイトを進める。
+                out.push(Token::Match {
+                    pos: (pos1 as u16) & ((N as u16) - 1),
+                    len: len1 as u8,
+                });
+
+                // すでに 1 バイト advance 済み。あと last_match_length-1 進める。
+                let last_match_length = len1;
+                let mut i = 1usize;
+                while i < last_match_length && input_idx < input.len() {
+                    st.delete_node(s);
+                    let c = input[input_idx];
+                    input_idx += 1;
+                    st.text_buf[s as usize] = c;
+                    if (s as usize) < F - 1 {
+                        st.text_buf[s as usize + N] = c;
+                    }
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    st.insert_node(r);
+                    i += 1;
+                }
+                while i < last_match_length {
+                    st.delete_node(s);
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    len -= 1;
+                    if len > 0 {
+                        st.insert_node(r);
+                    }
+                    i += 1;
+                }
+
+                if len == 0 {
+                    break;
+                }
+                // 不変条件を再確立: 反復先頭の (st.match_position, st.match_length) が r の情報。
+                // 上の advance loop の最後の insert_node(r) で既にそうなっている。
+                continue;
+            }
+        }
+
+        if take_lazy {
+            // lazy 経路で 1 バイト進めた状態。len チェックして次の反復へ。
+            if len == 0 {
+                break;
+            }
+            continue;
+        }
+
+        // 通常の greedy 出力経路 (len1 <= THRESHOLD あるいは len1 == len)
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// 奥村原典と同じだが、`for i in 1..=F { insert_node(r - i) }` のダミー挿入を
+/// **行わない**版。`insert_node(r)` のみ最初に行う。
+///
+/// 仮説: Leaf の LF2 エンコーダはこの F 個のダミーノードを挿入していないため、
+/// 序盤の出力が（奥村原典より）リテラル寄りになる。
+pub fn compress_okumura_no_dummy(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    // ダミー挿入なし。最初の本挿入のみ。
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = tie_mode;
     st.init_tree();
 
     let mut out: Vec<Token> = Vec::new();
@@ -365,5 +979,82 @@ mod tests {
             }
             other => panic!("token 26 expected Match {{ pos=4078, len=18 }}, got {:?}", other),
         }
+    }
+
+    /// 距離タイブレイク版でもスペース連続が F バイトのマッチで返ることを確認。
+    #[test]
+    fn distance_tie_run_of_spaces_matches_initial_ring() {
+        let input = vec![b' '; 20];
+        let toks = compress_okumura_distance_tie(&input);
+        match toks[0] {
+            Token::Match { len, .. } => assert_eq!(len, F as u8),
+            _ => panic!("expected match, got {:?}", toks[0]),
+        }
+    }
+
+    /// lazy 版でもスペース連続が F バイトの match で返り、トークン列が
+    /// 元の入力に decode し直せることを確認するスモークテスト。
+    #[test]
+    fn lazy_run_of_spaces_roundtrip() {
+        let input = vec![b' '; 20];
+        let toks = compress_okumura_lazy(&input);
+        // decode token stream into bytes using the same ring init as encoder.
+        let decoded = decode_oku_tokens(&toks);
+        assert_eq!(decoded, input, "lazy round-trip must reproduce input");
+    }
+
+    /// より複雑な入力でも lazy 版が round-trip することを確認。
+    #[test]
+    fn lazy_abc_repeat_roundtrip() {
+        let input: Vec<u8> = (0..200u32).map(|i| b'A' + (i % 26) as u8).collect();
+        let toks = compress_okumura_lazy(&input);
+        let decoded = decode_oku_tokens(&toks);
+        assert_eq!(decoded, input, "lazy round-trip on ABC..Z*8 must reproduce input");
+    }
+
+    #[test]
+    fn lazy_short_inputs_dont_panic() {
+        // end-of-input bookkeeping のスモーク。短い入力で panic しないこと。
+        for n in 0..40usize {
+            let input: Vec<u8> = (0..n as u32).map(|i| (i & 0xff) as u8).collect();
+            let toks = compress_okumura_lazy(&input);
+            let decoded = decode_oku_tokens(&toks);
+            assert_eq!(decoded, input, "lazy round-trip for n={}", n);
+        }
+    }
+
+    /// no_dummy 版のスモーク: AAAAA を round-trip できる。
+    #[test]
+    fn no_dummy_aaaaa_roundtrip() {
+        let input = b"AAAAA".to_vec();
+        let toks = compress_okumura_no_dummy(&input);
+        let decoded = decode_oku_tokens(&toks);
+        assert_eq!(decoded, input, "no_dummy round-trip on AAAAA");
+    }
+
+    /// 奥村 token 列を decode してバイト列に戻す簡易デコーダ（テスト専用）。
+    fn decode_oku_tokens(toks: &[Token]) -> Vec<u8> {
+        let mut ring = vec![0x20u8; N];
+        let mut r: usize = N - F;
+        let mut out: Vec<u8> = Vec::new();
+        for t in toks {
+            match *t {
+                Token::Literal(b) => {
+                    ring[r] = b;
+                    r = (r + 1) & (N - 1);
+                    out.push(b);
+                }
+                Token::Match { pos, len } => {
+                    let p = pos as usize;
+                    for i in 0..len as usize {
+                        let b = ring[(p + i) & (N - 1)];
+                        ring[r] = b;
+                        r = (r + 1) & (N - 1);
+                        out.push(b);
+                    }
+                }
+            }
+        }
+        out
     }
 }

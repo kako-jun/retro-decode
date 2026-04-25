@@ -271,6 +271,85 @@ impl Lf2Image {
         Ok(data)
     }
 
+    pub fn to_lf2_bytes_naive_strict(&self) -> Result<Vec<u8>> {
+        self.to_lf2_bytes_naive(false)
+    }
+
+    pub fn to_lf2_bytes_naive_equal(&self) -> Result<Vec<u8>> {
+        self.to_lf2_bytes_naive(true)
+    }
+
+    fn to_lf2_bytes_naive(&self, allow_equal: bool) -> Result<Vec<u8>> {
+        use super::naive_scan_lzss::compress_naive_backward;
+        use super::okumura_lzss::Token;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(LF2_MAGIC);
+        data.extend_from_slice(&self.x_offset.to_le_bytes());
+        data.extend_from_slice(&self.y_offset.to_le_bytes());
+        data.extend_from_slice(&self.width.to_le_bytes());
+        data.extend_from_slice(&self.height.to_le_bytes());
+        data.extend_from_slice(&[0; 2]);
+        data.push(self.transparent_color);
+        data.extend_from_slice(&[0; 3]);
+        data.push(self.color_count);
+        data.push(0);
+        for color in &self.palette {
+            data.push(color.b);
+            data.push(color.g);
+            data.push(color.r);
+        }
+
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let total_pixels = w * h;
+        let mut input_pixels = vec![0u8; total_pixels];
+        for (pixel_idx, dst) in input_pixels.iter_mut().enumerate() {
+            let x = pixel_idx % w;
+            let y = pixel_idx / w;
+            let flipped_y = h - 1 - y;
+            let output_idx = flipped_y * w + x;
+            if output_idx < self.pixels.len() {
+                *dst = self.pixels[output_idx];
+            }
+        }
+
+        let tokens = compress_naive_backward(&input_pixels, allow_equal);
+
+        let mut compressed: Vec<u8> = Vec::new();
+        let mut i = 0usize;
+        while i < tokens.len() {
+            let flag_pos = compressed.len();
+            compressed.push(0);
+
+            let mut flag_byte: u8 = 0;
+            let mut bits_used = 0;
+            while bits_used < 8 && i < tokens.len() {
+                match tokens[i] {
+                    Token::Literal(b) => {
+                        flag_byte |= 1 << (7 - bits_used);
+                        compressed.push(b ^ 0xff);
+                    }
+                    Token::Match { pos, len } => {
+                        let encoded_pos = (pos as usize) & 0x0fff;
+                        let encoded_len = ((len as usize) - 3) & 0x0f;
+                        let upper = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
+                        let lower = ((encoded_pos >> 4) & 0xff) as u8;
+                        compressed.push(upper ^ 0xff);
+                        compressed.push(lower ^ 0xff);
+                    }
+                }
+                bits_used += 1;
+                i += 1;
+            }
+
+            compressed[flag_pos] = flag_byte ^ 0xff;
+        }
+
+        data.extend_from_slice(&compressed);
+        Ok(data)
+    }
+
     /// Open LF2 file with high-speed implementation
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let data = std::fs::read(path)?;
