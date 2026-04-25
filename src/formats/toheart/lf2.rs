@@ -1672,7 +1672,6 @@ impl Lf2Image {
             while flag_bits_used < 8 && pos < input_pixels.len() {
                 // Extract features for decision tree
                 let image_x = (pos % (self.width as usize)) as f64;
-                let length = 0.0; // Not used in tree, but available
                 let image_y = (pos / (self.width as usize)) as f64;
                 let ring_r = ring_pos as f64;
 
@@ -1681,10 +1680,21 @@ impl Lf2Image {
 
                 // Use decision tree to select best candidate
                 if !matches.is_empty() {
-                    // Apply decision tree rule to get candidate index
+                    // Find minimum distance candidate to get the length feature
+                    let mut min_distance = f64::MAX;
+                    let mut min_distance_length = 0.0;
+                    for candidate in &matches {
+                        let dist = candidate.distance as f64;
+                        if dist < min_distance {
+                            min_distance = dist;
+                            min_distance_length = candidate.length as f64;
+                        }
+                    }
+
+                    // Apply decision tree rule with correct features (minimum distance candidate's length)
                     let best_idx = Self::select_best_candidate_with_rules(
                         image_x,
-                        length,
+                        min_distance_length,  // Use minimum distance candidate's length
                         image_y,
                         ring_r,
                     );
