@@ -20,7 +20,7 @@
 //!     filename,token_index,byte_offset,x,y,ring_r,
 //!     leaf_kind,leaf_pos,leaf_len,
 //!     oku_kind,oku_pos,oku_len,
-//!     leaf_in_candidates,num_candidates,max_candidate_len,
+//!     leaf_in_candidates,is_tail_overrun,num_candidates,max_candidate_len,
 //!     same_len_different_pos_count,longer_than_leaf_count
 
 use std::collections::BTreeMap;
