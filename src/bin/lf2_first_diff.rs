@@ -12,16 +12,22 @@
 //! モード B (ヒストグラム集計):
 //!     cargo run --release --bin lf2_first_diff -- --histogram <input_dir>
 //!
+//! モード C (全決定点データセット生成):
+//!     cargo run --release --bin lf2_first_diff -- --full-dataset <input_dir> <output.csv>
+//!
 //! ヒストグラムモードの出力:
 //!     - stdout: 1 行 1 ファイルの CSV（発散のあったファイルのみ）
 //!     - stderr: 集計サマリ
 //!
+//! 全決定点モードの出力:
+//!     - stdout: CSV フォーマット（ヘッダ行 + 各決定点）
+//!     - stderr: 処理進捗
+//!
 //! ヘッダ行 (CSV):
-//!     filename,token_index,byte_offset,x,y,ring_r,
-//!     leaf_kind,leaf_pos,leaf_len,
-//!     oku_kind,oku_pos,oku_len,
-//!     leaf_in_candidates,is_tail_overrun,num_candidates,max_candidate_len,
-//!     same_len_different_pos_count,longer_than_leaf_count
+//!     filename,token_index,leaf_choice_index,
+//!     num_candidates,max_candidate_len,
+//!     image_x,image_y,ring_r,prev_token_kind,
+//!     candidate_0_distance,candidate_0_length,...,candidate_N_distance,candidate_N_length
 
 use std::collections::BTreeMap;
 use std::env;
@@ -694,12 +700,157 @@ fn run_histogram(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.eq_ignore_ascii_case("lf2"))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+
+    let mut all_rows: Vec<String> = Vec::new();
+    let mut total_files = 0usize;
+    let mut total_tokens = 0usize;
+    let mut error_files = 0usize;
+
+    for path in &entries {
+        total_files += 1;
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+        eprintln!("[{}/{}] processing: {}", total_files, entries.len(), name);
+
+        let data = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("  read error: {}", e);
+                error_files += 1;
+                continue;
+            }
+        };
+
+        let hdr = match parse_header(&data) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  header parse error: {}", e);
+                error_files += 1;
+                continue;
+            }
+        };
+
+        let payload = &data[hdr.payload_start..];
+        let leaf_decode = match decompress_to_tokens(payload, hdr.width, hdr.height) {
+            Ok(ld) => ld,
+            Err(e) => {
+                eprintln!("  decompress error: {}", e);
+                error_files += 1;
+                continue;
+            }
+        };
+
+        // 各トークン位置で全決定点を取り出す
+        let mut ring = Box::new([0x20u8; 0x1000]);
+        let mut r: usize = 0x0fee;
+        let mut s: usize = 0;
+
+        for (token_idx, leaf_token) in leaf_decode.tokens.iter().enumerate() {
+            let candidates = enumerate_match_candidates_with_writeback(
+                &*ring,
+                &leaf_decode.ring_input,
+                s,
+                r,
+            );
+
+            // Leaf の選択がどのインデックスを選んだかを判定
+            let (leaf_choice_index, num_candidates, max_candidate_len) =
+                if let LeafToken::Match {
+                    pos: leaf_pos,
+                    len: leaf_len,
+                } = leaf_token
+                {
+                    // 候補の中から Leaf の選択と完全マッチするものを探す
+                    let choice_idx = candidates
+                        .iter()
+                        .position(|c| c.pos == *leaf_pos && c.len == *leaf_len)
+                        .map(|i| i as i32)
+                        .unwrap_or(-1);
+                    let max_len = candidates.iter().map(|c| c.len).max().unwrap_or(0);
+                    (choice_idx, candidates.len(), max_len)
+                } else {
+                    // リテラル選択時は -1（候補集合内にない）
+                    (-1, candidates.len(), 0)
+                };
+
+            let x = s % (hdr.width as usize);
+            let y = s / (hdr.width as usize);
+            let prev_token_kind = if token_idx > 0 {
+                match leaf_decode.tokens[token_idx - 1] {
+                    LeafToken::Literal(_) => "literal",
+                    LeafToken::Match { .. } => "match",
+                }
+            } else {
+                "none"
+            };
+
+            // CSV 行を組み立て。候補ごとに distance, length カラムを追加
+            let mut row = format!(
+                "{},{},{},{},{},{},{},0x{:04x},{}",
+                name, token_idx, leaf_choice_index, num_candidates, max_candidate_len, x, y, r,
+                prev_token_kind
+            );
+            for candidate in &candidates {
+                // 候補の「距離」: ring write pointer r から見た過去方向の距離（バイト）
+                // pos がどのくらい前のデータか。ring buffer wrap-around を考慮
+                let pos_usize = candidate.pos as usize;
+                let distance = if pos_usize <= r {
+                    r - pos_usize  // pos は r より前（過去）
+                } else {
+                    (0x1000 - pos_usize) + r  // wrap-around: pos は r をまたいで前
+                };
+                row.push_str(&format!(",{},{}", distance, candidate.len));
+            }
+            all_rows.push(row);
+            total_tokens += 1;
+
+            // リングバッファを更新（次のトークンのため）
+            let ut: UniToken = (*leaf_token).into();
+            apply_token(&mut *ring, &mut r, &mut s, &leaf_decode.ring_input, &ut);
+        }
+    }
+
+    // CSV ファイルに書き込み
+    let mut csv_content = String::new();
+    csv_content.push_str(
+        "filename,token_index,leaf_choice_index,num_candidates,max_candidate_len,\
+         image_x,image_y,ring_r,prev_token_kind,\
+         candidate_0_distance,candidate_0_length,candidate_1_distance,candidate_1_length\n"
+    );
+    for row in &all_rows {
+        csv_content.push_str(&row);
+        csv_content.push('\n');
+    }
+
+    fs::write(output_csv, csv_content)?;
+
+    eprintln!("---");
+    eprintln!("Total files: {}", total_files);
+    eprintln!("Total decision points (tokens): {}", total_tokens);
+    eprintln!("Errors: {}", error_files);
+    eprintln!("Output CSV: {}", output_csv.display());
+
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("usage:");
-        eprintln!("  {} <file.LF2>                      # モード A: 単一ファイル詳細", args[0]);
-        eprintln!("  {} --histogram <input_dir>         # モード B: ヒストグラム", args[0]);
+        eprintln!("  {} <file.LF2>                             # モード A: 単一ファイル詳細", args[0]);
+        eprintln!("  {} --histogram <input_dir>                # モード B: ヒストグラム", args[0]);
+        eprintln!("  {} --full-dataset <input_dir> <output.csv> # モード C: 全決定点データセット", args[0]);
         return ExitCode::from(2);
     }
 
@@ -714,6 +865,24 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         if let Err(e) = run_histogram(&dir) {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if args[1] == "--full-dataset" {
+        if args.len() != 4 {
+            eprintln!("usage: {} --full-dataset <input_dir> <output.csv>", args[0]);
+            return ExitCode::from(2);
+        }
+        let dir = PathBuf::from(&args[2]);
+        let output = PathBuf::from(&args[3]);
+        if !dir.is_dir() {
+            eprintln!("error: {} is not a directory", dir.display());
+            return ExitCode::from(2);
+        }
+        if let Err(e) = run_full_dataset(&dir, &output) {
             eprintln!("error: {}", e);
             return ExitCode::from(1);
         }
