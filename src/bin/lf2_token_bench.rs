@@ -1,16 +1,19 @@
 //! LF2 トークン一致率ベンチ: 奥村 BST 3 バリアント (tie_strict_gt / tie_allow_eq /
 //! dummy_rev) を Leaf 真値と突合し、最初の発散点を分類する。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use retro_decode::formats::toheart::lf2_tokens::{decompress_to_tokens, LeafToken};
 use retro_decode::formats::toheart::okumura_lzss::{
     compress_okumura, compress_okumura_distance_tie, compress_okumura_dummy_rev,
-    compress_okumura_lazy, compress_okumura_no_dummy, compress_okumura_with_tie,
+    compress_okumura_dummy_then_drop, compress_okumura_lazy, compress_okumura_no_dummy,
+    compress_okumura_no_dummy_dyntie, compress_okumura_no_dummy_min4,
+    compress_okumura_one_dummy_at_rf, compress_okumura_with_tie,
     Token as OkuToken, F, N,
 };
 
@@ -73,6 +76,7 @@ struct VariantResult {
     total_tokens: u64,
     matched_tokens: u64,
     identical_files: u64,
+    identical_set: BTreeSet<String>,
     first_div_offsets: Vec<usize>,
     clusters: HashMap<String, Cluster>,
 }
@@ -84,6 +88,7 @@ impl VariantResult {
             total_tokens: 0,
             matched_tokens: 0,
             identical_files: 0,
+            identical_set: BTreeSet::new(),
             first_div_offsets: Vec::new(),
             clusters: HashMap::new(),
         }
@@ -157,6 +162,7 @@ fn run_variant(
     let identical = leaf.len() == oku.len() && (matched as usize) == leaf.len();
     if identical {
         out.identical_files += 1;
+        out.identical_set.insert(file_label.to_string());
         return;
     }
 
@@ -295,9 +301,20 @@ fn main() -> ExitCode {
         VariantResult::new("distance_tie"),
         VariantResult::new("lazy"),
         VariantResult::new("no_dummy"),
+        VariantResult::new("one_dummy_at_rf"),
+        VariantResult::new("dummy_then_drop"),
+        VariantResult::new("no_dummy_min4"),
+        VariantResult::new("no_dummy_dyntie"),
     ];
     let mut processed: u64 = 0;
     let mut errors: u64 = 0;
+
+    // Leaf token0 のグローバル分類（variant 非依存）
+    let mut leaf_t0_match_18: u64 = 0;
+    let mut leaf_t0_match_lt18: u64 = 0;
+    let mut leaf_t0_literal: u64 = 0;
+    // (label, leaf_t0_kind, leaf_t0_pos_or_byte, leaf_t0_len) を記録
+    let mut leaf_t0_records: Vec<(String, &'static str, u32, u32)> = Vec::new();
 
     for path in &files {
         let data = match fs::read(path) {
@@ -335,6 +352,10 @@ fn main() -> ExitCode {
         let oku_dist = compress_okumura_distance_tie(&input);
         let oku_lazy = compress_okumura_lazy(&input);
         let oku_nodummy = compress_okumura_no_dummy(&input);
+        let oku_one_rf = compress_okumura_one_dummy_at_rf(&input);
+        let oku_drop = compress_okumura_dummy_then_drop(&input);
+        let oku_min4 = compress_okumura_no_dummy_min4(&input);
+        let oku_dyntie = compress_okumura_no_dummy_dyntie(&input);
 
         if oku_strict.is_empty()
             || oku_eq.is_empty()
@@ -342,6 +363,10 @@ fn main() -> ExitCode {
             || oku_dist.is_empty()
             || oku_lazy.is_empty()
             || oku_nodummy.is_empty()
+            || oku_one_rf.is_empty()
+            || oku_drop.is_empty()
+            || oku_min4.is_empty()
+            || oku_dyntie.is_empty()
         {
             errors += 1;
             continue;
@@ -353,12 +378,32 @@ fn main() -> ExitCode {
             .unwrap_or("?")
             .to_string();
 
+        // Leaf token0 分類（variant 非依存、ファイル単位で 1 回）
+        match leaf[0] {
+            LeafToken::Literal(b) => {
+                leaf_t0_literal += 1;
+                leaf_t0_records.push((label.clone(), "Literal", b as u32, 1));
+            }
+            LeafToken::Match { pos, len } => {
+                if len as usize == F {
+                    leaf_t0_match_18 += 1;
+                } else {
+                    leaf_t0_match_lt18 += 1;
+                }
+                leaf_t0_records.push((label.clone(), "Match", pos as u32, len as u32));
+            }
+        }
+
         run_variant("tie_strict_gt", &leaf, &oku_strict, &label, &mut variants[0]);
         run_variant("tie_allow_eq", &leaf, &oku_eq, &label, &mut variants[1]);
         run_variant("dummy_rev", &leaf, &oku_rev, &label, &mut variants[2]);
         run_variant("distance_tie", &leaf, &oku_dist, &label, &mut variants[3]);
         run_variant("lazy", &leaf, &oku_lazy, &label, &mut variants[4]);
         run_variant("no_dummy", &leaf, &oku_nodummy, &label, &mut variants[5]);
+        run_variant("one_dummy_at_rf", &leaf, &oku_one_rf, &label, &mut variants[6]);
+        run_variant("dummy_then_drop", &leaf, &oku_drop, &label, &mut variants[7]);
+        run_variant("no_dummy_min4", &leaf, &oku_min4, &label, &mut variants[8]);
+        run_variant("no_dummy_dyntie", &leaf, &oku_dyntie, &label, &mut variants[9]);
 
         processed += 1;
     }
@@ -371,6 +416,202 @@ fn main() -> ExitCode {
 
     for v in &variants {
         print_variant(v, processed);
+    }
+
+    // === 集合演算サマリ（dummy 戦線の天井検証） ===
+    let strict = &variants[0].identical_set;
+    let nodummy = &variants[5].identical_set;
+    let drop = &variants[7].identical_set;
+    let min4 = &variants[8].identical_set;
+    let dyntie = &variants[9].identical_set;
+    let union_all: BTreeSet<&String> = strict
+        .iter()
+        .chain(nodummy.iter())
+        .chain(drop.iter())
+        .chain(min4.iter())
+        .chain(dyntie.iter())
+        .collect();
+    let intersect_strict_nodummy: BTreeSet<&String> = strict.intersection(nodummy).collect();
+    let only_strict: BTreeSet<&String> = strict.difference(nodummy).collect();
+    let only_nodummy: BTreeSet<&String> = nodummy.difference(strict).collect();
+    let drop_minus_nodummy: BTreeSet<&String> = drop.difference(nodummy).collect();
+    let nodummy_minus_drop: BTreeSet<&String> = nodummy.difference(drop).collect();
+
+    println!("=== Identical-set algebra (dummy ceiling) ===");
+    println!("|tie_strict_gt|              = {}", strict.len());
+    println!("|no_dummy|                   = {}", nodummy.len());
+    println!("|dummy_then_drop|            = {}", drop.len());
+    println!(
+        "|tie_strict_gt ∩ no_dummy|   = {}",
+        intersect_strict_nodummy.len()
+    );
+    println!(
+        "|tie_strict_gt \\ no_dummy|   = {}  (奥村だけ当たる)",
+        only_strict.len()
+    );
+    println!(
+        "|no_dummy \\ tie_strict_gt|   = {}  (no_dummy だけ当たる)",
+        only_nodummy.len()
+    );
+    println!(
+        "|dummy_then_drop \\ no_dummy| = {}  (drop が新規に当てる)",
+        drop_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ dummy_then_drop| = {}  (drop で失った no_dummy)",
+        nodummy_minus_drop.len()
+    );
+    println!("|no_dummy_min4|              = {}", min4.len());
+    let min4_minus_nodummy: BTreeSet<&String> = min4.difference(nodummy).collect();
+    let nodummy_minus_min4: BTreeSet<&String> = nodummy.difference(min4).collect();
+    println!(
+        "|no_dummy_min4 \\ no_dummy|   = {}  (min4 が新規に当てる)",
+        min4_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ no_dummy_min4|   = {}  (min4 で失った no_dummy)",
+        nodummy_minus_min4.len()
+    );
+    println!("|no_dummy_dyntie|            = {}", dyntie.len());
+    let dyntie_minus_nodummy: BTreeSet<&String> = dyntie.difference(nodummy).collect();
+    let nodummy_minus_dyntie: BTreeSet<&String> = nodummy.difference(dyntie).collect();
+    println!(
+        "|no_dummy_dyntie \\ no_dummy| = {}  (dyntie が新規に当てる)",
+        dyntie_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ no_dummy_dyntie| = {}  (dyntie で失った no_dummy)",
+        nodummy_minus_dyntie.len()
+    );
+    println!(
+        "|tie_strict_gt ∪ no_dummy ∪ dummy_then_drop ∪ no_dummy_min4 ∪ no_dummy_dyntie| = {}  ← 5 変種ハイブリッド天井",
+        union_all.len()
+    );
+    if !dyntie_minus_nodummy.is_empty() {
+        let names: Vec<&str> = dyntie_minus_nodummy
+            .iter()
+            .map(|s| s.as_str())
+            .take(20)
+            .collect();
+        println!("dyntie が新規に当てる sample (max 20): {:?}", names);
+    }
+    if !min4_minus_nodummy.is_empty() {
+        let names: Vec<&str> = min4_minus_nodummy
+            .iter()
+            .map(|s| s.as_str())
+            .take(20)
+            .collect();
+        println!("min4 が新規に当てる sample (max 20): {:?}", names);
+    }
+    if !only_strict.is_empty() {
+        let names: Vec<&str> = only_strict.iter().map(|s| s.as_str()).take(20).collect();
+        println!("奥村だけ当たる sample (max 20): {:?}", names);
+    }
+    if !drop_minus_nodummy.is_empty() {
+        let names: Vec<&str> = drop_minus_nodummy
+            .iter()
+            .map(|s| s.as_str())
+            .take(20)
+            .collect();
+        println!("drop が新規に当てる sample (max 20): {:?}", names);
+    }
+    if !nodummy_minus_drop.is_empty() {
+        let names: Vec<&str> = nodummy_minus_drop
+            .iter()
+            .map(|s| s.as_str())
+            .take(20)
+            .collect();
+        println!("drop で失った no_dummy sample (max 20): {:?}", names);
+    }
+    println!();
+
+    // === Leaf token0 分類 ===
+    println!("=== Leaf token0 classification (variant-independent) ===");
+    println!(
+        "Match{{len=F=18}} = {}    Match{{len<F}} = {}    Literal = {}",
+        leaf_t0_match_18, leaf_t0_match_lt18, leaf_t0_literal
+    );
+
+    // Leaf token0 が Match のファイルのうち、各変種で identical だった件数
+    let mut t0match_in_strict: u64 = 0;
+    let mut t0match_in_nodummy: u64 = 0;
+    let mut t0match_in_drop: u64 = 0;
+    let mut t0lit_in_strict: u64 = 0;
+    let mut t0lit_in_nodummy: u64 = 0;
+    let mut t0lit_in_drop: u64 = 0;
+    for (label, kind, _pos_or_b, _len) in &leaf_t0_records {
+        if *kind == "Match" {
+            if strict.contains(label) {
+                t0match_in_strict += 1;
+            }
+            if nodummy.contains(label) {
+                t0match_in_nodummy += 1;
+            }
+            if drop.contains(label) {
+                t0match_in_drop += 1;
+            }
+        } else {
+            if strict.contains(label) {
+                t0lit_in_strict += 1;
+            }
+            if nodummy.contains(label) {
+                t0lit_in_nodummy += 1;
+            }
+            if drop.contains(label) {
+                t0lit_in_drop += 1;
+            }
+        }
+    }
+    println!(
+        "Leaf t0=Match → identical: tie_strict_gt={}/{}  no_dummy={}/{}  dummy_then_drop={}/{}",
+        t0match_in_strict,
+        leaf_t0_match_18 + leaf_t0_match_lt18,
+        t0match_in_nodummy,
+        leaf_t0_match_18 + leaf_t0_match_lt18,
+        t0match_in_drop,
+        leaf_t0_match_18 + leaf_t0_match_lt18
+    );
+    println!(
+        "Leaf t0=Literal → identical: tie_strict_gt={}/{}  no_dummy={}/{}  dummy_then_drop={}/{}",
+        t0lit_in_strict,
+        leaf_t0_literal,
+        t0lit_in_nodummy,
+        leaf_t0_literal,
+        t0lit_in_drop,
+        leaf_t0_literal
+    );
+    println!();
+
+    // === CSV 出力 (Python での集合演算用) ===
+    let csv_path = std::env::var("LF2_BENCH_CSV").unwrap_or_else(|_| "/tmp/lf2_bench.csv".into());
+    if let Ok(mut f) = fs::File::create(&csv_path) {
+        let _ = writeln!(
+            f,
+            "label,leaf_t0_kind,leaf_t0_pos_or_byte,leaf_t0_len,{}",
+            variants
+                .iter()
+                .map(|v| v.name)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for (label, kind, pob, len) in &leaf_t0_records {
+            let cols: Vec<String> = variants
+                .iter()
+                .map(|v| if v.identical_set.contains(label) { "1" } else { "0" }.to_string())
+                .collect();
+            let _ = writeln!(
+                f,
+                "{},{},{},{},{}",
+                label,
+                kind,
+                pob,
+                len,
+                cols.join(",")
+            );
+        }
+        eprintln!("CSV written to {}", csv_path);
+    } else {
+        eprintln!("warning: could not write CSV to {}", csv_path);
     }
 
     ExitCode::SUCCESS

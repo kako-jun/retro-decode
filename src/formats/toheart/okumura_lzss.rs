@@ -45,6 +45,9 @@ pub enum TieMode {
     StrictGt,
     AllowEq,
     DistanceTie,
+    /// 短マッチ (len ≤ 3) は AllowEq、それ以外は StrictGt。
+    /// セッション 295 の U 字分布発見 (max_len=3 → rank=末尾 60.5%, max_len=18 → rank=先頭 87.3%) に対応する仮説。
+    DynamicShortEq,
 }
 
 /// 奥村エンコード途中のステートを丸ごと持ち出すためのスナップショット。
@@ -345,6 +348,15 @@ impl Okumura {
                         let cur_dist = (self.cur_r - p) & mask;
                         let best_dist = (self.cur_r - self.match_position) & mask;
                         cur_dist > 0 && (best_dist == 0 || cur_dist < best_dist)
+                    } else {
+                        false
+                    }
+                }
+                TieMode::DynamicShortEq => {
+                    if (i as i32) > self.match_length {
+                        true
+                    } else if (i as i32) == self.match_length && (i as i32) <= 3 {
+                        true
                     } else {
                         false
                     }
@@ -820,6 +832,369 @@ pub fn compress_okumura_no_dummy(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// no_dummy 変種に「pos = r - F に dummy を 1 個だけ挿入」を加えた版。
+///
+/// 仮説: Leaf は奥村のような F 個ダミー挿入はしないが、token 0 で
+/// `Match{pos=0xFDC=N-2F, len=18}` を出しているファイルが存在する。
+/// `insert_node(r - F)` だけ先に行えば、text_buf 全 0x20 初期状態で
+/// `pos=r-F, len=18` のマッチが BST から取れる。
+pub fn compress_okumura_one_dummy_at_rf(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    // r - F の位置に dummy を 1 個だけ挿入（mod N で正規化）。
+    let dummy_pos = ((r - F as i32) + N as i32) & (N as i32 - 1);
+    st.insert_node(dummy_pos);
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// 奥村原典どおり F-dummy を最初に挿入するが、token 0 を出力した直後に
+/// dummy として挿入したノード群（r-1, r-2, ..., r-F の旧位置）を全削除し、
+/// それ以降は no_dummy 等価で進行する変種。
+///
+/// 仮説: 奥村が当てる 171 + no_dummy が当てる 215 のいいとこ取り。
+/// dummy が token 0 の `Match{len=18}` を生み、その後カスケードしないので
+/// 中盤以降は no_dummy と同じ挙動になる。
+pub fn compress_okumura_dummy_then_drop(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    // 奥村原典どおり F dummy 挿入（r-1 .. r-F）。挿入位置を記録しておく。
+    let mut dummy_positions: Vec<i32> = Vec::with_capacity(F);
+    for i in 1..=F {
+        let p = ((r - i as i32) + N as i32) & (N as i32 - 1);
+        st.insert_node(p);
+        dummy_positions.push(p);
+    }
+    st.insert_node(r);
+
+    let mut first_token_done = false;
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        // token 0 の処理が終わったら、dummy として挿入した位置を全削除。
+        // ただし通常進行で既に s が回って delete されている範囲は除く。
+        if !first_token_done {
+            first_token_done = true;
+            // s が回ってない範囲の dummy を削除。
+            // 通常進行で delete された slot は old_s..old_s + last_match_length。
+            // dummy は r-1, r-2, ..., r-F の F 個（r=N-F の場合 N-F-1..N-2F）。
+            // 簡便のため、まだ生きてる dummy を「再挿入なしの delete」で除去する。
+            // delete_node は不在ノードに対して no-op に近い設計のため
+            // 多少の重複削除は安全（奥村の delete_node 実装を確認してから運用）。
+            for p in dummy_positions.iter().copied() {
+                // r 自身（本挿入）は削除しない。
+                if p == r {
+                    continue;
+                }
+                st.delete_node(p);
+            }
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// no_dummy ベース + 動的 tie 規則（短マッチは AllowEq、長マッチは StrictGt）。
+///
+/// 仮説 (セッション 295 の U 字分布発見に基づく):
+/// max_len=3 → rank=末尾 60.5%, max_len=18 → rank=先頭 87.3%。
+/// この非対称性を「短マッチは末尾上書き、長マッチは先頭保持」で再現する。
+pub fn compress_okumura_no_dummy_dyntie(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::DynamicShortEq;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// no_dummy ベースで最小マッチ長を 4 にした変種（THRESHOLD を 2 → 3 に切替相当）。
+///
+/// 仮説: Leaf は 3 バイトマッチをリテラル 3 個より得と判断せず、
+/// `len <= 3` を Literal で出している。これにより no_dummy 残差の
+/// `MATCH_vs_LIT:len<=5` クラスタ（58 ファイル）の解消を狙う。
+pub fn compress_okumura_no_dummy_min4(input: &[u8]) -> Vec<Token> {
+    const LOCAL_THRESHOLD: usize = 3;
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        if (st.match_length as usize) <= LOCAL_THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
@@ -1030,6 +1405,51 @@ mod tests {
         let toks = compress_okumura_no_dummy(&input);
         let decoded = decode_oku_tokens(&toks);
         assert_eq!(decoded, input, "no_dummy round-trip on AAAAA");
+    }
+
+    /// one_dummy_at_rf 版のスモーク: round-trip と、空白18バイトで
+    /// token 0 が `Match{pos=N-2F, len=18}` になることを確認。
+    #[test]
+    fn one_dummy_at_rf_aaaaa_roundtrip() {
+        let input = b"AAAAA".to_vec();
+        let toks = compress_okumura_one_dummy_at_rf(&input);
+        let decoded = decode_oku_tokens(&toks);
+        assert_eq!(decoded, input, "one_dummy_at_rf round-trip on AAAAA");
+    }
+
+    #[test]
+    fn dummy_then_drop_aaaaa_roundtrip() {
+        let input = b"AAAAA".to_vec();
+        let toks = compress_okumura_dummy_then_drop(&input);
+        let decoded = decode_oku_tokens(&toks);
+        assert_eq!(decoded, input, "dummy_then_drop round-trip on AAAAA");
+    }
+
+    #[test]
+    fn dummy_then_drop_emits_token0_match_for_spaces() {
+        let input = vec![0x20u8; 18];
+        let toks = compress_okumura_dummy_then_drop(&input);
+        let first = toks.first().expect("at least one token");
+        // 奥村原典どおり F dummy が居れば token 0 は Match{len=F}。pos は最初に当たったノード
+        // (実装依存: 奥村は r-1 を最後に挿入するので最も新しい r-1 が当たることが多い)
+        match *first {
+            Token::Match { len, .. } => assert_eq!(len as usize, F),
+            Token::Literal(_) => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn one_dummy_at_rf_emits_match_for_18_spaces() {
+        let input = vec![0x20u8; 18];
+        let toks = compress_okumura_one_dummy_at_rf(&input);
+        let first = toks.first().expect("at least one token");
+        match *first {
+            Token::Match { pos, len } => {
+                assert_eq!(pos as usize, N - 2 * F, "pos should be N - 2F");
+                assert_eq!(len as usize, F, "len should be F=18");
+            }
+            Token::Literal(_) => panic!("expected Match, got Literal"),
+        }
     }
 
     /// 奥村 token 列を decode してバイト列に戻す簡易デコーダ（テスト専用）。
