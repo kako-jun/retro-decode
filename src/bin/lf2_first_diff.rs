@@ -802,13 +802,13 @@ fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
                 prev_token_kind
             );
             for candidate in &candidates {
-                // 候補の「距離」: ring_r から当該位置までの距離
-                // r から pos まで「順方向」の距離を計算（wrap-around を考慮）
+                // 候補の「距離」: ring write pointer r から見た過去方向の距離（バイト）
+                // pos がどのくらい前のデータか。ring buffer wrap-around を考慮
                 let pos_usize = candidate.pos as usize;
                 let distance = if pos_usize <= r {
-                    r - pos_usize
+                    r - pos_usize  // pos は r より前（過去）
                 } else {
-                    (0x1000 - pos_usize) + r
+                    (0x1000 - pos_usize) + r  // wrap-around: pos は r をまたいで前
                 };
                 row.push_str(&format!(",{},{}", distance, candidate.len));
             }
@@ -826,10 +826,8 @@ fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
     csv_content.push_str(
         "filename,token_index,leaf_choice_index,num_candidates,max_candidate_len,\
          image_x,image_y,ring_r,prev_token_kind,\
-         candidate_0_distance,candidate_0_length,candidate_1_distance,candidate_1_length,\
-         ...(and so on for each candidate)\n"
+         candidate_0_distance,candidate_0_length,candidate_1_distance,candidate_1_length\n"
     );
-    csv_content.push_str("# Note: each row has variable number of columns depending on candidate count\n");
     for row in &all_rows {
         csv_content.push_str(&row);
         csv_content.push('\n');
