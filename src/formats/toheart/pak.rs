@@ -225,7 +225,7 @@ impl PakArchive {
         state.total_pixels = self.entries.len(); // Use file count as "pixels"
         
         // Collect entries to avoid borrow checker issues
-        let entries: Vec<_> = self.entries.iter().cloned().collect();
+        let entries: Vec<_> = self.entries.to_vec();
         
         for (i, entry) in entries.iter().enumerate() {
             if config.step_by_step {

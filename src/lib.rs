@@ -51,6 +51,7 @@ pub mod prelude {
 
 /// Configuration for the decoding process
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct DecodeConfig {
     pub parallel: bool,
     pub gpu: bool,
@@ -60,15 +61,3 @@ pub struct DecodeConfig {
     pub no_output: bool,
 }
 
-impl Default for DecodeConfig {
-    fn default() -> Self {
-        Self {
-            parallel: false,
-            gpu: false,
-            step_by_step: false,
-            verbose: false,
-            benchmark: false,
-            no_output: false,
-        }
-    }
-}

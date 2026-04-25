@@ -3,7 +3,6 @@
 
 use super::*;
 use super::lf2::Rgb;
-use crate::DecodeConfig;
 
 /// Create a simple test LF2 image with known transparency pattern
 pub fn create_test_transparency_image() -> Lf2Image {
@@ -72,17 +71,20 @@ mod tests {
         let rgba_img = img.to_rgba8();
         let pixel_data = rgba_img.as_raw();
         
-        // Check that transparent pixels (index 2) have alpha = 0
-        // Pixel at (2,0) should be transparent (blue with alpha=0)
-        let pixel_index = (0 * 4 + 2) * 4; // Row 0, Column 2, 4 bytes per pixel
+        // pixel byte index = (row * width + col) * bytes_per_pixel. 4x4 RGBA image.
+        const W: usize = 4;
+        const BPP: usize = 4;
+        let pixel_idx = |row: usize, col: usize| (row * W + col) * BPP;
+
+        // (row=0, col=2) should be transparent (blue with alpha=0)
+        let pixel_index = pixel_idx(0, 2);
         assert_eq!(pixel_data[pixel_index], 0);     // R = 0 (blue)
         assert_eq!(pixel_data[pixel_index + 1], 0); // G = 0 (blue)
         assert_eq!(pixel_data[pixel_index + 2], 255); // B = 255 (blue)
         assert_eq!(pixel_data[pixel_index + 3], 0);   // A = 0 (transparent)
-        
-        // Check that non-transparent pixels have alpha = 255
-        // Pixel at (0,0) should be opaque (red with alpha=255)
-        let pixel_index = (0 * 4 + 0) * 4; // Row 0, Column 0, 4 bytes per pixel
+
+        // (row=0, col=0) should be opaque (red with alpha=255)
+        let pixel_index = pixel_idx(0, 0);
         assert_eq!(pixel_data[pixel_index], 255);   // R = 255 (red)
         assert_eq!(pixel_data[pixel_index + 1], 0); // G = 0 (red)
         assert_eq!(pixel_data[pixel_index + 2], 0); // B = 0 (red)

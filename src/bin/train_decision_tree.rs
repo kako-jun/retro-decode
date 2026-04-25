@@ -1,15 +1,25 @@
 //! CART (Classification And Regression Trees) 決定木学習バイナリ
 //!
-//! Leaf エンコーダの選択ルールを決定木で学習する。
-//! 特徴量：distance, length, image_x, image_y, ring_r, prev_token_kind
-//! ラベル：leaf_choice_index
+//! Leaf エンコーダの候補選択ルールを決定木で学習する。
+//! 特徴量: min_distance, min_distance_length, image_x, image_y, ring_r
+//! ラベル: leaf_choice_index (>= 0 のもののみ。リテラル選択 -1 は学習対象外)
+//!
+//! 入力 CSV の形式（lf2_first_diff --full-dataset の出力と一致）:
+//!   filename, token_index, leaf_choice_index, num_candidates, max_candidate_len,
+//!   image_x, image_y, ring_r, prev_token_kind,
+//!   min_distance, min_distance_length, leaf_choice_distance, leaf_choice_length
+//!
+//! 出力:
+//!   - stdout: 学習統計
+//!   - --tree-out: 決定木をバイナリ (bincode) で保存。推論時にこのファイルをロード
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufRead;
+use std::io::{BufRead, BufWriter, Write};
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(name = "train_decision_tree")]
@@ -22,37 +32,44 @@ struct Args {
     /// 最大出力ルール数（デフォルト: 100）
     #[arg(long, default_value = "100")]
     max_rules: usize,
+
+    /// 学習した決定木のバイナリ保存先（bincode 形式）
+    #[arg(long, default_value = "decision_tree.bin")]
+    tree_out: PathBuf,
+
+    /// 木の最大深さ（デフォルト: 制限なし）
+    #[arg(long)]
+    max_depth: Option<usize>,
 }
 
 /// 1つのデータポイント
 #[derive(Clone, Debug)]
 struct DataPoint {
+    /// 最小距離候補の distance（推論時と完全一致する必要あり）
     distance: f64,
+    /// 最小距離候補の length
     length: f64,
     image_x: f64,
     image_y: f64,
     ring_r: f64,
-    prev_token_kind: String,
-    leaf_choice: usize, // ラベル
+    leaf_choice: usize, // ラベル: 候補リスト中で Leaf が選んだ index
 }
 
-/// 分割条件
-#[derive(Clone, Debug)]
-struct Split {
-    feature: String,
-    threshold: f64,
+/// 分割条件（推論側の DecisionTree モジュールと同型を bincode で交換する）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Split {
+    pub feature: String,
+    pub threshold: f64,
 }
 
-/// 決定木のノード
-#[derive(Clone, Debug)]
-enum TreeNode {
-    /// リーフノード：最も多い leaf_choice を記録
+/// 決定木のノード（推論側と共通の serde 形式）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TreeNode {
     Leaf {
         choice: usize,
         count: usize,
         coverage: usize,
     },
-    /// 内部ノード
     Internal {
         split: Split,
         left: Box<TreeNode>,
@@ -321,13 +338,15 @@ fn main() -> Result<()> {
         total_rows += 1;
         let fields: Vec<&str> = line.split(',').collect();
 
-        // 最小フィールド数の確認
-        if fields.len() < 9 {
+        // 新 CSV: 13 列固定。
+        // 0:filename 1:token_index 2:leaf_choice_index 3:num_candidates 4:max_candidate_len
+        // 5:image_x 6:image_y 7:ring_r 8:prev_token_kind
+        // 9:min_distance 10:min_distance_length 11:leaf_choice_distance 12:leaf_choice_length
+        if fields.len() < 13 {
             skipped += 1;
             continue;
         }
 
-        // 必要なカラムを抽出
         let leaf_choice_index: i32 = match fields[2].parse() {
             Ok(v) => v,
             Err(_) => {
@@ -335,71 +354,37 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-
-        // leaf_choice_index >= 0 のデータのみを取得
         if leaf_choice_index < 0 {
+            // リテラル選択は学習対象外
             skipped += 1;
             continue;
         }
 
-        let num_candidates: usize = match fields[3].parse() {
-            Ok(v) => v,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
-        };
-
+        let num_candidates: usize = fields[3].parse().unwrap_or(0);
         if num_candidates == 0 {
             skipped += 1;
             continue;
         }
 
-        let image_x: f64 = fields.get(4).unwrap_or(&"0").parse().unwrap_or(0.0);
-        let image_y: f64 = fields.get(5).unwrap_or(&"0").parse().unwrap_or(0.0);
+        let image_x: f64 = fields[5].parse().unwrap_or(0.0);
+        let image_y: f64 = fields[6].parse().unwrap_or(0.0);
 
-        // ring_r はヘックス値の可能性がある
-        let ring_r_str = fields.get(6).unwrap_or(&"0");
-        let ring_r: f64 = if ring_r_str.starts_with("0x") {
-            u64::from_str_radix(&ring_r_str[2..], 16).unwrap_or(0) as f64
+        let ring_r_str = fields[7];
+        let ring_r: f64 = if let Some(rest) = ring_r_str.strip_prefix("0x") {
+            u64::from_str_radix(rest, 16).unwrap_or(0) as f64
         } else {
             ring_r_str.parse().unwrap_or(0.0)
         };
 
-        let prev_token_kind = fields.get(7).unwrap_or(&"unknown").to_string();
-
-        // データポイント生成：各候補を別々のデータポイントとして扱う
-        // fields[8 + 2*i] = distance, fields[9 + 2*i] = length
-        let mut candidate_min_distance = f64::MAX;
-        let mut candidate_best_length = 0.0;
-
-        for i in 0..num_candidates {
-            let col_dist = 8 + 2 * i;
-            let col_len = 9 + 2 * i;
-            if let (Some(dist_str), Some(len_str)) = (fields.get(col_dist), fields.get(col_len)) {
-                let dist: f64 = dist_str.parse().unwrap_or(0.0);
-                let len: f64 = len_str.parse().unwrap_or(0.0);
-                if dist < candidate_min_distance {
-                    candidate_min_distance = dist;
-                    candidate_best_length = len;
-                }
-            }
-        }
-
-        // 距離と長さは最小距離と対応する長さを使用
-        let distance = if candidate_min_distance == f64::MAX {
-            0.0
-        } else {
-            candidate_min_distance
-        };
+        let min_distance: f64 = fields[9].parse().unwrap_or(0.0);
+        let min_distance_length: f64 = fields[10].parse().unwrap_or(0.0);
 
         data.push(DataPoint {
-            distance,
-            length: candidate_best_length,
+            distance: min_distance,
+            length: min_distance_length,
             image_x,
             image_y,
             ring_r,
-            prev_token_kind,
             leaf_choice: leaf_choice_index as usize,
         });
     }
@@ -430,8 +415,8 @@ fn main() -> Result<()> {
     println!();
 
     // CART 決定木を構築
-    println!("Building CART decision tree...");
-    let tree = build_tree(data.clone(), 0, None);
+    println!("Building CART decision tree (max_depth: {:?})...", args.max_depth);
+    let tree = build_tree(data.clone(), 0, args.max_depth);
 
     // 訓練精度を計算
     let accuracy = training_accuracy(&tree, &data);
@@ -463,6 +448,18 @@ fn main() -> Result<()> {
     } else {
         println!("⚠ Training accuracy {:.2}%. Some classes remain mixed.", accuracy * 100.0);
     }
+
+    // 決定木バイナリ保存（推論側がロードして走査する）
+    let serialized = bincode::serialize(&tree)
+        .map_err(|e| anyhow!("Failed to serialize tree: {}", e))?;
+    let mut out = BufWriter::new(File::create(&args.tree_out)
+        .map_err(|e| anyhow!("Failed to create tree output: {}", e))?);
+    out.write_all(&serialized)?;
+    out.flush()?;
+    println!();
+    println!("=== Tree binary saved ===");
+    println!("Path: {}", args.tree_out.display());
+    println!("Size: {} bytes", serialized.len());
 
     Ok(())
 }

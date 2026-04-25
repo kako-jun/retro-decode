@@ -110,7 +110,7 @@ fn main() -> ExitCode {
                 }
             }
             if orig_len != re_len {
-                count += (orig_len as i64 - re_len as i64).abs() as u64;
+                count += (orig_len as i64 - re_len as i64).unsigned_abs();
             }
             (first, count)
         };
@@ -130,7 +130,7 @@ fn main() -> ExitCode {
                  diff_count);
     }
 
-    eprintln!("");
+    eprintln!();
     eprintln!("=== SUMMARY ===");
     eprintln!("Total files: {}", total);
     eprintln!("Matched: {} ({:.1}%)", matched, (matched as f64 / total as f64 * 100.0));

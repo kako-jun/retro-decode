@@ -40,13 +40,13 @@ fn main() -> anyhow::Result<()> {
     println!("  • Green pixels (index 1) = Opaque");
     println!("  • Blue pixels (index 2) = TRANSPARENT");
     println!("  • Yellow pixels (index 3) = Opaque");
-    println!("");
+    println!();
     println!("Files created in test_assets/generated/:");
     println!("  • test_transparency.png - PNG with alpha channel (blue pixels transparent)");
     println!("  • test_palette.bmp - 8-bit BMP with palette (no transparency)");
     println!("  • test_rgb.raw - Raw RGB data (transparent pixels as black)");
     println!("  • test_rgba.raw - Raw RGBA data (alpha=0 for transparent pixels)");
-    println!("");
+    println!();
     println!("To verify transparency, open test_assets/generated/test_transparency.png");
     println!("in an image viewer that supports transparency. Blue pixels should appear transparent.");
     

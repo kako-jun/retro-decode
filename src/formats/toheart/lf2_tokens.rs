@@ -12,8 +12,8 @@
 //! - 8 ステップごとに flag byte（XOR 0xff）
 //! - flag ビットが 1: リテラル (pixel XOR 0xff)
 //! - flag ビットが 0: 2 バイトのマッチ参照
-//!     upper = (len-3) | ((pos & 0x0f) << 4)   (XOR 0xff で格納)
-//!     lower = (pos >> 4) & 0xff               (XOR 0xff で格納)
+//!   upper = (len-3) | ((pos & 0x0f) << 4)   (XOR 0xff で格納)
+//!   lower = (pos >> 4) & 0xff               (XOR 0xff で格納)
 //! - pos は 0..4096 の**絶対リングバッファ位置**（奥村 `match_position` と同じ表現）
 //! - len は 3..=18
 
@@ -265,12 +265,10 @@ mod tests {
         // width=4, height=1 → 4 ピクセル。flag=0xff (全ビット 1 = リテラル)
         // flag XOR 0xff = 0x00 が格納される。
         // pixels [0x10, 0x20, 0x30, 0x40] の XOR 0xff = [0xef, 0xdf, 0xcf, 0xbf]
-        let mut compressed = Vec::new();
-        compressed.push(0x00); // flag = 0xff after XOR
-        compressed.push(0xef);
-        compressed.push(0xdf);
-        compressed.push(0xcf);
-        compressed.push(0xbf);
+        let compressed = vec![
+            0x00, // flag = 0xff after XOR
+            0xef, 0xdf, 0xcf, 0xbf,
+        ];
         // 残り 4 ビットぶんは消費されない
 
         let decoded = decompress_to_tokens(&compressed, 4, 1).unwrap();

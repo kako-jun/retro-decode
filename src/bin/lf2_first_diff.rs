@@ -211,7 +211,7 @@ fn find_first_divergence(
 
         // 一致していれば ring を更新
         let mut s = s_leaf;
-        apply_token(&mut *ring, &mut r, &mut s, input, &lt);
+        apply_token(&mut ring, &mut r, &mut s, input, &lt);
         s_leaf = s;
     }
 
@@ -353,7 +353,7 @@ fn analyze(data: &[u8]) -> anyhow::Result<(AnalyzeResult, Header)> {
 
     // 候補列挙
     let candidates = enumerate_match_candidates_with_writeback(
-        &*div.ring,
+        &div.ring,
         &leaf_decode.ring_input,
         div.s,
         div.ring_r,
@@ -701,6 +701,8 @@ fn run_histogram(dir: &Path) -> anyhow::Result<()> {
 }
 
 fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
+    use std::io::{BufWriter, Write};
+
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -713,7 +715,18 @@ fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
         .collect();
     entries.sort();
 
-    let mut all_rows: Vec<String> = Vec::new();
+    // ストリーミング書き出し（メモリ非保持）。CSV 列は学習に必要な特徴量のみ。
+    // 候補リスト全列を残すと 1 行 ~100KB になり 584 ファイルで OOM するため、
+    // min_distance / min_distance_length を生成側で算出して固定列にする。
+    let file = fs::File::create(output_csv)?;
+    let mut w = BufWriter::new(file);
+    writeln!(
+        w,
+        "filename,token_index,leaf_choice_index,num_candidates,max_candidate_len,\
+         image_x,image_y,ring_r,prev_token_kind,min_distance,min_distance_length,\
+         leaf_choice_distance,leaf_choice_length"
+    )?;
+
     let mut total_files = 0usize;
     let mut total_tokens = 0usize;
     let mut error_files = 0usize;
@@ -721,7 +734,9 @@ fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
     for path in &entries {
         total_files += 1;
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-        eprintln!("[{}/{}] processing: {}", total_files, entries.len(), name);
+        if total_files % 50 == 0 || total_files == 1 {
+            eprintln!("[{}/{}] processing: {}", total_files, entries.len(), name);
+        }
 
         let data = match fs::read(path) {
             Ok(b) => b,
@@ -751,38 +766,51 @@ fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
             }
         };
 
-        // 各トークン位置で全決定点を取り出す
         let mut ring = Box::new([0x20u8; 0x1000]);
         let mut r: usize = 0x0fee;
         let mut s: usize = 0;
 
         for (token_idx, leaf_token) in leaf_decode.tokens.iter().enumerate() {
             let candidates = enumerate_match_candidates_with_writeback(
-                &*ring,
+                &ring,
                 &leaf_decode.ring_input,
                 s,
                 r,
             );
 
-            // Leaf の選択がどのインデックスを選んだかを判定
-            let (leaf_choice_index, num_candidates, max_candidate_len) =
-                if let LeafToken::Match {
-                    pos: leaf_pos,
-                    len: leaf_len,
-                } = leaf_token
-                {
-                    // 候補の中から Leaf の選択と完全マッチするものを探す
-                    let choice_idx = candidates
+            let distance_of = |pos_usize: usize| -> usize {
+                if pos_usize <= r {
+                    r - pos_usize
+                } else {
+                    (0x1000 - pos_usize) + r
+                }
+            };
+
+            // 最小距離候補とその length（learning/inference で共通使用）
+            let mut min_distance: usize = usize::MAX;
+            let mut min_distance_length: u8 = 0;
+            for c in &candidates {
+                let d = distance_of(c.pos as usize);
+                if d < min_distance {
+                    min_distance = d;
+                    min_distance_length = c.len;
+                }
+            }
+            let min_distance_out = if min_distance == usize::MAX { 0 } else { min_distance };
+
+            let (leaf_choice_index, leaf_distance, leaf_length) =
+                if let LeafToken::Match { pos: leaf_pos, len: leaf_len } = leaf_token {
+                    let idx = candidates
                         .iter()
                         .position(|c| c.pos == *leaf_pos && c.len == *leaf_len)
                         .map(|i| i as i32)
                         .unwrap_or(-1);
-                    let max_len = candidates.iter().map(|c| c.len).max().unwrap_or(0);
-                    (choice_idx, candidates.len(), max_len)
+                    (idx, distance_of(*leaf_pos as usize), *leaf_len)
                 } else {
-                    // リテラル選択時は -1（候補集合内にない）
-                    (-1, candidates.len(), 0)
+                    (-1, 0, 0)
                 };
+            let max_candidate_len = candidates.iter().map(|c| c.len).max().unwrap_or(0);
+            let num_candidates = candidates.len();
 
             let x = s % (hdr.width as usize);
             let y = s / (hdr.width as usize);
@@ -795,45 +823,32 @@ fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
                 "none"
             };
 
-            // CSV 行を組み立て。候補ごとに distance, length カラムを追加
-            let mut row = format!(
-                "{},{},{},{},{},{},{},0x{:04x},{}",
-                name, token_idx, leaf_choice_index, num_candidates, max_candidate_len, x, y, r,
-                prev_token_kind
-            );
-            for candidate in &candidates {
-                // 候補の「距離」: ring write pointer r から見た過去方向の距離（バイト）
-                // pos がどのくらい前のデータか。ring buffer wrap-around を考慮
-                let pos_usize = candidate.pos as usize;
-                let distance = if pos_usize <= r {
-                    r - pos_usize  // pos は r より前（過去）
-                } else {
-                    (0x1000 - pos_usize) + r  // wrap-around: pos は r をまたいで前
-                };
-                row.push_str(&format!(",{},{}", distance, candidate.len));
-            }
-            all_rows.push(row);
+            writeln!(
+                w,
+                "{},{},{},{},{},{},{},0x{:04x},{},{},{},{},{}",
+                name,
+                token_idx,
+                leaf_choice_index,
+                num_candidates,
+                max_candidate_len,
+                x,
+                y,
+                r,
+                prev_token_kind,
+                min_distance_out,
+                min_distance_length,
+                leaf_distance,
+                leaf_length,
+            )?;
             total_tokens += 1;
 
-            // リングバッファを更新（次のトークンのため）
             let ut: UniToken = (*leaf_token).into();
-            apply_token(&mut *ring, &mut r, &mut s, &leaf_decode.ring_input, &ut);
+            apply_token(&mut ring, &mut r, &mut s, &leaf_decode.ring_input, &ut);
         }
     }
 
-    // CSV ファイルに書き込み
-    let mut csv_content = String::new();
-    csv_content.push_str(
-        "filename,token_index,leaf_choice_index,num_candidates,max_candidate_len,\
-         image_x,image_y,ring_r,prev_token_kind,\
-         candidate_0_distance,candidate_0_length,candidate_1_distance,candidate_1_length\n"
-    );
-    for row in &all_rows {
-        csv_content.push_str(&row);
-        csv_content.push('\n');
-    }
-
-    fs::write(output_csv, csv_content)?;
+    w.flush()?;
+    drop(w);
 
     eprintln!("---");
     eprintln!("Total files: {}", total_files);

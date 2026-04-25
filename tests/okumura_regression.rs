@@ -40,12 +40,12 @@ fn assert_payload_matches(filename: &str) {
     let color_count = original[0x16] as usize;
     let payload_start = 0x18 + color_count * 3;
     assert!(
-        payload_start + 1 <= original.len(),
+        payload_start < original.len(),
         "{}: payload_start out of range",
         filename
     );
     assert!(
-        payload_start + 1 <= reenc.len(),
+        payload_start < reenc.len(),
         "{}: reencoded payload_start out of range",
         filename
     );

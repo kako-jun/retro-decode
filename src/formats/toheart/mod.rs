@@ -13,6 +13,7 @@ pub mod lf2;
 pub mod scn;
 pub mod okumura_lzss;
 pub mod lf2_tokens;
+pub mod decision_tree;
 
 pub mod test_transparency;
 

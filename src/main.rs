@@ -173,7 +173,6 @@ Examples:
             println!("RetroDecode - P⁴ (Pixel by pixel, past preserved)");
             println!("Educational tool for analyzing retro game image formats");
             println!("\nRun with --help for detailed usage information.");
-            return;
         }
         (Some(_), Some(_)) => {
             error!("Cannot specify both --input and --input-dir");

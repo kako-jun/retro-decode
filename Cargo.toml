@@ -6,6 +6,9 @@ rust-version = "1.70"
 authors = ["kako-jun"]
 license = "MIT"
 description = "Educational tool for analyzing Japanese retro game image formats - Pixel by pixel, past preserved"
+# Phase 3 移行で examples/ 配下の 70+ 本（旧 Haiku 試行錯誤残骸）を
+# cargo build のスコープから外す。明示登録された [[example]] のみ有効。
+autoexamples = false
 homepage = "https://github.com/your-username/retro-decode"
 repository = "https://github.com/your-username/retro-decode"
 keywords = ["retro", "games", "image", "decoder", "educational"]
@@ -108,7 +111,11 @@ name = "train_decision_tree"
 path = "src/bin/train_decision_tree.rs"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# `cdylib` + `rlib` 同時指定は同じ出力名 (.dylib) で衝突し、
+# bin/test の linker error の原因になっていた。デフォルトの rlib のみに
+# 戻す。wasm/Tauri ビルドが必要なときは feature ごとに crate-type を
+# 個別指定する（その時に再導入）。
+crate-type = ["rlib"]
 
 [[example]]
 name = "transparency_demo"

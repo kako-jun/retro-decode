@@ -127,7 +127,7 @@ fn main() -> ExitCode {
                  diff_count);
     }
 
-    eprintln!("");
+    eprintln!();
     eprintln!("=== SUMMARY ===");
     eprintln!("Total files: {}", total);
     eprintln!("Pixel-perfect: {} ({:.1}%)", matched, (matched as f64 / total as f64 * 100.0));

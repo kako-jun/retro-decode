@@ -6,59 +6,21 @@ use anyhow::{Result, anyhow};
 use tracing::debug;
 
 use crate::{DecodeConfig, DecodingState, DecodeStep};
-
-#[derive(Debug)]
-enum OriginalAction {
-    DirectPixel,
-    Match { position: usize, length: usize },
-}
-
-#[derive(Debug)]
-struct MatchCandidate {
-    position: usize,
-    length: usize,
-    distance: usize,
-    quality: f64,
-}
-
-/// 確定的決定ルール（95%カバレッジ）
-#[derive(Debug)]
-struct DeterministicRules {
-    /// リングバッファ完全一致検出
-    ring_buffer_exact_match_threshold: usize,
-    /// 短距離優先しきい値
-    short_distance_threshold: usize,
-    /// 3-4バイト長の絶対優先
-    priority_length_range: (usize, usize),
-    /// 反復ピクセル検出窓サイズ
-    repetition_window_size: usize,
-}
-
-impl Default for DeterministicRules {
-    fn default() -> Self {
-        Self {
-            ring_buffer_exact_match_threshold: 6,  // ML分析: より短いマッチも考慮
-            short_distance_threshold: 32,          // ML分析: 広めの近距離範囲
-            priority_length_range: (3, 4),         // 確定: 3-4バイト長優先
-            repetition_window_size: 4,             // より短い反復検出
-        }
-    }
-}
+use crate::formats::toheart::lf2_tokens::{
+    enumerate_match_candidates_with_writeback,
+    MatchCandidate as TokenCandidate,
+};
+use crate::formats::toheart::decision_tree::global_tree;
 
 /// 圧縮戦略選択
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionStrategy {
-    /// 100%ピクセル精度（マッチング無効）
-    PerfectAccuracy,
-    /// オリジナル再現（逆エンジニアリング結果）
-    OriginalReplication,
-    /// 機械学習ガイド（ML知見活用）
-    MachineLearningGuided,
-    /// バランス重視（圧縮率と精度のトレードオフ）
-    Balanced,
-    /// 完璧オリジナル再現（95%確定ルール + 5%ML強化）
-    PerfectOriginalReplication,
-    /// 決定木ルールガイド（Phase 3: CART decision tree, 100 rules）
+    /// 決定木ガイド（Phase 3: CART decision tree, 学習済みバイナリをロード）
+    ///
+    /// Phase 3 移行で唯一の正規ルートに統合。以前あった 5 戦略
+    /// (PerfectAccuracy / OriginalReplication / MachineLearningGuided /
+    ///  Balanced / PerfectOriginalReplication) は試行錯誤の残骸として
+    /// 削除済み（git 履歴は残る）。
     DecisionTreeGuided,
 }
 
@@ -131,11 +93,11 @@ impl Lf2Image {
             let b = rgb_data[i * 3 + 2];
             let color = (r, g, b);
             
-            if !color_map.contains_key(&color) {
+            if let std::collections::hash_map::Entry::Vacant(e) = color_map.entry(color) {
                 if unique_colors.len() >= max_colors as usize {
                     break; // Simple truncation - could be improved
                 }
-                color_map.insert(color, unique_colors.len());
+                e.insert(unique_colors.len());
                 unique_colors.push(Rgb { r, g, b });
             }
         }
@@ -168,9 +130,9 @@ impl Lf2Image {
         let mut closest_index = 0;
         
         for (i, color) in palette.iter().enumerate() {
-            let dr = (r as i32 - color.r as i32).abs() as u32;
-            let dg = (g as i32 - color.g as i32).abs() as u32;
-            let db = (b as i32 - color.b as i32).abs() as u32;
+            let dr = (r as i32 - color.r as i32).unsigned_abs();
+            let dg = (g as i32 - color.g as i32).unsigned_abs();
+            let db = (b as i32 - color.b as i32).unsigned_abs();
             let distance = dr * dr + dg * dg + db * db;
             
             if distance < min_distance {
@@ -189,57 +151,35 @@ impl Lf2Image {
         Ok(())
     }
     
-    /// Convert to LF2 binary format (default: ML-guided compression)
+    /// Convert to LF2 binary format (Phase 3: decision tree guided)
     pub fn to_lf2_bytes(&self) -> Result<Vec<u8>> {
-        self.to_lf2_bytes_with_strategy(CompressionStrategy::MachineLearningGuided)
+        self.to_lf2_bytes_with_strategy(CompressionStrategy::DecisionTreeGuided)
     }
-    
+
     /// Convert to LF2 binary format with compression strategy selection
     pub fn to_lf2_bytes_with_strategy(&self, strategy: CompressionStrategy) -> Result<Vec<u8>> {
         let mut data = Vec::new();
-        
-        // Magic number
         data.extend_from_slice(LF2_MAGIC);
-        
-        // Header
         data.extend_from_slice(&self.x_offset.to_le_bytes());
         data.extend_from_slice(&self.y_offset.to_le_bytes());
         data.extend_from_slice(&self.width.to_le_bytes());
         data.extend_from_slice(&self.height.to_le_bytes());
-        
-        // Padding to 0x12
-        data.extend_from_slice(&[0; 2]);
-        
-        // Transparent color at 0x12
+        data.extend_from_slice(&[0; 2]); // padding to 0x12
         data.push(self.transparent_color);
-        
-        // Padding to 0x16  
-        data.extend_from_slice(&[0; 3]);
-        
-        // Color count at 0x16
+        data.extend_from_slice(&[0; 3]); // padding to 0x16
         data.push(self.color_count);
-        
-        // Padding to 0x18
-        data.push(0);
-        
-        // Palette (BGR format)
+        data.push(0); // padding to 0x18
         for color in &self.palette {
-            data.push(color.b); // Blue first (BGR order)
-            data.push(color.g); // Green
-            data.push(color.r); // Red
+            data.push(color.b);
+            data.push(color.g);
+            data.push(color.r);
         }
-        
-        // Compress pixel data using selected strategy
+
         let compressed_pixels = match strategy {
-            CompressionStrategy::PerfectAccuracy => self.compress_lzss_with_level(0)?,
-            CompressionStrategy::OriginalReplication => self.compress_lzss_exact_algorithm()?,
-            CompressionStrategy::MachineLearningGuided => self.compress_lzss_ml_guided()?,
-            CompressionStrategy::Balanced => self.compress_lzss_with_level(2)?,
-            CompressionStrategy::PerfectOriginalReplication => self.compress_lzss_perfect_original()?,
             CompressionStrategy::DecisionTreeGuided => self.compress_lzss_with_decision_tree()?,
         };
         data.extend_from_slice(&compressed_pixels);
-        
+
         Ok(data)
     }
 
@@ -275,15 +215,17 @@ impl Lf2Image {
         // Y-flip 前処理（既存 compress_lzss_ml_guided と同じ）。
         // デコーダは Y 反転後のバイト列を展開するので、エンコーダ側も
         // Y 反転後のバイト列を圧縮する必要がある。
-        let total_pixels = (self.width as usize) * (self.height as usize);
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let total_pixels = w * h;
         let mut input_pixels = vec![0u8; total_pixels];
-        for pixel_idx in 0..total_pixels {
-            let x = pixel_idx % (self.width as usize);
-            let y = pixel_idx / (self.width as usize);
-            let flipped_y = (self.height as usize) - 1 - y;
-            let output_idx = flipped_y * (self.width as usize) + x;
+        for (pixel_idx, dst) in input_pixels.iter_mut().enumerate() {
+            let x = pixel_idx % w;
+            let y = pixel_idx / w;
+            let flipped_y = h - 1 - y;
+            let output_idx = flipped_y * w + x;
             if output_idx < self.pixels.len() {
-                input_pixels[pixel_idx] = self.pixels[output_idx];
+                *dst = self.pixels[output_idx];
             }
         }
 
@@ -327,707 +269,6 @@ impl Lf2Image {
 
         data.extend_from_slice(&compressed);
         Ok(data)
-    }
-
-    /// LZSS compression with configurable matching level
-    /// level: 0=無効, 1=短いマッチのみ, 2=標準, 3=最大
-    fn compress_lzss_with_level(&self, match_level: u8) -> Result<Vec<u8>> {
-        // Prepare pixel data with Y-flip to match decompression input order
-        let total_pixels = (self.width as usize) * (self.height as usize);
-        let mut input_pixels = vec![0u8; total_pixels];
-        
-        // Create the sequence that decompression would process
-        // This is the reverse of the Y-flip that happens during decompression
-        for pixel_idx in 0..total_pixels {
-            let x = pixel_idx % (self.width as usize);
-            let y = pixel_idx / (self.width as usize);
-            let flipped_y = (self.height as usize) - 1 - y;
-            let output_idx = flipped_y * (self.width as usize) + x;
-            
-            if output_idx < self.pixels.len() {
-                input_pixels[pixel_idx] = self.pixels[output_idx];
-            }
-        }
-        
-        let mut compressed = Vec::new();
-        let mut ring = [0x20u8; 0x1000]; // Initialize exactly like decompression
-        let mut ring_pos = 0x0fee; // Same initial position
-        
-        let mut pos = 0;
-        
-        while pos < input_pixels.len() {
-            // Process up to 8 pixels per flag byte
-            let mut flag_byte = 0u8;
-            let mut flag_bits_used = 0;
-            let flag_pos = compressed.len();
-            compressed.push(0); // Placeholder for flag byte
-            
-            while flag_bits_used < 8 && pos < input_pixels.len() {
-                let pixel = input_pixels[pos];
-                
-                // Try to find match in ring buffer
-                let (match_pos, match_len) = self.find_lzss_match(&ring, ring_pos, &input_pixels[pos..]);
-                
-                // Use match based on level
-                let use_match = match match_level {
-                    0 => false, // 無効
-                    1 => match_len == 3, // 3バイトのみ
-                    2 => match_len >= 3 && match_len <= 5, // 短いマッチ
-                    3 => match_len >= 3 && match_len <= 8, // 中程度
-                    4 => match_len >= 3 && match_len <= 12, // 標準
-                    _ => match_len >= 3 && match_len <= 18, // 最大
-                };
-                
-                if use_match {
-                    // Ring buffer reference - bit = 0 (don't set bit in flag)
-                    // Encode to match decompression format:
-                    // upper = (length-3) | (position & 0x0f)
-                    // lower = (position >> 4) & 0xff
-                    let encoded_pos = match_pos & 0x0fff;
-                    let encoded_len = (match_len - 3) & 0x0f;
-                    
-                    let upper_byte = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
-                    let lower_byte = ((encoded_pos >> 4) & 0xff) as u8;
-                    
-                    compressed.push(upper_byte ^ 0xff);
-                    compressed.push(lower_byte ^ 0xff);
-                    
-                    // Update ring buffer exactly like decompression (one byte at a time)
-                    // This mimics the copy process in decompression where bytes are read from 
-                    // ring buffer one by one and written back
-                    let mut copy_pos = match_pos;
-                    for _ in 0..match_len {
-                        let byte_from_ring = ring[copy_pos];
-                        ring[ring_pos] = byte_from_ring;
-                        ring_pos = (ring_pos + 1) & 0x0fff;
-                        copy_pos = (copy_pos + 1) & 0x0fff;
-                    }
-                    
-                    pos += match_len;
-                } else {
-                    // Direct pixel - set bit (1 = direct)
-                    flag_byte |= 1 << (7 - flag_bits_used);
-                    compressed.push(pixel ^ 0xff);
-                    
-                    // Update ring buffer exactly like decompression
-                    ring[ring_pos] = pixel;
-                    ring_pos = (ring_pos + 1) & 0x0fff;
-                    
-                    pos += 1;
-                }
-                
-                flag_bits_used += 1;
-            }
-            
-            // Store completed flag byte
-            compressed[flag_pos] = flag_byte ^ 0xff;
-        }
-        
-        Ok(compressed)
-    }
-    
-    /// オリジナルのLZSSアルゴリズムを完全再現（逆エンジニアリング結果）
-    fn compress_lzss_exact_algorithm(&self) -> Result<Vec<u8>> {
-        // Y-flipピクセルデータ準備
-        let total_pixels = (self.width as usize) * (self.height as usize);
-        let mut input_pixels = vec![0u8; total_pixels];
-        
-        for pixel_idx in 0..total_pixels {
-            let x = pixel_idx % (self.width as usize);
-            let y = pixel_idx / (self.width as usize);
-            let flipped_y = (self.height as usize) - 1 - y;
-            let output_idx = flipped_y * (self.width as usize) + x;
-            
-            if output_idx < self.pixels.len() {
-                input_pixels[pixel_idx] = self.pixels[output_idx];
-            }
-        }
-        
-        let mut compressed = Vec::new();
-        let mut ring = [0x20u8; 0x1000]; 
-        let mut ring_pos = 0x0fee;
-        let mut pos = 0;
-        
-        while pos < input_pixels.len() {
-            let mut flag_byte = 0u8;
-            let mut flag_bits_used = 0;
-            let flag_pos = compressed.len();
-            compressed.push(0);
-            
-            while flag_bits_used < 8 && pos < input_pixels.len() {
-                // オリジナルの決定ロジックを適用
-                let matches = self.find_optimal_matches(&ring, ring_pos, &input_pixels[pos..]);
-                let chosen_action = self.apply_original_decision_logic(pos, &matches);
-                
-                match chosen_action {
-                    OriginalAction::DirectPixel => {
-                        flag_byte |= 1 << (7 - flag_bits_used);
-                        compressed.push(input_pixels[pos] ^ 0xff);
-                        
-                        ring[ring_pos] = input_pixels[pos];
-                        ring_pos = (ring_pos + 1) & 0x0fff;
-                        pos += 1;
-                    }
-                    OriginalAction::Match { position, length } => {
-                        // マッチエンコード
-                        let encoded_pos = position & 0x0fff;
-                        let encoded_len = (length - 3) & 0x0f;
-                        
-                        let upper_byte = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
-                        let lower_byte = ((encoded_pos >> 4) & 0xff) as u8;
-                        
-                        compressed.push(upper_byte ^ 0xff);
-                        compressed.push(lower_byte ^ 0xff);
-                        
-                        // リングバッファ更新
-                        let mut copy_pos = position;
-                        for _ in 0..length {
-                            let byte_from_ring = ring[copy_pos];
-                            ring[ring_pos] = byte_from_ring;
-                            ring_pos = (ring_pos + 1) & 0x0fff;
-                            copy_pos = (copy_pos + 1) & 0x0fff;
-                        }
-                        
-                        pos += length;
-                    }
-                }
-                
-                flag_bits_used += 1;
-            }
-            
-            compressed[flag_pos] = flag_byte ^ 0xff;
-        }
-        
-        Ok(compressed)
-    }
-    
-    /// Perfect Original Replication LZSS compression 
-    /// 95%確定ルール + 5%ML強化による完璧な往復テスト達成
-    fn compress_lzss_perfect_original(&self) -> Result<Vec<u8>> {
-        // Y-flipピクセルデータ準備
-        let total_pixels = (self.width as usize) * (self.height as usize);
-        let mut input_pixels = vec![0u8; total_pixels];
-        
-        for pixel_idx in 0..total_pixels {
-            let x = pixel_idx % (self.width as usize);
-            let y = pixel_idx / (self.width as usize);
-            let flipped_y = (self.height as usize) - 1 - y;
-            let output_idx = flipped_y * (self.width as usize) + x;
-            
-            if output_idx < self.pixels.len() {
-                input_pixels[pixel_idx] = self.pixels[output_idx];
-            }
-        }
-        
-        let mut compressed = Vec::new();
-        let mut ring = [0x20u8; 0x1000]; 
-        let mut ring_pos = 0x0fee;
-        let mut pos = 0;
-        
-        while pos < input_pixels.len() {
-            let mut flag_byte = 0u8;
-            let mut flag_bits_used = 0;
-            let flag_pos = compressed.len();
-            compressed.push(0);
-            
-            while flag_bits_used < 8 && pos < input_pixels.len() {
-                // マッチ候補検索
-                let matches = self.find_optimal_matches(&ring, ring_pos, &input_pixels[pos..]);
-                
-                // 95%確定ルール + 5%ML強化決定ロジック
-                let action = self.apply_perfect_original_logic(pos, &matches, &ring, ring_pos);
-                
-                match action {
-                    OriginalAction::DirectPixel => {
-                        // 直接ピクセル出力
-                        let pixel = input_pixels[pos];
-                        compressed.push(pixel);
-                        
-                        ring[ring_pos] = pixel;
-                        ring_pos = (ring_pos + 1) & 0xfff;
-                        pos += 1;
-                    }
-                    OriginalAction::Match { position, length } => {
-                        // マッチング出力
-                        flag_byte |= 1 << flag_bits_used;
-                        
-                        let encoded_pos = position & 0x0fff;
-                        let encoded_len = ((length - 3) & 0x0f) as u8;
-                        
-                        compressed.push(encoded_pos as u8);
-                        compressed.push((((encoded_pos >> 8) as u8) | (encoded_len << 4)) as u8);
-                        
-                        // リングバッファ更新
-                        for i in 0..length {
-                            if pos + i < input_pixels.len() {
-                                ring[ring_pos] = input_pixels[pos + i];
-                                ring_pos = (ring_pos + 1) & 0xfff;
-                            }
-                        }
-                        pos += length;
-                    }
-                }
-                
-                flag_bits_used += 1;
-            }
-            
-            compressed[flag_pos] = flag_byte ^ 0xff;
-        }
-        
-        Ok(compressed)
-    }
-    
-    /// 完璧オリジナル決定ロジック（95%確定ルール + 5%ML強化）
-    fn apply_perfect_original_logic(&self, pos: usize, matches: &[MatchCandidate], ring_buffer: &[u8], ring_pos: usize) -> OriginalAction {
-        let rules = DeterministicRules::default();
-        
-        if matches.is_empty() {
-            return OriginalAction::DirectPixel;
-        }
-        
-        // 95%確定ルール適用
-        for candidate in matches {
-            // ルール1: リングバッファ完全一致検出
-            if candidate.length >= rules.ring_buffer_exact_match_threshold {
-                let ring_start = (ring_pos + 0x1000 - candidate.distance) & 0xfff;
-                let mut exact_match = true;
-                for i in 0..candidate.length {
-                    let ring_byte = ring_buffer[(ring_start + i) & 0xfff];
-                    let target_byte = if pos + i < self.pixels.len() {
-                        self.pixels[pos + i]
-                    } else {
-                        0
-                    };
-                    if ring_byte != target_byte {
-                        exact_match = false;
-                        break;
-                    }
-                }
-                if exact_match {
-                    return OriginalAction::Match { 
-                        position: candidate.position, 
-                        length: candidate.length 
-                    };
-                }
-            }
-            
-            // ルール2: 3-4バイト長の絶対優先
-            if candidate.length >= rules.priority_length_range.0 && 
-               candidate.length <= rules.priority_length_range.1 {
-                return OriginalAction::Match { 
-                    position: candidate.position, 
-                    length: candidate.length 
-                };
-            }
-            
-            // ルール3: 短距離優先（0-16距離）
-            if candidate.distance <= rules.short_distance_threshold {
-                return OriginalAction::Match { 
-                    position: candidate.position, 
-                    length: candidate.length 
-                };
-            }
-        }
-        
-        // ルール4: 反復ピクセル検出
-        if self.detect_pixel_repetition(pos, rules.repetition_window_size) {
-            return OriginalAction::DirectPixel;
-        }
-        
-        // 残り5%: ML強化判定（後で実装）
-        // 現在は最良マッチを選択
-        let best_match = &matches[0];
-        OriginalAction::Match { 
-            position: best_match.position, 
-            length: best_match.length 
-        }
-    }
-    
-    /// 反復ピクセル検出
-    fn detect_pixel_repetition(&self, pos: usize, window_size: usize) -> bool {
-        if pos + window_size >= self.pixels.len() {
-            return false;
-        }
-        
-        let first_pixel = self.pixels[pos];
-        for i in 1..window_size {
-            if pos + i < self.pixels.len() && self.pixels[pos + i] != first_pixel {
-                return false;
-            }
-        }
-        true // window_size分の同じピクセルが続く
-    }
-    
-    /// オリジナルの決定ロジック（解析結果に基づく）
-    fn apply_original_decision_logic(&self, pos: usize, matches: &[MatchCandidate]) -> OriginalAction {
-        if matches.is_empty() {
-            return OriginalAction::DirectPixel;
-        }
-        
-        // オリジナルの特性に基づく決定ルール：
-        // 1. 3-4バイトの短いマッチを優先
-        // 2. 近距離（0-255バイト）を優先
-        // 3. 99.9%の確率でマッチングを選択
-        
-        let best_match = &matches[0];
-        
-        // 長さ優先度（3-4バイトが最優先）
-        let length_score = match best_match.length {
-            3 => 100.0,   // 最高優先度
-            4 => 90.0,    // 高優先度
-            5 => 70.0,    // 中優先度
-            6..=8 => 50.0, // 低優先度
-            _ => 30.0,    // 最低優先度
-        };
-        
-        // 距離優先度（近いほど良い）
-        let distance_score = if best_match.distance <= 255 {
-            50.0  // 近距離ボーナス
-        } else if best_match.distance <= 512 {
-            30.0
-        } else {
-            10.0
-        };
-        
-        let total_score = length_score + distance_score;
-        
-        // 99.9%の確率でマッチングを選択（オリジナルの特性）
-        // スコアが一定以上、かつ位置ベースの疑似ランダムチェック
-        if total_score >= 80.0 || (total_score >= 40.0 && (pos % 1000) != 0) {
-            OriginalAction::Match {
-                position: best_match.position,
-                length: best_match.length,
-            }
-        } else {
-            OriginalAction::DirectPixel
-        }
-    }
-    
-    /// オリジナルの最適マッチ検索（特性に基づく）
-    fn find_optimal_matches(&self, ring: &[u8; 0x1000], ring_pos: usize, remaining: &[u8]) -> Vec<MatchCandidate> {
-        let mut matches = Vec::new();
-        
-        if remaining.is_empty() {
-            return matches;
-        }
-        
-        let first_byte = remaining[0];
-        let max_len = std::cmp::min(18, remaining.len());
-        
-        if max_len < 3 {
-            return matches;
-        }
-        
-        // 近距離から検索（オリジナルの特性）
-        for offset in 1..=0x1000 {
-            let start = (ring_pos + 0x1000 - offset) & 0x0fff;
-            
-            if ring[start] != first_byte {
-                continue;
-            }
-            
-            let mut len = 1;
-            while len < max_len {
-                let ring_idx = (start + len) & 0x0fff;
-                if ring[ring_idx] == remaining[len] {
-                    len += 1;
-                } else {
-                    break;
-                }
-            }
-            
-            if len >= 3 {
-                let distance = offset;
-                let quality = self.calculate_original_quality(len, distance);
-                
-                matches.push(MatchCandidate {
-                    position: start,
-                    length: len,
-                    distance,
-                    quality,
-                });
-            }
-        }
-        
-        // オリジナルの優先度でソート
-        matches.sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap());
-        
-        matches
-    }
-
-    /// Decision tree rule-based candidate selection (Phase 3)
-    /// Generated from CART decision tree with 100 rules
-    /// Features: image_x, length, image_y, ring_r
-    ///
-    /// Train (Phase 2):
-    ///   cargo run --release --bin train_decision_tree -- /tmp/full_dataset.csv 2>/dev/null
-    ///
-    /// Integration (Phase 3):
-    ///   Used in compress_lzss_*() to select best match candidate from find_optimal_matches()
-    fn select_best_candidate_with_rules(
-        image_x: f64,
-        length: f64,
-        image_y: f64,
-        ring_r: f64,
-    ) -> usize {
-        // CART decision tree (100 rules, 100% training accuracy)
-        if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y <= 74.00 && ring_r <= 263.00 && length <= 1.50 {
-            return 3;
-        } else if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y <= 74.00 && ring_r <= 263.00 && length > 1.50 {
-            return 46;
-        } else if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y <= 74.00 && ring_r > 263.00 && ring_r <= 403.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y <= 74.00 && ring_r > 263.00 && ring_r > 403.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y > 74.00 && image_y <= 91.00 && length <= 1.50 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y > 74.00 && image_y <= 91.00 && length > 1.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y > 74.00 && image_y > 91.00 && length <= 1.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length <= 2.50 && image_y > 74.00 && image_y > 91.00 && length > 1.50 {
-            return 23;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y <= 62.00 && ring_r <= 85.00 && image_y <= 60.00 && image_y <= 48.00 && image_y <= 41.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y <= 62.00 && ring_r <= 85.00 && image_y <= 60.00 && image_y <= 48.00 && image_y > 41.50 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y <= 62.00 && ring_r <= 85.00 && image_y <= 60.00 && image_y > 48.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y <= 62.00 && ring_r <= 85.00 && image_y > 60.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y <= 62.00 && ring_r > 85.00 && length <= 75.50 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y <= 62.00 && ring_r > 85.00 && length > 75.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y > 62.00 && ring_r <= 60.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y > 62.00 && ring_r > 60.50 && length <= 144.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y > 62.00 && ring_r > 60.50 && length > 144.50 && image_y <= 73.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length <= 145.50 && image_y > 62.00 && ring_r > 60.50 && length > 144.50 && image_y > 73.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r <= 87.00 && length > 145.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r <= 363.50 && ring_r <= 260.00 && ring_r <= 251.00 && length <= 111.50 && image_y <= 48.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r <= 363.50 && ring_r <= 260.00 && ring_r <= 251.00 && length <= 111.50 && image_y > 48.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r <= 363.50 && ring_r <= 260.00 && ring_r <= 251.00 && length > 111.50 {
-            return 4;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r <= 363.50 && ring_r <= 260.00 && ring_r > 251.00 && length <= 111.50 && image_y <= 48.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r <= 363.50 && ring_r <= 260.00 && ring_r > 251.00 && length <= 111.50 && image_y > 48.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r <= 363.50 && ring_r <= 260.00 && ring_r > 251.00 && length > 111.50 {
-            return 4;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r <= 363.50 && ring_r > 260.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r > 363.50 && length <= 146.50 && ring_r <= 364.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r > 363.50 && length <= 146.50 && ring_r > 364.50 && ring_r <= 390.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r > 363.50 && length <= 146.50 && ring_r > 364.50 && ring_r > 390.50 && image_y <= 87.50 && ring_r <= 391.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r > 363.50 && length <= 146.50 && ring_r > 364.50 && ring_r > 390.50 && image_y <= 87.50 && ring_r > 391.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r > 363.50 && length <= 146.50 && ring_r > 364.50 && ring_r > 390.50 && image_y > 87.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r > 363.50 && length > 146.50 && length <= 148.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y <= 132.50 && ring_r > 87.00 && ring_r > 363.50 && length > 146.50 && length > 148.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y > 132.50 && length <= 146.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length <= 149.50 && image_y > 132.50 && length > 146.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r <= 63.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r > 63.00 && image_y <= 87.50 && image_y <= 76.50 && image_y <= 67.00 && ring_r <= 162.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r > 63.00 && image_y <= 87.50 && image_y <= 76.50 && image_y <= 67.00 && ring_r > 162.00 && ring_r <= 231.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r > 63.00 && image_y <= 87.50 && image_y <= 76.50 && image_y <= 67.00 && ring_r > 162.00 && ring_r > 231.50 && image_y <= 57.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r > 63.00 && image_y <= 87.50 && image_y <= 76.50 && image_y <= 67.00 && ring_r > 162.00 && ring_r > 231.50 && image_y > 57.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r > 63.00 && image_y <= 87.50 && image_y <= 76.50 && image_y > 67.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r > 63.00 && image_y <= 87.50 && image_y > 76.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length <= 157.00 && ring_r > 63.00 && image_y > 87.50 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length > 157.00 && length <= 158.50 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y <= 125.50 && length > 157.00 && length > 158.50 {
-            return 7;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length <= 160.00 && image_y > 125.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r <= 11.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y <= 54.50 && ring_r <= 171.50 && length <= 282.00 && length <= 218.00 {
-            return 3;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y <= 54.50 && ring_r <= 171.50 && length <= 282.00 && length > 218.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y <= 54.50 && ring_r <= 171.50 && length > 282.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y <= 54.50 && ring_r > 171.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y > 54.50 && image_y <= 99.50 && image_y <= 93.00 && length <= 261.00 && length <= 256.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y > 54.50 && image_y <= 99.50 && image_y <= 93.00 && length <= 261.00 && length > 256.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y > 54.50 && image_y <= 99.50 && image_y <= 93.00 && length > 261.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y > 54.50 && image_y <= 99.50 && image_y > 93.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length <= 291.50 && image_y > 54.50 && image_y > 99.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length > 291.50 && ring_r <= 134.00 && length <= 293.50 && ring_r <= 63.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length > 291.50 && ring_r <= 134.00 && length <= 293.50 && ring_r > 63.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length > 291.50 && ring_r <= 134.00 && length > 293.50 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length > 291.50 && ring_r > 134.00 && ring_r <= 192.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length > 291.50 && ring_r > 134.00 && ring_r > 192.50 && image_y <= 93.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r <= 204.50 && length > 291.50 && ring_r > 134.00 && ring_r > 192.50 && image_y > 93.50 {
-            return 4;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y <= 75.50 && length <= 289.50 && image_y <= 40.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y <= 75.50 && length <= 289.50 && image_y > 40.00 && image_y <= 67.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y <= 75.50 && length <= 289.50 && image_y > 40.00 && image_y > 67.00 && length <= 249.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y <= 75.50 && length <= 289.50 && image_y > 40.00 && image_y > 67.00 && length > 249.00 {
-            return 3;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y <= 75.50 && length > 289.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y > 75.50 && length <= 242.00 && length <= 188.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y > 75.50 && length <= 242.00 && length > 188.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y > 75.50 && length > 242.00 && ring_r <= 205.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r <= 235.50 && ring_r > 204.50 && image_y > 75.50 && length > 242.00 && ring_r > 205.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y <= 21.00 && ring_r <= 281.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y <= 21.00 && ring_r > 281.00 && image_y <= 13.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y <= 21.00 && ring_r > 281.00 && image_y > 13.00 && ring_r <= 310.00 && length <= 270.00 && length <= 248.00 && image_y <= 19.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y <= 21.00 && ring_r > 281.00 && image_y > 13.00 && ring_r <= 310.00 && length <= 270.00 && length <= 248.00 && image_y > 19.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y <= 21.00 && ring_r > 281.00 && image_y > 13.00 && ring_r <= 310.00 && length <= 270.00 && length > 248.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y <= 21.00 && ring_r > 281.00 && image_y > 13.00 && ring_r <= 310.00 && length > 270.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y <= 21.00 && ring_r > 281.00 && image_y > 13.00 && ring_r > 310.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length <= 280.00 && length <= 278.50 && ring_r <= 305.50 && image_y <= 127.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length <= 280.00 && length <= 278.50 && ring_r <= 305.50 && image_y > 127.50 && length <= 193.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length <= 280.00 && length <= 278.50 && ring_r <= 305.50 && image_y > 127.50 && length > 193.50 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length <= 280.00 && length <= 278.50 && ring_r > 305.50 && length <= 254.00 {
-            return 0;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length <= 280.00 && length <= 278.50 && ring_r > 305.50 && length > 254.00 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length <= 280.00 && length > 278.50 {
-            return 1;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length > 280.00 && ring_r <= 257.00 && length <= 288.00 {
-            return 2;
-        } else if image_x <= 3.50 && length <= 296.50 && length > 2.50 && length > 149.50 && ring_r <= 422.50 && length > 160.00 && ring_r > 11.00 && ring_r > 235.50 && image_y > 21.00 && ring_r <= 408.50 && length > 280.00 && ring_r <= 257.00 && length > 288.00 {
-            return 0;
-        } else {
-            return 0;  // Default: first candidate
-        }
-    }
-
-    /// オリジナルの品質計算（解析結果に基づく）
-    fn calculate_original_quality(&self, length: usize, distance: usize) -> f64 {
-        // 長さ重み（3-4バイトが最優先）
-        let length_weight = match length {
-            3 => 10.0,
-            4 => 9.0,
-            5 => 7.0,
-            6 => 5.0,
-            7..=8 => 3.0,
-            _ => 1.0,
-        };
-        
-        // 距離重み（近いほど良い）
-        let distance_weight = if distance <= 255 {
-            5.0
-        } else if distance <= 512 {
-            3.0
-        } else if distance <= 1024 {
-            2.0
-        } else {
-            1.0
-        };
-        
-        length_weight * distance_weight
-    }
-
-    /// Find the longest match in the ring buffer (optimized)
-    fn find_lzss_match(&self, ring: &[u8; 0x1000], ring_pos: usize, remaining: &[u8]) -> (usize, usize) {
-        let mut best_pos = 0;
-        let mut best_len = 0;
-        
-        if remaining.is_empty() {
-            return (0, 0);
-        }
-        
-        let first_byte = remaining[0];
-        let max_len = std::cmp::min(18, remaining.len());
-        
-        // Minimum match length to be useful
-        if max_len < 3 {
-            return (0, 0);
-        }
-        
-        // Search recent history first (better locality)
-        // Look backwards from current position
-        let search_distance = std::cmp::min(0x1000, ring_pos + 0x1000);
-        
-        for offset in 1..=search_distance {
-            let start = (ring_pos + 0x1000 - offset) & 0x0fff;
-            
-            // Quick first-byte check
-            if ring[start] != first_byte {
-                continue;
-            }
-            
-            let mut len = 1;
-            
-            // Check how many bytes match
-            while len < max_len {
-                let ring_idx = (start + len) & 0x0fff;
-                if ring[ring_idx] == remaining[len] {
-                    len += 1;
-                } else {
-                    break;
-                }
-            }
-            
-            // Only consider matches of 3 or more bytes
-            if len >= 3 && len > best_len {
-                best_len = len;
-                best_pos = start;
-                
-                // If we found a perfect match, use it
-                if len == max_len {
-                    break;
-                }
-            }
-        }
-        
-        (best_pos, best_len)
     }
 
     /// Open LF2 file with high-speed implementation
@@ -1182,193 +423,6 @@ impl Lf2Image {
         
         Ok(pixels)
     }
-    
-    /// Decompress with step-by-step visualization for education
-    fn decompress_with_steps(compressed_data: &[u8], width: u16, height: u16, state: &mut DecodingState) -> Result<Vec<u8>> {
-        let total_pixels = (width as usize) * (height as usize);
-        let mut pixels = vec![0u8; total_pixels];
-        
-        state.total_pixels = total_pixels;
-        state.ring_buffer = vec![0u8; 0x1000];
-        
-        let mut ring = [0x20u8; 0x1000]; // Initialize with spaces like original C
-        let mut ring_pos = 0x0fee;
-        
-        let mut data_pos = 0;
-        let mut pixel_idx = 0;
-        let mut flag = 0u8;
-        let mut flag_count = 0;
-        let mut step_number = 1;
-        
-        while pixel_idx < total_pixels && data_pos < compressed_data.len() {
-            if flag_count == 0 {
-                if data_pos >= compressed_data.len() {
-                    break;
-                }
-                flag = compressed_data[data_pos] ^ 0xff;
-                data_pos += 1;
-                flag_count = 8;
-                
-                // Add step for flag reading
-                let step = DecodeStep {
-                    step_number,
-                    description: format!("フラグバイト: 0x{:02x}", flag),
-                    explanation: format!(
-                        "フラグバイト 0x{:02x} を読み込みました。このバイトの各ビットが次の8つの操作を制御します。\n\
-                         ビット=1: 直接ピクセル（リテラル）\n\
-                         ビット=0: LZSSマッチ（リングバッファ参照）\n\
-                         現在の進捗: {}/{} ピクセル",
-                        flag, pixel_idx, total_pixels
-                    ),
-                    operation_type: crate::formats::StepOperationType::FlagByte,
-                    raw_bytes: vec![compressed_data[data_pos - 1]],
-                    data_offset: data_pos - 1,
-                    data_length: 1,
-                    pixels_decoded: pixel_idx,
-                    memory_state: ring[..32].to_vec(), // Show first 32 bytes of ring buffer
-                    ring_position: ring_pos,
-                    partial_image: None,
-                };
-                state.add_step(step);
-                step_number += 1;
-            }
-            
-            if (flag & 0x80) != 0 {
-                // Direct pixel - show this step
-                if data_pos >= compressed_data.len() {
-                    break;
-                }
-                let pixel = compressed_data[data_pos] ^ 0xff;
-                data_pos += 1;
-                
-                ring[ring_pos] = pixel;
-                ring_pos = (ring_pos + 1) & 0x0fff;
-                
-                let x = pixel_idx % (width as usize);
-                let y = pixel_idx / (width as usize);
-                let flipped_y = (height as usize) - 1 - y;
-                let output_idx = flipped_y * (width as usize) + x;
-                
-                if output_idx < pixels.len() {
-                    pixels[output_idx] = pixel;
-                }
-                
-                // Add step for direct pixel
-                let step = DecodeStep {
-                    step_number,
-                    description: format!("直接ピクセル: #{} 位置({},{})", pixel, x, y),
-                    explanation: format!(
-                        "直接ピクセルデータ: パレットインデックス {} (0x{:02x})\n\
-                         座標: ({}, {}) → 出力位置 {}\n\
-                         リングバッファ位置 0x{:03x} に書き込み\n\
-                         この操作では圧縮されていない生のピクセル値を直接出力します。",
-                        pixel, pixel, x, y, output_idx, ring_pos - 1
-                    ),
-                    operation_type: crate::formats::StepOperationType::DirectPixel { palette_index: pixel },
-                    raw_bytes: vec![compressed_data[data_pos - 1]],
-                    data_offset: data_pos - 1,
-                    data_length: 1,
-                    pixels_decoded: pixel_idx + 1,
-                    memory_state: ring[..32].to_vec(),
-                    ring_position: ring_pos,
-                    partial_image: Some(pixels[..std::cmp::min(pixels.len(), (pixel_idx + 1) * 3)].to_vec()),
-                };
-                state.add_step(step);
-                step_number += 1;
-                pixel_idx += 1;
-            } else {
-                // Ring buffer reference
-                if data_pos + 1 >= compressed_data.len() {
-                    break;
-                }
-                
-                let upper = compressed_data[data_pos] ^ 0xff;
-                let lower = compressed_data[data_pos + 1] ^ 0xff;
-                data_pos += 2;
-                
-                let length = ((upper & 0x0f) as usize) + 3;
-                let position = (((upper >> 4) as usize) + ((lower as usize) << 4)) & 0x0fff;
-                let distance = if ring_pos >= position {
-                    ring_pos - position
-                } else {
-                    0x1000 - position + ring_pos
-                };
-
-                let step = DecodeStep {
-                    step_number,
-                    description: format!("LZSSマッチ: 距離{}, 長さ{}", distance, length),
-                    explanation: format!(
-                        "LZSSマッチング（LZSS Match）\n\
-                         生バイト: [0x{:02x}, 0x{:02x}]\n\
-                         → 長さ: {} バイト (0x{:01x} + 3)\n\
-                         → 位置: 0x{:03x}\n\
-                         → 距離: {} バイト前\n\n\
-                         リングバッファの位置 0x{:03x} から {} バイトをコピーします。\n\
-                         これにより {}バイトを2バイトで表現できます（圧縮率: {:.1}%）。\n\
-                         現在リングバッファ位置: 0x{:03x}",
-                        upper ^ 0xff, lower ^ 0xff,
-                        length, upper & 0x0f,
-                        position,
-                        distance,
-                        position, length, length,
-                        (1.0 - 2.0 / length as f32) * 100.0,
-                        ring_pos
-                    ),
-                    operation_type: crate::formats::StepOperationType::LzssMatch {
-                        distance,
-                        length
-                    },
-                    raw_bytes: vec![
-                        compressed_data[data_pos - 2],
-                        compressed_data[data_pos - 1]
-                    ],
-                    data_offset: data_pos - 2,
-                    data_length: 2,
-                    pixels_decoded: pixel_idx,
-                    memory_state: ring[..32].to_vec(),
-                    ring_position: ring_pos,
-                    partial_image: None,
-                };
-                state.add_step(step);
-                step_number += 1;
-                
-                let mut copy_pos = position;
-                for _ in 0..length {
-                    if pixel_idx >= total_pixels {
-                        break;
-                    }
-                    
-                    let pixel = ring[copy_pos];
-                    ring[ring_pos] = pixel;
-                    ring_pos = (ring_pos + 1) & 0x0fff;
-                    copy_pos = (copy_pos + 1) & 0x0fff;
-                    
-                    let x = pixel_idx % (width as usize);
-                    let y = pixel_idx / (width as usize);
-                    let flipped_y = (height as usize) - 1 - y;
-                    let output_idx = flipped_y * (width as usize) + x;
-                    
-                    if output_idx < pixels.len() {
-                        pixels[output_idx] = pixel;
-                    }
-                    
-                    pixel_idx += 1;
-                }
-                
-                state.decoded_pixels = pixel_idx;
-            }
-            
-            flag <<= 1;
-            flag_count -= 1;
-        }
-        
-        // Update final state
-        state.ring_buffer = ring.to_vec();
-        state.decoded_pixels = pixel_idx;
-        
-        Ok(pixels)
-    }
-    
     /// Save in multiple formats based on extension
     pub fn decode(&self, output_path: &Path, config: &DecodeConfig) -> Result<()> {
         // Skip file output for benchmark mode
@@ -1419,7 +473,7 @@ impl Lf2Image {
         file.write_all(&1u16.to_le_bytes())?;     // Planes
         file.write_all(&8u16.to_le_bytes())?;     // Bits per pixel (8-bit indexed)
         file.write_all(&0u32.to_le_bytes())?;     // Compression (none)
-        file.write_all(&(pixel_data_size as u32).to_le_bytes())?; // Image size
+        file.write_all(&pixel_data_size.to_le_bytes())?; // Image size
         file.write_all(&2835u32.to_le_bytes())?;  // X pixels per meter (72 DPI)
         file.write_all(&2835u32.to_le_bytes())?;  // Y pixels per meter (72 DPI)
         file.write_all(&(palette_entries as u32).to_le_bytes())?; // Colors used
@@ -1550,118 +604,28 @@ impl Lf2Image {
         self.decode(output_path, config)
     }
     
-    /// Machine Learning guided LZSS compression (ML insights from 246万決定ポイント)
-    /// Key findings: compression_progress(27.4), estimated_y(16.6) are most important
-    fn compress_lzss_ml_guided(&self) -> Result<Vec<u8>> {
-        // Y-flipピクセルデータ準備
-        let total_pixels = (self.width as usize) * (self.height as usize);
-        let mut input_pixels = vec![0u8; total_pixels];
-        
-        for pixel_idx in 0..total_pixels {
-            let x = pixel_idx % (self.width as usize);
-            let y = pixel_idx / (self.width as usize);
-            let flipped_y = (self.height as usize) - 1 - y;
-            let output_idx = flipped_y * (self.width as usize) + x;
-            
-            if output_idx < self.pixels.len() {
-                input_pixels[pixel_idx] = self.pixels[output_idx];
-            }
-        }
-        
-        let mut compressed = Vec::new();
-        let mut ring = [0x20u8; 0x1000]; 
-        let mut ring_pos = 0x0fee;
-        let mut pos = 0;
-        
-        while pos < input_pixels.len() {
-            let mut flag_byte = 0u8;
-            let mut flag_bits_used = 0;
-            let flag_pos = compressed.len();
-            compressed.push(0);
-            
-            while flag_bits_used < 8 && pos < input_pixels.len() {
-                // ML特徴量計算
-                let compression_progress = pos as f64 / input_pixels.len() as f64;
-                let estimated_y = (pos / (self.width as usize)) as f64 / (self.height as usize) as f64;
-                let ring_buffer_state = self.calculate_ring_buffer_score(&ring, ring_pos);
-                
-                // マッチ候補検索
-                let matches = self.find_optimal_matches(&ring, ring_pos, &input_pixels[pos..]);
-                
-                // ML学習済み決定ロジック適用
-                let should_match = self.apply_ml_decision_logic(
-                    compression_progress,
-                    estimated_y,
-                    ring_buffer_state,
-                    &matches
-                );
-                
-                if should_match && !matches.is_empty() {
-                    // マッチング使用
-                    let best_match = &matches[0];
-                    let position = best_match.position;
-                    let length = best_match.length;
-                    
-                    let encoded_pos = position & 0x0fff;
-                    let encoded_len = (length - 3) & 0x0f;
-                    
-                    let upper_byte = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
-                    let lower_byte = ((encoded_pos >> 4) & 0xff) as u8;
-                    
-                    compressed.push(upper_byte ^ 0xff);
-                    compressed.push(lower_byte ^ 0xff);
-                    
-                    // リングバッファ更新
-                    let mut copy_pos = position;
-                    for _ in 0..length {
-                        let byte_from_ring = ring[copy_pos];
-                        ring[ring_pos] = byte_from_ring;
-                        ring_pos = (ring_pos + 1) & 0x0fff;
-                        copy_pos = (copy_pos + 1) & 0x0fff;
-                    }
-                    
-                    pos += length;
-                } else {
-                    // 直接ピクセル
-                    flag_byte |= 1 << (7 - flag_bits_used);
-                    compressed.push(input_pixels[pos] ^ 0xff);
-                    
-                    ring[ring_pos] = input_pixels[pos];
-                    ring_pos = (ring_pos + 1) & 0x0fff;
-                    pos += 1;
-                }
-                
-                flag_bits_used += 1;
-            }
-            
-            compressed[flag_pos] = flag_byte ^ 0xff;
-        }
-        
-        Ok(compressed)
-    }
-
-    /// LZSS compression with decision tree rule guidance (Phase 3)
-    /// Uses CART decision tree (100 rules) to select best match candidate
     fn compress_lzss_with_decision_tree(&self) -> Result<Vec<u8>> {
         // Y-flip pixel data preparation
-        let total_pixels = (self.width as usize) * (self.height as usize);
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let total_pixels = w * h;
         let mut input_pixels = vec![0u8; total_pixels];
 
-        for pixel_idx in 0..total_pixels {
-            let x = pixel_idx % (self.width as usize);
-            let y = pixel_idx / (self.width as usize);
-            let flipped_y = (self.height as usize) - 1 - y;
-            let output_idx = flipped_y * (self.width as usize) + x;
+        for (pixel_idx, dst) in input_pixels.iter_mut().enumerate() {
+            let x = pixel_idx % w;
+            let y = pixel_idx / w;
+            let flipped_y = h - 1 - y;
+            let output_idx = flipped_y * w + x;
 
             if output_idx < self.pixels.len() {
-                input_pixels[pixel_idx] = self.pixels[output_idx];
+                *dst = self.pixels[output_idx];
             }
         }
 
         let mut compressed = Vec::new();
         let mut ring = [0x20u8; 0x1000];
-        let mut ring_pos = 0x0fee;
-        let mut pos = 0;
+        let mut ring_pos: usize = 0x0fee;
+        let mut pos: usize = 0;
 
         while pos < input_pixels.len() {
             let mut flag_byte = 0u8;
@@ -1670,43 +634,50 @@ impl Lf2Image {
             compressed.push(0);
 
             while flag_bits_used < 8 && pos < input_pixels.len() {
-                // Extract features for decision tree
                 let image_x = (pos % (self.width as usize)) as f64;
                 let image_y = (pos / (self.width as usize)) as f64;
                 let ring_r = ring_pos as f64;
 
-                // Search for match candidates
-                let matches = self.find_optimal_matches(&ring, ring_pos, &input_pixels[pos..]);
+                // 学習データ生成と同じ候補列挙関数を使う（自己オーバーラップ対応 +
+                // (pos, len) 全組み合わせ + pos 昇順 → len 昇順）。
+                // 学習時と推論時で候補集合とインデックスが完全一致することが大前提。
+                let matches: Vec<TokenCandidate> = enumerate_match_candidates_with_writeback(
+                    &ring,
+                    &input_pixels,
+                    pos,
+                    ring_pos,
+                );
 
-                // Use decision tree to select best candidate
                 if !matches.is_empty() {
-                    // Find minimum distance candidate to get the length feature
-                    let mut min_distance = f64::MAX;
-                    let mut min_distance_length = 0.0;
+                    // distance 計算は学習時 (lf2_first_diff::full_dataset) と同一式。
+                    let distance_of = |c: &TokenCandidate| -> usize {
+                        let p = c.pos as usize;
+                        if p <= ring_pos {
+                            ring_pos - p
+                        } else {
+                            (0x1000 - p) + ring_pos
+                        }
+                    };
+                    let mut min_distance = usize::MAX;
+                    let mut min_distance_length: f64 = 0.0;
                     for candidate in &matches {
-                        let dist = candidate.distance as f64;
-                        if dist < min_distance {
-                            min_distance = dist;
-                            min_distance_length = candidate.length as f64;
+                        let d = distance_of(candidate);
+                        if d < min_distance {
+                            min_distance = d;
+                            min_distance_length = candidate.len as f64;
                         }
                     }
 
-                    // Apply decision tree rule with correct features (minimum distance candidate's length)
-                    let best_idx = Self::select_best_candidate_with_rules(
-                        image_x,
-                        min_distance_length,  // Use minimum distance candidate's length
-                        image_y,
-                        ring_r,
-                    );
-
-                    // Clamp to valid match index
+                    let tree = global_tree().map_err(|e| anyhow!(
+                        "decision tree not loaded: {}", e
+                    ))?;
+                    let best_idx = tree.predict(image_x, min_distance_length, image_y, ring_r);
                     let best_idx = std::cmp::min(best_idx, matches.len() - 1);
                     let best_match = &matches[best_idx];
 
-                    // Use match if it's long enough
-                    if best_match.length >= 3 {
-                        let position = best_match.position;
-                        let match_len = best_match.length;
+                    if best_match.len >= 3 {
+                        let position = best_match.pos as usize;
+                        let match_len = best_match.len as usize;
 
                         let encoded_pos = position & 0x0fff;
                         let encoded_len = (match_len - 3) & 0x0f;
@@ -1717,7 +688,6 @@ impl Lf2Image {
                         compressed.push(upper_byte ^ 0xff);
                         compressed.push(lower_byte ^ 0xff);
 
-                        // Update ring buffer
                         let mut copy_pos = position;
                         for _ in 0..match_len {
                             let byte_from_ring = ring[copy_pos];
@@ -1728,7 +698,6 @@ impl Lf2Image {
 
                         pos += match_len;
                     } else {
-                        // Direct pixel
                         flag_byte |= 1 << (7 - flag_bits_used);
                         compressed.push(input_pixels[pos] ^ 0xff);
 
@@ -1737,7 +706,6 @@ impl Lf2Image {
                         pos += 1;
                     }
                 } else {
-                    // No matches, direct pixel
                     flag_byte |= 1 << (7 - flag_bits_used);
                     compressed.push(input_pixels[pos] ^ 0xff);
 
@@ -1753,90 +721,5 @@ impl Lf2Image {
         }
 
         Ok(compressed)
-    }
-
-    /// ML学習済み決定ロジック（重要度: compression_progress=27.4, estimated_y=16.6）
-    fn apply_ml_decision_logic(
-        &self,
-        compression_progress: f64,
-        estimated_y: f64,
-        ring_score: f64,
-        matches: &[MatchCandidate],
-    ) -> bool {
-        if matches.is_empty() {
-            return false;
-        }
-        
-        let best_match = &matches[0];
-        
-        // ML学習済み重み（特徴量重要度から計算）
-        let progress_weight = 27.36; // 最重要特徴量
-        let y_position_weight = 16.58; // 第2重要特徴量
-        let ring_weight = 2.11; // リングバッファ重要度
-        
-        // 特徴量スコア計算
-        let progress_score = if compression_progress < 0.3 {
-            0.8 // 序盤は積極的マッチング
-        } else if compression_progress < 0.7 {
-            0.6 // 中盤はバランス
-        } else {
-            0.4 // 終盤は保守的
-        };
-        
-        let y_score = if estimated_y < 0.5 {
-            0.7 // 上半分で積極的
-        } else {
-            0.5 // 下半分で保守的
-        };
-        
-        // マッチ品質評価（元の解析結果に基づく）
-        let length_score = match best_match.length {
-            3 => 0.9,   // 3バイト: 最優先（オリジナル特徴）
-            4 => 0.8,   // 4バイト: 高優先
-            5..=8 => 0.6, // 中程度
-            _ => 0.3,   // 長いマッチは慎重
-        };
-        
-        let distance_score = if best_match.distance <= 255 {
-            0.8 // 近距離優先（オリジナル特徴）
-        } else if best_match.distance <= 512 {
-            0.5
-        } else {
-            0.2
-        };
-        
-        // 総合スコア計算（ML重要度重み付き）
-        let total_score = 
-            (progress_score * progress_weight) +
-            (y_score * y_position_weight) +
-            (ring_score * ring_weight) +
-            (length_score * 10.0) +
-            (distance_score * 5.0);
-        
-        // ML学習済み閾値（75.3%精度達成の閾値）
-        total_score > 45.0
-    }
-    
-    /// リングバッファ状態スコア計算
-    fn calculate_ring_buffer_score(&self, ring: &[u8; 0x1000], ring_pos: usize) -> f64 {
-        // 最近の32バイトパターンを評価（ML特徴量設計に基づく）
-        let mut pattern_score = 0.0;
-        let mut unique_bytes = std::collections::HashSet::new();
-        
-        for i in 0..32 {
-            let pos = (ring_pos + 0x1000 - 32 + i) & 0x0fff;
-            let byte_val = ring[pos];
-            unique_bytes.insert(byte_val);
-            
-            // パターンの多様性評価
-            if byte_val != 0x20 { // 初期値以外
-                pattern_score += 0.1;
-            }
-        }
-        
-        // 多様性ボーナス
-        pattern_score += (unique_bytes.len() as f64) / 32.0;
-        
-        pattern_score.min(1.0)
     }
 }

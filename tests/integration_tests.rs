@@ -5,7 +5,7 @@ use tempfile::TempDir;
 /// Helper function to run retro-decode command and capture output
 fn run_retro_decode(args: &[&str]) -> Result<std::process::Output, Box<dyn std::error::Error>> {
     let output = Command::new("cargo")
-        .args(&["run", "--"])
+        .args(["run", "--"])
         .args(args)
         .output()?;
     Ok(output)
@@ -27,7 +27,7 @@ fn test_single_file_processing() {
     let test_file = std::fs::read_dir(test_dir).unwrap()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .find(|path| path.extension().map_or(false, |ext| ext.to_string_lossy().to_lowercase() == "lf2"));
+        .find(|path| path.extension().is_some_and(|ext| ext.to_string_lossy().to_lowercase() == "lf2"));
     
     let test_file = match test_file {
         Some(file) => file,
@@ -94,7 +94,7 @@ fn test_benchmark_output_format() {
         .map(|entry| entry.path())
         .find(|path| {
             path.extension()
-                .map_or(false, |ext| supported_extensions.contains(&ext.to_string_lossy().to_lowercase().as_str()))
+                .is_some_and(|ext| supported_extensions.contains(&ext.to_string_lossy().to_lowercase().as_str()))
         });
     
     let test_file = match test_file {
@@ -142,7 +142,7 @@ fn test_readme_basic_usage() {
     let test_file = std::fs::read_dir(test_dir).unwrap()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .find(|path| path.extension().map_or(false, |ext| ext.to_string_lossy().to_lowercase() == "lf2"));
+        .find(|path| path.extension().is_some_and(|ext| ext.to_string_lossy().to_lowercase() == "lf2"));
     
     let test_file = match test_file {
         Some(file) => file,
@@ -164,7 +164,7 @@ fn test_readme_basic_usage() {
     // Check if any PNG output file was created
     let png_files: Vec<_> = std::fs::read_dir(&output_path).unwrap()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "png"))
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
         .collect();
     assert!(!png_files.is_empty(), "No PNG output files created");
 }
@@ -208,7 +208,7 @@ fn test_readme_benchmark_parsing() {
         .map(|entry| entry.path())
         .find(|path| {
             path.extension()
-                .map_or(false, |ext| supported_extensions.contains(&ext.to_string_lossy().to_lowercase().as_str()))
+                .is_some_and(|ext| supported_extensions.contains(&ext.to_string_lossy().to_lowercase().as_str()))
         });
     
     let test_file = match test_file {
@@ -291,7 +291,7 @@ fn test_output_formats() {
     let test_file = std::fs::read_dir(test_dir).unwrap()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .find(|path| path.extension().map_or(false, |ext| ext.to_string_lossy().to_lowercase() == "lf2"));
+        .find(|path| path.extension().is_some_and(|ext| ext.to_string_lossy().to_lowercase() == "lf2"));
     
     let test_file = match test_file {
         Some(file) => file,
@@ -317,7 +317,7 @@ fn test_output_formats() {
         // Check if any output file with the correct format was created
         let format_files: Vec<_> = std::fs::read_dir(&output_path).unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().map_or(false, |ext| ext == *format))
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == *format))
             .collect();
         assert!(!format_files.is_empty(), "No output files for format {} created", format);
     }
@@ -342,7 +342,7 @@ fn test_verbose_output() {
         .map(|entry| entry.path())
         .find(|path| {
             path.extension()
-                .map_or(false, |ext| supported_extensions.contains(&ext.to_string_lossy().to_lowercase().as_str()))
+                .is_some_and(|ext| supported_extensions.contains(&ext.to_string_lossy().to_lowercase().as_str()))
         });
     
     let test_file = match test_file {
@@ -376,7 +376,7 @@ fn test_generated_assets() {
     if !Path::new(generated_dir).exists() {
         // Generate the assets if they don't exist
         let generate_output = Command::new("cargo")
-            .args(&["run", "--example", "generate_test_assets"])
+            .args(["run", "--example", "generate_test_assets"])
             .output()
             .expect("Failed to run generate_test_assets");
         
@@ -393,7 +393,7 @@ fn test_generated_assets() {
     let png_files: Vec<_> = std::fs::read_dir(generated_dir).unwrap()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().map_or(false, |ext| ext == "png"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
         .collect();
     
     assert!(!png_files.is_empty(), "No PNG test files found in generated assets");
@@ -433,7 +433,7 @@ fn test_transparency_assets() {
     if !transparency_png.exists() {
         // Generate transparency demo if it doesn't exist
         let demo_output = Command::new("cargo")
-            .args(&["run", "--example", "transparency_demo"])
+            .args(["run", "--example", "transparency_demo"])
             .output()
             .expect("Failed to run transparency_demo");
             

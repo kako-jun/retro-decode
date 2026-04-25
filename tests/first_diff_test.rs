@@ -113,8 +113,8 @@ fn encode_literals(input: &[u8]) -> Vec<u8> {
             flag |= 1 << (7 - b);
         }
         out.push(flag ^ 0xff);
-        for b in i..end {
-            out.push(input[b] ^ 0xff);
+        for &b in &input[i..end] {
+            out.push(b ^ 0xff);
         }
         i = end;
     }
