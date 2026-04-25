@@ -1030,6 +1030,120 @@ pub fn compress_okumura_dummy_then_drop(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// 入力先頭 F バイトが全て同値ならば奥村原典 (dummy あり)、そうでなければ no_dummy。
+///
+/// セッション 297 観察: 「奥村だけ当たる 9 ファイル」のうち 5 ファイル
+/// (C0601, CLNO_07, H42, V80, V91) は先頭 F=18 バイトが全て同値で、これらは
+/// dummy が直接 long match (len=F) として活きる単色画像。
+pub fn compress_okumura_uniform_head(input: &[u8]) -> Vec<Token> {
+    if input.len() >= F && input[..F].iter().all(|&b| b == input[0]) {
+        compress_okumura(input)
+    } else {
+        compress_okumura_no_dummy(input)
+    }
+}
+
+/// 奥村と no_dummy を両方 encode し、出力 token 数が少ない方を採用。
+///
+/// 仮説: Leaf エンコーダは「dummy あり/なし両方試して圧縮率の良い方を選ぶ」
+/// 二段階エンコーダ。token 数で判定するのは LZSS フラグビットとペイロードの
+/// 比例関係から圧縮 byte サイズと相関するため。
+pub fn compress_okumura_min_tokens(input: &[u8]) -> Vec<Token> {
+    let oku = compress_okumura(input);
+    let nod = compress_okumura_no_dummy(input);
+    if oku.len() <= nod.len() {
+        oku
+    } else {
+        nod
+    }
+}
+
+/// LZSS の正確なバイトサイズを計算（8 token ごとに 1 flag byte、Literal=1B、Match=2B）。
+fn lzss_byte_size(toks: &[Token]) -> usize {
+    let mut size = 0usize;
+    for (i, t) in toks.iter().enumerate() {
+        if i % 8 == 0 {
+            size += 1;
+        }
+        match t {
+            Token::Literal(_) => size += 1,
+            Token::Match { .. } => size += 2,
+        }
+    }
+    size
+}
+
+/// 奥村と no_dummy を両方 encode し、LZSS バイト長が短い方を採用。
+/// `min_tokens` の精度向上版（フラグバイトと literal/match 比率を考慮）。
+pub fn compress_okumura_min_bytes(input: &[u8]) -> Vec<Token> {
+    let oku = compress_okumura(input);
+    let nod = compress_okumura_no_dummy(input);
+    let ob = lzss_byte_size(&oku);
+    let nb = lzss_byte_size(&nod);
+    if ob <= nb {
+        oku
+    } else {
+        nod
+    }
+}
+
+/// 奥村と no_dummy で、奥村が厳密に小さい時のみ奥村採用（タイは no_dummy 優先）。
+pub fn compress_okumura_min_bytes_strict(input: &[u8]) -> Vec<Token> {
+    let oku = compress_okumura(input);
+    let nod = compress_okumura_no_dummy(input);
+    let ob = lzss_byte_size(&oku);
+    let nb = lzss_byte_size(&nod);
+    if ob < nb {
+        oku
+    } else {
+        nod
+    }
+}
+
+/// 奥村と no_dummy で、no_dummy が厳密に小さい時のみ no_dummy 採用（タイは奥村優先）。
+pub fn compress_okumura_min_bytes_oku_pref(input: &[u8]) -> Vec<Token> {
+    let oku = compress_okumura(input);
+    let nod = compress_okumura_no_dummy(input);
+    let ob = lzss_byte_size(&oku);
+    let nb = lzss_byte_size(&nod);
+    if nb < ob {
+        nod
+    } else {
+        oku
+    }
+}
+
+/// 単色先頭判定 + サイズ判定の合わせ技。
+/// 先頭 F バイトが同値なら奥村、それ以外は奥村サイズ < no_dummy サイズの時のみ奥村。
+pub fn compress_okumura_combo(input: &[u8]) -> Vec<Token> {
+    if input.len() >= F && input[..F].iter().all(|&b| b == input[0]) {
+        return compress_okumura(input);
+    }
+    let oku = compress_okumura(input);
+    let nod = compress_okumura_no_dummy(input);
+    if lzss_byte_size(&oku) < lzss_byte_size(&nod) {
+        oku
+    } else {
+        nod
+    }
+}
+
+/// 奥村と no_dummy のうち「Leaf 出力サイズ」と一致する方を採用（オラクル）。
+/// 真のエンコーダロジック解析用。bench で「true Leaf size をどれだけ再現できるか」の上限測定に使う。
+pub fn compress_okumura_oracle_size(input: &[u8], leaf_size: usize) -> Vec<Token> {
+    let oku = compress_okumura(input);
+    let nod = compress_okumura_no_dummy(input);
+    let ob = lzss_byte_size(&oku);
+    let nb = lzss_byte_size(&nod);
+    let od = (ob as i64 - leaf_size as i64).abs();
+    let nd = (nb as i64 - leaf_size as i64).abs();
+    if od <= nd {
+        oku
+    } else {
+        nod
+    }
+}
+
 /// no_dummy ベース + 動的 tie 規則（短マッチは AllowEq、長マッチは StrictGt）。
 ///
 /// 仮説 (セッション 295 の U 字分布発見に基づく):

@@ -10,10 +10,12 @@ use std::process::ExitCode;
 
 use retro_decode::formats::toheart::lf2_tokens::{decompress_to_tokens, LeafToken};
 use retro_decode::formats::toheart::okumura_lzss::{
-    compress_okumura, compress_okumura_distance_tie, compress_okumura_dummy_rev,
-    compress_okumura_dummy_then_drop, compress_okumura_lazy, compress_okumura_no_dummy,
+    compress_okumura, compress_okumura_combo, compress_okumura_distance_tie,
+    compress_okumura_dummy_rev, compress_okumura_dummy_then_drop, compress_okumura_lazy,
+    compress_okumura_min_bytes, compress_okumura_min_bytes_oku_pref,
+    compress_okumura_min_bytes_strict, compress_okumura_min_tokens, compress_okumura_no_dummy,
     compress_okumura_no_dummy_dyntie, compress_okumura_no_dummy_min4,
-    compress_okumura_one_dummy_at_rf, compress_okumura_with_tie,
+    compress_okumura_one_dummy_at_rf, compress_okumura_uniform_head, compress_okumura_with_tie,
     Token as OkuToken, F, N,
 };
 
@@ -305,6 +307,12 @@ fn main() -> ExitCode {
         VariantResult::new("dummy_then_drop"),
         VariantResult::new("no_dummy_min4"),
         VariantResult::new("no_dummy_dyntie"),
+        VariantResult::new("uniform_head"),
+        VariantResult::new("min_tokens"),
+        VariantResult::new("min_bytes"),
+        VariantResult::new("min_bytes_strict"),
+        VariantResult::new("min_bytes_oku_pref"),
+        VariantResult::new("combo"),
     ];
     let mut processed: u64 = 0;
     let mut errors: u64 = 0;
@@ -356,6 +364,12 @@ fn main() -> ExitCode {
         let oku_drop = compress_okumura_dummy_then_drop(&input);
         let oku_min4 = compress_okumura_no_dummy_min4(&input);
         let oku_dyntie = compress_okumura_no_dummy_dyntie(&input);
+        let oku_uhead = compress_okumura_uniform_head(&input);
+        let oku_mintok = compress_okumura_min_tokens(&input);
+        let oku_minb = compress_okumura_min_bytes(&input);
+        let oku_minbs = compress_okumura_min_bytes_strict(&input);
+        let oku_minbo = compress_okumura_min_bytes_oku_pref(&input);
+        let oku_combo = compress_okumura_combo(&input);
 
         if oku_strict.is_empty()
             || oku_eq.is_empty()
@@ -367,6 +381,12 @@ fn main() -> ExitCode {
             || oku_drop.is_empty()
             || oku_min4.is_empty()
             || oku_dyntie.is_empty()
+            || oku_uhead.is_empty()
+            || oku_mintok.is_empty()
+            || oku_minb.is_empty()
+            || oku_minbs.is_empty()
+            || oku_minbo.is_empty()
+            || oku_combo.is_empty()
         {
             errors += 1;
             continue;
@@ -404,6 +424,12 @@ fn main() -> ExitCode {
         run_variant("dummy_then_drop", &leaf, &oku_drop, &label, &mut variants[7]);
         run_variant("no_dummy_min4", &leaf, &oku_min4, &label, &mut variants[8]);
         run_variant("no_dummy_dyntie", &leaf, &oku_dyntie, &label, &mut variants[9]);
+        run_variant("uniform_head", &leaf, &oku_uhead, &label, &mut variants[10]);
+        run_variant("min_tokens", &leaf, &oku_mintok, &label, &mut variants[11]);
+        run_variant("min_bytes", &leaf, &oku_minb, &label, &mut variants[12]);
+        run_variant("min_bytes_strict", &leaf, &oku_minbs, &label, &mut variants[13]);
+        run_variant("min_bytes_oku_pref", &leaf, &oku_minbo, &label, &mut variants[14]);
+        run_variant("combo", &leaf, &oku_combo, &label, &mut variants[15]);
 
         processed += 1;
     }
@@ -424,12 +450,18 @@ fn main() -> ExitCode {
     let drop = &variants[7].identical_set;
     let min4 = &variants[8].identical_set;
     let dyntie = &variants[9].identical_set;
+    let uhead = &variants[10].identical_set;
+    let mintok = &variants[11].identical_set;
+    let minb = &variants[12].identical_set;
     let union_all: BTreeSet<&String> = strict
         .iter()
         .chain(nodummy.iter())
         .chain(drop.iter())
         .chain(min4.iter())
         .chain(dyntie.iter())
+        .chain(uhead.iter())
+        .chain(mintok.iter())
+        .chain(minb.iter())
         .collect();
     let intersect_strict_nodummy: BTreeSet<&String> = strict.intersection(nodummy).collect();
     let only_strict: BTreeSet<&String> = strict.difference(nodummy).collect();
@@ -483,10 +515,67 @@ fn main() -> ExitCode {
         "|no_dummy \\ no_dummy_dyntie| = {}  (dyntie で失った no_dummy)",
         nodummy_minus_dyntie.len()
     );
+    println!("|uniform_head|               = {}", uhead.len());
+    let uhead_minus_nodummy: BTreeSet<&String> = uhead.difference(nodummy).collect();
+    let nodummy_minus_uhead: BTreeSet<&String> = nodummy.difference(uhead).collect();
     println!(
-        "|tie_strict_gt ∪ no_dummy ∪ dummy_then_drop ∪ no_dummy_min4 ∪ no_dummy_dyntie| = {}  ← 5 変種ハイブリッド天井",
+        "|uniform_head \\ no_dummy|    = {}  (uhead が新規に当てる)",
+        uhead_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ uniform_head|    = {}  (uhead で失った no_dummy)",
+        nodummy_minus_uhead.len()
+    );
+    println!("|min_tokens|                 = {}", mintok.len());
+    let mintok_minus_nodummy: BTreeSet<&String> = mintok.difference(nodummy).collect();
+    let nodummy_minus_mintok: BTreeSet<&String> = nodummy.difference(mintok).collect();
+    println!(
+        "|min_tokens \\ no_dummy|      = {}  (mintok が新規に当てる)",
+        mintok_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ min_tokens|      = {}  (mintok で失った no_dummy)",
+        nodummy_minus_mintok.len()
+    );
+    println!("|min_bytes|                  = {}", minb.len());
+    let minb_minus_nodummy: BTreeSet<&String> = minb.difference(nodummy).collect();
+    let nodummy_minus_minb: BTreeSet<&String> = nodummy.difference(minb).collect();
+    println!(
+        "|min_bytes \\ no_dummy|       = {}  (minb が新規に当てる)",
+        minb_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ min_bytes|       = {}  (minb で失った no_dummy)",
+        nodummy_minus_minb.len()
+    );
+    println!(
+        "|全 8 変種 ∪| = {}  ← 全変種ハイブリッド天井",
         union_all.len()
     );
+    if !minb_minus_nodummy.is_empty() {
+        let names: Vec<&str> = minb_minus_nodummy
+            .iter()
+            .map(|s| s.as_str())
+            .take(20)
+            .collect();
+        println!("minb が新規に当てる sample (max 20): {:?}", names);
+    }
+    if !uhead_minus_nodummy.is_empty() {
+        let names: Vec<&str> = uhead_minus_nodummy
+            .iter()
+            .map(|s| s.as_str())
+            .take(20)
+            .collect();
+        println!("uhead が新規に当てる sample (max 20): {:?}", names);
+    }
+    if !mintok_minus_nodummy.is_empty() {
+        let names: Vec<&str> = mintok_minus_nodummy
+            .iter()
+            .map(|s| s.as_str())
+            .take(20)
+            .collect();
+        println!("mintok が新規に当てる sample (max 20): {:?}", names);
+    }
     if !dyntie_minus_nodummy.is_empty() {
         let names: Vec<&str> = dyntie_minus_nodummy
             .iter()
