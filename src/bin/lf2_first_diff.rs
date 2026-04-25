@@ -455,20 +455,32 @@ fn print_single(path: &Path) -> anyhow::Result<()> {
     println!();
     println!("Candidates at this position (len 3..=18): {} total", div.candidates.len());
 
-    const MAX_PRINT: usize = 40;
-    let shown: Vec<&MatchCandidate> = div.candidates.iter().take(MAX_PRINT).collect();
-    for c in &shown {
+    let r = div.info.ring_r;
+    let dist_of = |pos: u16| -> u16 { ((r + 0x1000 - pos as usize) & 0xFFF) as u16 };
+
+    let mut by_dist: Vec<&MatchCandidate> = div.candidates.iter().collect();
+    by_dist.sort_by_key(|c| (std::cmp::Reverse(c.len), dist_of(c.pos)));
+
+    let leaf_dist = if div.info.leaf.is_match { Some(dist_of(div.info.leaf.pos)) } else { None };
+    let oku_dist = if div.info.oku.is_match { Some(dist_of(div.info.oku.pos)) } else { None };
+
+    println!("All candidates, sorted by (len desc, distance asc):");
+    for c in &by_dist {
+        let d = dist_of(c.pos);
         let mut marker = String::new();
         if div.info.leaf.is_match && c.pos == div.info.leaf.pos && c.len == div.info.leaf.len {
-            marker.push_str("  <-- Leaf's choice");
+            marker.push_str("  <-- Leaf");
         }
         if div.info.oku.is_match && c.pos == div.info.oku.pos && c.len == div.info.oku.len {
-            marker.push_str("  <-- Okumura's choice");
+            marker.push_str("  <-- Okumura");
         }
-        println!("  pos=0x{:03x} len={}{}", c.pos, c.len, marker);
+        println!("  len={:2} pos=0x{:03x} dist={:4}{}", c.len, c.pos, d, marker);
     }
-    if div.candidates.len() > MAX_PRINT {
-        println!("  ... ({} more)", div.candidates.len() - MAX_PRINT);
+
+    if let (Some(ld), Some(od)) = (leaf_dist, oku_dist) {
+        println!();
+        println!("Leaf distance:    {}", ld);
+        println!("Okumura distance: {}", od);
     }
 
     println!();
@@ -859,6 +871,48 @@ fn run_full_dataset(dir: &Path, output_csv: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_tiebreaks(input_path: &Path) -> anyhow::Result<()> {
+    let data = fs::read(input_path)?;
+    let hdr = parse_header(&data)?;
+    let payload = &data[hdr.payload_start..];
+    let leaf = retro_decode::formats::toheart::lf2_tokens::decompress_to_tokens(
+        payload, hdr.width, hdr.height,
+    )?;
+    let input_bytes = leaf.ring_input.clone();
+
+    println!("# file\ttoken_idx\tring_r\tleaf_pos\tleaf_dist\tmax_len\tn_max\tdists_csv\tleaf_dist_rank");
+
+    let mut ring = Box::new([0x20u8; 0x1000]);
+    let mut r: usize = 0x0fee;
+    let mut s: usize = 0;
+    let fname = input_path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+
+    for (idx, tok) in leaf.tokens.iter().enumerate() {
+        let ut: UniToken = (*tok).into();
+        if ut.is_match {
+            let cands = enumerate_match_candidates_with_writeback(&ring, &input_bytes, s, r);
+            if !cands.is_empty() {
+                let max_len = cands.iter().map(|c| c.len).max().unwrap_or(0);
+                let same_len: Vec<&MatchCandidate> = cands.iter().filter(|c| c.len == max_len).collect();
+                if same_len.len() >= 2 && ut.len == max_len {
+                    let dist_of = |pos: u16| -> u16 { ((r + 0x1000 - pos as usize) & 0xFFF) as u16 };
+                    let mut dists: Vec<u16> = same_len.iter().map(|c| dist_of(c.pos)).collect();
+                    dists.sort();
+                    let leaf_dist = dist_of(ut.pos);
+                    let rank = dists.iter().position(|&d| d == leaf_dist).unwrap_or(usize::MAX);
+                    let dists_str = dists.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+                    println!(
+                        "{}\t{}\t0x{:04x}\t0x{:03x}\t{}\t{}\t{}\t{}\t{}",
+                        fname, idx, r, ut.pos, leaf_dist, max_len, same_len.len(), dists_str, rank + 1
+                    );
+                }
+            }
+        }
+        apply_token(&mut ring, &mut r, &mut s, &input_bytes, &ut);
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -866,7 +920,21 @@ fn main() -> ExitCode {
         eprintln!("  {} <file.LF2>                             # モード A: 単一ファイル詳細", args[0]);
         eprintln!("  {} --histogram <input_dir>                # モード B: ヒストグラム", args[0]);
         eprintln!("  {} --full-dataset <input_dir> <output.csv> # モード C: 全決定点データセット", args[0]);
+        eprintln!("  {} --tiebreaks <file.LF2>                 # モード D: 同最大長タイの全マッチ TSV", args[0]);
         return ExitCode::from(2);
+    }
+
+    if args[1] == "--tiebreaks" {
+        if args.len() != 3 {
+            eprintln!("usage: {} --tiebreaks <file.LF2>", args[0]);
+            return ExitCode::from(2);
+        }
+        let path = PathBuf::from(&args[2]);
+        if let Err(e) = run_tiebreaks(&path) {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
     }
 
     if args[1] == "--histogram" {
