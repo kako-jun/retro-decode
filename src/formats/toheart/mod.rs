@@ -12,6 +12,7 @@ pub mod pak;
 pub mod lf2;
 pub mod scn;
 pub mod okumura_lzss;
+pub mod lf2_tokens;
 
 pub mod test_transparency;
 
