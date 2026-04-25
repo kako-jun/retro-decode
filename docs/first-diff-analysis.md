@@ -5,12 +5,25 @@ Leaf の LF2 エンコーダが選んだ `(pos, len)` と、奥村 lzss.c 二分
 突き合わせた結果。
 
 コーパス: `/tmp/lvns3_extract/out/` (LVNS3DAT.PAK 展開済み、522 ファイル)。
-再現手順:
+
+## 再現手順
+
+### モード B (first-diff ヒストグラム集計)
 
 ```
 cargo run --release --bin lf2_first_diff -- --histogram /tmp/lvns3_extract/out/ \
     > /tmp/first_diff.csv 2>/tmp/first_diff_summary.txt
 ```
+
+### モード C (全決定点データセット生成 / Issue #5 用)
+
+```
+cargo run --release --bin lf2_first_diff -- --full-dataset /tmp/lvns3_extract/out/ \
+    /tmp/full_dataset.csv 2>/tmp/full_dataset_progress.txt
+```
+
+出力: `/tmp/full_dataset.csv`（2.4M+ 行、各トークン位置ごとに 1 行）。
+進捗: stderr に処理中ファイル数を表示。
 
 ## 全体サマリ
 
@@ -210,5 +223,11 @@ Leaf エンコーダの `enumerate_match_candidates()` が列挙した、
 
 ## 出力データ
 
-- CSV: `/tmp/first_diff.csv` (351 行 + ヘッダ)
+### モード B (first-diff)
+- CSV: `/tmp/first_diff.csv` (351 行 + ヘッダ、発散ファイルのみ)
 - サマリ: `/tmp/first_diff_summary.txt`
+
+### モード C (全決定点)
+- CSV: `/tmp/full_dataset.csv` (2.4M+ 行 + ヘッダ、全トークン位置)
+- 形式: `filename,token_index,leaf_choice_index,num_candidates,max_candidate_len,image_x,image_y,ring_r,prev_token_kind,candidate_0_distance,candidate_0_length,candidate_1_distance,...`
+- 用途: 決定木学習による Leaf エンコーダルール抽出（Issue #5）
