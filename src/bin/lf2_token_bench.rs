@@ -11,12 +11,13 @@ use std::process::ExitCode;
 use retro_decode::formats::toheart::lf2_tokens::{decompress_to_tokens, LeafToken};
 use retro_decode::formats::toheart::okumura_lzss::{
     compress_okumura, compress_okumura_combo, compress_okumura_distance_tie,
-    compress_okumura_dummy_rev, compress_okumura_dummy_then_drop, compress_okumura_lazy,
-    compress_okumura_min_bytes, compress_okumura_min_bytes_oku_pref,
-    compress_okumura_min_bytes_strict, compress_okumura_min_tokens, compress_okumura_no_dummy,
-    compress_okumura_no_dummy_dyntie, compress_okumura_no_dummy_min4,
-    compress_okumura_one_dummy_at_rf, compress_okumura_uniform_head, compress_okumura_with_tie,
-    Token as OkuToken, F, N,
+    compress_okumura_dummy_no_swap, compress_okumura_dummy_rev,
+    compress_okumura_dummy_then_drop, compress_okumura_lazy, compress_okumura_min_bytes,
+    compress_okumura_min_bytes_oku_pref, compress_okumura_min_bytes_strict,
+    compress_okumura_min_tokens, compress_okumura_no_dummy, compress_okumura_no_dummy_dyntie,
+    compress_okumura_no_dummy_left_first, compress_okumura_no_dummy_min4,
+    compress_okumura_no_dummy_no_swap, compress_okumura_one_dummy_at_rf,
+    compress_okumura_uniform_head, compress_okumura_with_tie, Token as OkuToken, F, N,
 };
 
 const LF2_MAGIC: &[u8] = b"LEAF256\0";
@@ -313,6 +314,9 @@ fn main() -> ExitCode {
         VariantResult::new("min_bytes_strict"),
         VariantResult::new("min_bytes_oku_pref"),
         VariantResult::new("combo"),
+        VariantResult::new("no_dummy_left_first"),
+        VariantResult::new("no_dummy_no_swap"),
+        VariantResult::new("dummy_no_swap"),
     ];
     let mut processed: u64 = 0;
     let mut errors: u64 = 0;
@@ -370,6 +374,9 @@ fn main() -> ExitCode {
         let oku_minbs = compress_okumura_min_bytes_strict(&input);
         let oku_minbo = compress_okumura_min_bytes_oku_pref(&input);
         let oku_combo = compress_okumura_combo(&input);
+        let oku_lf = compress_okumura_no_dummy_left_first(&input);
+        let oku_nosw = compress_okumura_no_dummy_no_swap(&input);
+        let oku_dnosw = compress_okumura_dummy_no_swap(&input);
 
         if oku_strict.is_empty()
             || oku_eq.is_empty()
@@ -387,6 +394,9 @@ fn main() -> ExitCode {
             || oku_minbs.is_empty()
             || oku_minbo.is_empty()
             || oku_combo.is_empty()
+            || oku_lf.is_empty()
+            || oku_nosw.is_empty()
+            || oku_dnosw.is_empty()
         {
             errors += 1;
             continue;
@@ -430,6 +440,9 @@ fn main() -> ExitCode {
         run_variant("min_bytes_strict", &leaf, &oku_minbs, &label, &mut variants[13]);
         run_variant("min_bytes_oku_pref", &leaf, &oku_minbo, &label, &mut variants[14]);
         run_variant("combo", &leaf, &oku_combo, &label, &mut variants[15]);
+        run_variant("no_dummy_left_first", &leaf, &oku_lf, &label, &mut variants[16]);
+        run_variant("no_dummy_no_swap", &leaf, &oku_nosw, &label, &mut variants[17]);
+        run_variant("dummy_no_swap", &leaf, &oku_dnosw, &label, &mut variants[18]);
 
         processed += 1;
     }
@@ -453,6 +466,9 @@ fn main() -> ExitCode {
     let uhead = &variants[10].identical_set;
     let mintok = &variants[11].identical_set;
     let minb = &variants[12].identical_set;
+    let lf = &variants[16].identical_set;
+    let nosw = &variants[17].identical_set;
+    let dnosw = &variants[18].identical_set;
     let union_all: BTreeSet<&String> = strict
         .iter()
         .chain(nodummy.iter())
@@ -462,6 +478,9 @@ fn main() -> ExitCode {
         .chain(uhead.iter())
         .chain(mintok.iter())
         .chain(minb.iter())
+        .chain(lf.iter())
+        .chain(nosw.iter())
+        .chain(dnosw.iter())
         .collect();
     let intersect_strict_nodummy: BTreeSet<&String> = strict.intersection(nodummy).collect();
     let only_strict: BTreeSet<&String> = strict.difference(nodummy).collect();
@@ -548,8 +567,57 @@ fn main() -> ExitCode {
         "|no_dummy \\ min_bytes|       = {}  (minb で失った no_dummy)",
         nodummy_minus_minb.len()
     );
+    // BST 構造変種（セッション 298 追加）
+    println!("=== BST 構造変種 (セッション 298) ===");
+    println!("|no_dummy_left_first|        = {}", lf.len());
+    let lf_minus_nodummy: BTreeSet<&String> = lf.difference(nodummy).collect();
+    let nodummy_minus_lf: BTreeSet<&String> = nodummy.difference(lf).collect();
     println!(
-        "|全 8 変種 ∪| = {}  ← 全変種ハイブリッド天井",
+        "|no_dummy_left_first \\ no_dummy| = {}  (lf が新規に当てる)",
+        lf_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ no_dummy_left_first| = {}  (lf で失った no_dummy)",
+        nodummy_minus_lf.len()
+    );
+    println!("|no_dummy_no_swap|           = {}", nosw.len());
+    let nosw_minus_nodummy: BTreeSet<&String> = nosw.difference(nodummy).collect();
+    let nodummy_minus_nosw: BTreeSet<&String> = nodummy.difference(nosw).collect();
+    println!(
+        "|no_dummy_no_swap \\ no_dummy| = {}  (nosw が新規に当てる)",
+        nosw_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ no_dummy_no_swap| = {}  (nosw で失った no_dummy)",
+        nodummy_minus_nosw.len()
+    );
+    println!("|dummy_no_swap|              = {}", dnosw.len());
+    let dnosw_minus_nodummy: BTreeSet<&String> = dnosw.difference(nodummy).collect();
+    let nodummy_minus_dnosw: BTreeSet<&String> = nodummy.difference(dnosw).collect();
+    println!(
+        "|dummy_no_swap \\ no_dummy|   = {}  (dnosw が新規に当てる)",
+        dnosw_minus_nodummy.len()
+    );
+    println!(
+        "|no_dummy \\ dummy_no_swap|   = {}  (dnosw で失った no_dummy)",
+        nodummy_minus_dnosw.len()
+    );
+    if !lf_minus_nodummy.is_empty() {
+        let names: Vec<&str> = lf_minus_nodummy.iter().map(|s| s.as_str()).take(20).collect();
+        println!("lf が新規に当てる sample (max 20): {:?}", names);
+    }
+    if !nosw_minus_nodummy.is_empty() {
+        let names: Vec<&str> = nosw_minus_nodummy.iter().map(|s| s.as_str()).take(20).collect();
+        println!("nosw が新規に当てる sample (max 20): {:?}", names);
+    }
+    if !dnosw_minus_nodummy.is_empty() {
+        let names: Vec<&str> = dnosw_minus_nodummy.iter().map(|s| s.as_str()).take(20).collect();
+        println!("dnosw が新規に当てる sample (max 20): {:?}", names);
+    }
+    println!();
+
+    println!(
+        "|全 11 変種 ∪| = {}  ← 全変種ハイブリッド天井",
         union_all.len()
     );
     if !minb_minus_nodummy.is_empty() {

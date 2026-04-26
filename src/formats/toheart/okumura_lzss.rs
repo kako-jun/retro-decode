@@ -50,12 +50,29 @@ pub enum TieMode {
     DynamicShortEq,
 }
 
+/// BST 探索・挿入の構造的バリアント。
+///
+/// セッション 296-297 で「奥村 LZSS の dummy/THRESHOLD/tie/サイズ判定」軸を 16 変種
+/// 試して 224/522 で天井に達した。これらは **BST の構造そのものを触らない**変種。
+/// セッション 298 でこの軸（insert_node の探索順 + swap-with-r の有無）に踏み込む。
+///
+/// - `Standard`: 奥村原典。`cmp = 1` 初期 → 最初は右、tie 評価で `cmp >= 0` 右
+/// - `LeftFirst`: `cmp = -1` 初期 → 最初は左、`cmp > 0` のみ右、tie で左 (奥村の左右反転)
+/// - `NoSwap`: F バイト完全一致時に swap-with-r ブロックをスキップ。新ノード r は BST に
+///   入らず（孤立、dad[r] = NIL）、既存ノード p がそのまま残る。古いマッチを優先する挙動。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BstMode {
+    Standard,
+    LeftFirst,
+    NoSwap,
+}
+
 /// 奥村エンコード途中のステートを丸ごと持ち出すためのスナップショット。
 /// `lf2_first_div_inspect` バイナリ専用のデバッグ用構造体。
 pub struct OkumuraSnapshot {
     pub tokens: Vec<Token>,
     pub text_buf: Box<[u8; N + F - 1]>,
-    pub lson: Box<[i32; N + 1]>,
+    pub lson: Box<[i32; N + 257]>,
     pub rson: Box<[i32; N + 257]>,
     pub dad: Box<[i32; N + 1]>,
     pub r: i32,
@@ -245,8 +262,9 @@ pub fn compress_okumura_inspect(input: &[u8], stop_at_token: usize) -> OkumuraSn
 struct Okumura {
     /// ring buffer (+F-1 でマッチ検索用に末尾に overlap 領域)
     text_buf: [u8; N + F - 1],
-    /// 左子 (N+1 要素)
-    lson: [i32; N + 1],
+    /// 左子 (奥村原典は N+1 で十分だが、`BstMode::LeftFirst` で root pseudo-node の
+    /// 左探索を許すために N+257 に拡張。Standard モードでは余分な末尾領域は未使用)
+    lson: [i32; N + 257],
     /// 右子 (N+257 要素、先頭 256 は256分木のルート)
     rson: [i32; N + 257],
     /// 親 (N+1 要素)
@@ -260,19 +278,22 @@ struct Okumura {
     /// `InsertNode` 内で参照する現在の ring write head `r`。
     /// `DistanceTie` モードのときに距離計算に使う。
     cur_r: i32,
+    /// BST 構造バリアント
+    bst_mode: BstMode,
 }
 
 impl Okumura {
     fn new(fill: u8) -> Self {
         Self {
             text_buf: [fill; N + F - 1],
-            lson: [0; N + 1],
+            lson: [0; N + 257],
             rson: [0; N + 257],
             dad: [0; N + 1],
             match_position: 0,
             match_length: 0,
             tie_mode: TieMode::StrictGt,
             cur_r: 0,
+            bst_mode: BstMode::Standard,
         }
     }
 
@@ -281,6 +302,12 @@ impl Okumura {
         // For i = N + 1 to N + 256, rson[i] = NIL   (右子のルート 256 個)
         for i in (N + 1)..=(N + 256) {
             self.rson[i] = NIL;
+        }
+        // BstMode::LeftFirst: root pseudo-node の lson も探索対象になるので NIL 初期化
+        if matches!(self.bst_mode, BstMode::LeftFirst) {
+            for i in (N + 1)..=(N + 256) {
+                self.lson[i] = NIL;
+            }
         }
         // For i = 0 to N - 1, dad[i] = NIL
         for i in 0..N {
@@ -293,7 +320,11 @@ impl Okumura {
     /// text_buf[r..r+F-1] を木に挿入し、同時に最長一致を探索する。
     /// 結果は `self.match_position` / `self.match_length` に格納される。
     fn insert_node(&mut self, r: i32) {
-        let mut cmp: i32 = 1;
+        // BstMode::LeftFirst: cmp = -1 初期 + cmp > 0 のみ右へ (奥村の左右反転)
+        let mut cmp: i32 = match self.bst_mode {
+            BstMode::LeftFirst => -1,
+            _ => 1,
+        };
         let key_start = r as usize;
         // key = &text_buf[r..]
         let p_root_idx = N as i32 + 1 + self.text_buf[key_start] as i32;
@@ -305,7 +336,11 @@ impl Okumura {
         self.cur_r = r;
 
         loop {
-            if cmp >= 0 {
+            let go_right = match self.bst_mode {
+                BstMode::LeftFirst => cmp > 0,
+                _ => cmp >= 0,
+            };
+            if go_right {
                 if self.rson[p as usize] != NIL {
                     p = self.rson[p as usize];
                 } else {
@@ -369,6 +404,15 @@ impl Okumura {
                     break;
                 }
             }
+        }
+
+        // BstMode::NoSwap: F バイト完全一致した既存ノード p をそのまま残し、
+        // 新ノード r は BST に入れない（孤立、dad[r] = NIL）。
+        // delete_node(r) は dad[r] == NIL なら early return するので safe。
+        if matches!(self.bst_mode, BstMode::NoSwap) {
+            self.dad[r as usize] = NIL;
+            // lson[r] / rson[r] は loop 開始時に NIL 済み
+            return;
         }
 
         // 既存ノード p を r で置き換える。
@@ -1309,6 +1353,147 @@ pub fn compress_okumura_no_dummy_min4(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// no_dummy ベース + insert_node の左右反転 (cmp 初期値 -1 + tie で左)。
+///
+/// セッション 297 末尾「次にやる」未着手案。同じ subtree の異なる候補を返す可能性を狙う。
+pub fn compress_okumura_no_dummy_left_first(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_with_bst(input, BstMode::LeftFirst)
+}
+
+/// no_dummy ベース + insert_node の swap-with-r ブロックをスキップ。
+///
+/// 仮説: Leaf は F バイト完全一致が出ても新ノードを BST に入れず、古いノードを保持する。
+/// セッション 296 末尾「F-dummy with no swap-with-r」の no_dummy 版。
+pub fn compress_okumura_no_dummy_no_swap(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_with_bst(input, BstMode::NoSwap)
+}
+
+/// 奥村原典どおり F dummy 挿入 + insert_node の swap-with-r ブロックをスキップ。
+///
+/// 仮説: F dummy で BST に F 個のノードが入り、swap が抑制されるので
+/// dummy ノードがそのまま残り続ける。token 0 で奥村と同じ Match{len=F} を出しつつ、
+/// その後の swap 抑制で no_dummy に近い挙動になる可能性。
+pub fn compress_okumura_dummy_no_swap(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.bst_mode = BstMode::NoSwap;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    out
+}
+
+/// no_dummy ベースで BstMode を切り替えて回す共通実装。
+fn compress_okumura_no_dummy_with_bst(input: &[u8], bst_mode: BstMode) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.bst_mode = bst_mode;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    st.insert_node(r);
+
+    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    out
+}
+
+/// 奥村 lzss.c の `Encode()` メインループ部分（先読み・初期 insert は呼び出し側責任）。
+fn encode_loop(
+    st: &mut Okumura,
+    out: &mut Vec<Token>,
+    r: &mut i32,
+    s: &mut i32,
+    input_idx: &mut usize,
+    len: &mut usize,
+    input: &[u8],
+) {
+    loop {
+        if st.match_length as usize > *len {
+            st.match_length = *len as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[*r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && *input_idx < input.len() {
+            st.delete_node(*s);
+            let c = input[*input_idx];
+            *input_idx += 1;
+
+            st.text_buf[*s as usize] = c;
+            if (*s as usize) < F - 1 {
+                st.text_buf[*s as usize + N] = c;
+            }
+
+            *s = (*s + 1) & (N as i32 - 1);
+            *r = (*r + 1) & (N as i32 - 1);
+            st.insert_node(*r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(*s);
+            *s = (*s + 1) & (N as i32 - 1);
+            *r = (*r + 1) & (N as i32 - 1);
+            *len -= 1;
+            if *len > 0 {
+                st.insert_node(*r);
+            }
+            i += 1;
+        }
+
+        if *len == 0 {
+            break;
+        }
+    }
+}
+
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
@@ -1564,6 +1749,44 @@ mod tests {
             }
             Token::Literal(_) => panic!("expected Match, got Literal"),
         }
+    }
+
+    #[test]
+    fn no_dummy_left_first_roundtrips() {
+        for n in 0..40usize {
+            let input: Vec<u8> = (0..n as u32).map(|i| (i & 0xff) as u8).collect();
+            let toks = compress_okumura_no_dummy_left_first(&input);
+            let decoded = decode_oku_tokens(&toks);
+            assert_eq!(decoded, input, "no_dummy_left_first round-trip n={}", n);
+        }
+    }
+
+    #[test]
+    fn no_dummy_no_swap_roundtrips() {
+        for n in 0..40usize {
+            let input: Vec<u8> = (0..n as u32).map(|i| (i & 0xff) as u8).collect();
+            let toks = compress_okumura_no_dummy_no_swap(&input);
+            let decoded = decode_oku_tokens(&toks);
+            assert_eq!(decoded, input, "no_dummy_no_swap round-trip n={}", n);
+        }
+    }
+
+    #[test]
+    fn dummy_no_swap_roundtrips() {
+        for n in 0..40usize {
+            let input: Vec<u8> = (0..n as u32).map(|i| (i & 0xff) as u8).collect();
+            let toks = compress_okumura_dummy_no_swap(&input);
+            let decoded = decode_oku_tokens(&toks);
+            assert_eq!(decoded, input, "dummy_no_swap round-trip n={}", n);
+        }
+    }
+
+    #[test]
+    fn no_dummy_left_first_run_of_spaces() {
+        let input = vec![b' '; 20];
+        let toks = compress_okumura_no_dummy_left_first(&input);
+        let decoded = decode_oku_tokens(&toks);
+        assert_eq!(decoded, input);
     }
 
     /// 奥村 token 列を decode してバイト列に戻す簡易デコーダ（テスト専用）。
