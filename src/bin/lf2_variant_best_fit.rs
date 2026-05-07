@@ -200,16 +200,17 @@ fn main() -> ExitCode {
     );
 
     println!();
-    println!("=== Uncovered file names (first 30) ===");
-    let mut count = 0;
+    println!("=== Uncovered file names ===");
     for r in &results {
         if r.matched_variants.is_empty() {
             println!("{}", r.name);
-            count += 1;
-            if count >= 30 {
-                println!("...");
-                break;
-            }
+        }
+    }
+    println!();
+    println!("=== Per-file matched variants (file -> variants) ===");
+    for r in &results {
+        if !r.matched_variants.is_empty() {
+            println!("{}\t{}", r.name, r.matched_variants.join(","));
         }
     }
 
