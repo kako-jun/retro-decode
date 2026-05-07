@@ -18,6 +18,8 @@ use retro_decode::formats::toheart::okumura_lzss::{
     compress_okumura_no_dummy_left_first_lazy_eq_tie_eq,
     compress_okumura_distance_tie,
     compress_okumura_dummy_then_drop,
+    compress_okumura_max_dist_tie,
+    compress_okumura_basic_no_init,
     Token
 };
 
@@ -51,6 +53,8 @@ fn main() -> ExitCode {
         "okumura_basic" => compress_okumura(&dec.ring_input),
         "distance_tie" => compress_okumura_distance_tie(&dec.ring_input),
         "dummy_then_drop" => compress_okumura_dummy_then_drop(&dec.ring_input),
+        "max_dist_tie" => compress_okumura_max_dist_tie(&dec.ring_input),
+        "basic_no_init" => compress_okumura_basic_no_init(&dec.ring_input),
         _ => compress_no_init_match(&dec.ring_input, NoInitMode::BestMinDist),
     };
 

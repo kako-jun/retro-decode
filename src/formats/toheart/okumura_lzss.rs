@@ -48,6 +48,8 @@ pub enum TieMode {
     /// 短マッチ (len ≤ 3) は AllowEq、それ以外は StrictGt。
     /// セッション 295 の U 字分布発見 (max_len=3 → rank=末尾 60.5%, max_len=18 → rank=先頭 87.3%) に対応する仮説。
     DynamicShortEq,
+    /// 同一長のとき r から **遠い** 候補 (max-dist) を選択する版。
+    MaxDistTie,
 }
 
 /// BST 探索・挿入の構造的バリアント。
@@ -387,6 +389,18 @@ impl Okumura {
                         false
                     }
                 }
+                TieMode::MaxDistTie => {
+                    if (i as i32) > self.match_length {
+                        true
+                    } else if (i as i32) == self.match_length {
+                        let mask = N as i32 - 1;
+                        let cur_dist = (self.cur_r - p) & mask;
+                        let best_dist = (self.cur_r - self.match_position) & mask;
+                        cur_dist > best_dist
+                    } else {
+                        false
+                    }
+                }
                 TieMode::DynamicShortEq => {
                     if (i as i32) > self.match_length {
                         true
@@ -509,6 +523,104 @@ pub fn compress_okumura_with_tie(input: &[u8], allow_equal: bool) -> Vec<Token> 
 /// 距離タイブレイク版。同一長のとき `r` に近い (back distance が小さい) 候補を採用。
 pub fn compress_okumura_distance_tie(input: &[u8]) -> Vec<Token> {
     compress_okumura_impl(input, TieMode::DistanceTie)
+}
+
+/// 反転距離タイブレイク版。同一長のとき r からより遠い候補を採用 (= max dist)。
+/// 既存奥村は BST 内部順に頼った tie だが、明示 max-dist 選択を行う。
+pub fn compress_okumura_max_dist_tie(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl(input, TieMode::MaxDistTie)
+}
+
+/// 基本奥村 + 書き込み済み bitmap フィルタ。
+/// match の pos が初期 0x20 fill 領域 (= 未書込み) なら Literal に格下げ。
+///
+/// 仮説: cc=48 ファイルの encoder は基本奥村 (StrictGt tie + Default BST + greedy) を
+/// 使うが、未書込み ring 位置への match のみ拒否する。session 364 の C0205 token 161
+/// 観察が動機。
+pub fn compress_okumura_basic_no_init(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+
+    // 書込み済み bitmap (true = 実データが書かれた位置)
+    let mut written = [false; N];
+    // 先読み済 F バイト = 書込み済
+    // (M17 厳格版テスト後、permissive に戻す)
+    for k in 0..F {
+        written[((N - F + k) & (N - 1))] = true;
+    }
+
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+        let pos1 = (st.match_position & (N as i32 - 1)) as usize;
+        let len1 = st.match_length as usize;
+
+        // フィルタ: pos が未書込みなら Literal 強制
+        let force_literal = if len1 > THRESHOLD {
+            !written[pos1]
+        } else {
+            false
+        };
+
+        if force_literal || (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            // この s 位置は実データで書き込まれた
+            written[s as usize] = true;
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if len == 0 { break; }
+    }
+    out
 }
 
 /// dummy_rev variant
