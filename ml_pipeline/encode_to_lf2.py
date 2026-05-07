@@ -11,8 +11,14 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-LF2_PATH = Path("/mnt/hdd6tb/lf2_archive/先人のお手本/Windows95版のTo Heart/LVNS3DAT/C0101.LF2")
-CSV_PATH = Path("/tmp/lf2_ml_test/c0101_v8.csv")
+FNAME = sys.argv[1] if len(sys.argv) > 1 else "C0101"
+LF2_PATH = Path(f"/mnt/hdd6tb/lf2_archive/先人のお手本/Windows95版のTo Heart/LVNS3DAT/{FNAME}.LF2")
+CSV_PATH = Path(f"/tmp/lf2_ml_test/{FNAME}_v8.csv")
+if not CSV_PATH.exists():
+    # try with lowercase
+    alt = Path(f"/tmp/lf2_ml_test/{FNAME.lower()}_v8.csv")
+    if alt.exists():
+        CSV_PATH = alt
 
 NON_FEATURE_COLS = {"file", "token_idx", "is_leaf"}
 
@@ -40,7 +46,7 @@ def train_model(df):
         "learning_rate": 0.1, "num_leaves": 4096, "min_data_in_leaf": 1,
         "max_depth": -1, "verbosity": -1,
     }
-    model = lgb.train(params, train_set, num_boost_round=2000)
+    model = lgb.train(params, train_set, num_boost_round=3000)
     return model, feature_cols
 
 
