@@ -1360,6 +1360,88 @@ pub fn compress_okumura_no_dummy_left_first(input: &[u8]) -> Vec<Token> {
     compress_okumura_no_dummy_with_bst(input, BstMode::LeftFirst)
 }
 
+/// no_dummy_left_first ベース + 先頭 `early_bytes` までは強制 Literal。
+///
+/// session 364 first_diff 解析で判明: leaf=lit, oku=match の divergence が
+/// 49 ファイル発生。うち 26 が y=0、42 が y<=5 (image width 起因)。
+/// encoder は初期 ring (0x20 で初期化された未書込み領域) へのマッチを
+/// 既存 no_dummy より厳しく排除している可能性。
+pub fn compress_okumura_no_dummy_left_first_early_lit(
+    input: &[u8],
+    early_bytes: usize,
+) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.bst_mode = BstMode::LeftFirst;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    st.insert_node(r);
+
+    // encode_loop 相当 + early literal 強制
+    let mut emitted_bytes: usize = 0;
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        let force_lit = emitted_bytes < early_bytes;
+        if force_lit || (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+        emitted_bytes += last_match_length;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
 /// no_dummy ベース + insert_node の swap-with-r ブロックをスキップ。
 ///
 /// 仮説: Leaf は F バイト完全一致が出ても新ノードを BST に入れず、古いノードを保持する。
