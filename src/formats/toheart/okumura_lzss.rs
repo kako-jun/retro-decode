@@ -1360,6 +1360,80 @@ pub fn compress_okumura_no_dummy_left_first(input: &[u8]) -> Vec<Token> {
     compress_okumura_no_dummy_with_bst(input, BstMode::LeftFirst)
 }
 
+/// no_dummy + LeftFirst BST + AllowEq tie (= 同最大長候補で「より新しい」を採用)。
+/// 既存組み合わせに含まれていなかったセル。
+pub fn compress_okumura_no_dummy_left_first_eq(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::AllowEq;
+    st.bst_mode = BstMode::LeftFirst;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    st.insert_node(r);
+    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    out
+}
+
+/// no_dummy + Default BST + AllowEq tie。同様に未試行セル。
+pub fn compress_okumura_no_dummy_eq(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::AllowEq;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    st.insert_node(r);
+    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    out
+}
+
+/// no_dummy + Default BST + DistanceTie。同様に未試行セル。
+pub fn compress_okumura_no_dummy_distance_tie(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::DistanceTie;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    st.insert_node(r);
+    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    out
+}
+
 /// no_dummy_left_first + lazy lookahead (1 step).
 ///
 /// 仮説: Leaf encoder は no_dummy ベースで left_first BST を使い、かつ
