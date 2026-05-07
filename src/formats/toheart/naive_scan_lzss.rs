@@ -174,6 +174,94 @@ pub fn compress_naive_forward_pos(input: &[u8], allow_equal: bool) -> Vec<Token>
     out
 }
 
+/// 円環スキャン: pos = (r + 1) & (N-1), (r + 2), ..., (r + N - 1) の順に走査。
+/// 「r の直後 = ring 上で最も古い書き込み位置」から始まり一周する順序。
+/// first / best 2 mode。
+#[derive(Clone, Copy)]
+pub enum CircularMode { FirstMatch, BestMatch }
+
+pub fn compress_circular(input: &[u8], mode: CircularMode) -> Vec<Token> {
+    let mut text_buf = [0x20u8; N + F - 1];
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: usize = N - F;
+    let mut s: usize = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        text_buf[r + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+
+    loop {
+        let max_match = len.min(F);
+        let mut best_len: usize = 0;
+        let mut best_pos: usize = 0;
+
+        // pos = (r + 1) & (N-1), then (r + 2), ..., (r + N - 1)
+        for k in 1..N {
+            let pos = (r + k) & (N - 1);
+            let mut ml = 0usize;
+            while ml < max_match && text_buf[pos + ml] == text_buf[r + ml] {
+                ml += 1;
+            }
+            if ml >= 3 {
+                match mode {
+                    CircularMode::FirstMatch => {
+                        best_len = ml;
+                        best_pos = pos;
+                        break;
+                    }
+                    CircularMode::BestMatch => {
+                        if ml > best_len {
+                            best_len = ml;
+                            best_pos = pos;
+                            if best_len >= F { break; }
+                        }
+                    }
+                }
+            }
+        }
+
+        let last_match_length = if best_len <= THRESHOLD {
+            out.push(Token::Literal(text_buf[r]));
+            1
+        } else {
+            out.push(Token::Match {
+                pos: (best_pos as u16) & ((N as u16) - 1),
+                len: best_len as u8,
+            });
+            best_len
+        };
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            let c = input[input_idx];
+            input_idx += 1;
+            text_buf[s] = c;
+            if s < F - 1 {
+                text_buf[s + N] = c;
+            }
+            s = (s + 1) & (N - 1);
+            r = (r + 1) & (N - 1);
+            i += 1;
+        }
+        while i < last_match_length {
+            s = (s + 1) & (N - 1);
+            r = (r + 1) & (N - 1);
+            len -= 1;
+            i += 1;
+            if len == 0 { break; }
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
 /// 厳格 no-init-region matching エンコーダ。
 ///
 /// 仮説: cc=48 (キャラスプライト) ファイルの encoder は **初期 0x20 fill 領域**
