@@ -203,3 +203,48 @@ ML / ルール路線では **99.9% per-token / ~200-400 ファイルで 100% 達
 4. v8/v10 CSV は補助的に使い続ける (ML が当てる 75% は確定的、残り 25% を γ で詰める)
 
 **これで「数日コース」ではなく「数週間〜数ヶ月の地道な γ 実装コース」が現実的見立て**。
+
+## Phase D 続編 (session 363 真夜中〜朝): v11 binary + Per-file overfit テスト
+
+### v11 binary 実装と実行 (源 LF2 ファイル使用、SSD マウント後)
+SSD `/media/ariori/Extreme SSD/先人のお手本/Windows95版のTo Heart/LVNS3DAT/` から 522 LF2 入手 (133MB)。
+NUC で v11 binary を新規実装、24 列追加 (深い履歴 14 + global state 10):
+- prev_4 ~ prev_10 (kind+len) — 14 cols
+- bytes_emitted, bytes_remaining, token_count, last_match_len, last_literal_byte,
+  recent_m_count, recent_l_count, recent_avg_len_x10, last5_max_len, last5_min_len — 10 cols
+
+CSV 60→84 列、19,260,530 rows 生成 (5.25GB、tmpfs 経由再走で 7657 秒 = 2 hr)。
+**最初の試行は NTFS-FUSE 経由で I/O ボトルネック (32 分で 33%)、tmpfs にコピーして再起動**。
+
+**Stage 0 v11 は NUC で起動したが、再起動 (OOM 推定) で結果と CSV 全消失** — 5.25GB を 16GB RAM の polars に流したため。Stage 0 v11 は run しなおしの場合 source SSD から再再生する必要 (LF2 は SSD に永続、CSV は tmpfs だった)。
+
+### Per-file overfit ML test (v8 features、Windows 16GB で完走、~3.3 時間)
+LightGBM を 1 file ごとに **完全 overfit** (num_leaves=32768、min_data=1、no regularization) して同データでテスト → 「特徴量だけで Leaf を区別可能か」の最終判定。
+
+| 指標 | 結果 |
+|---|---|
+| per-token 100% 到達 | **358 / 522 (68.6%)** |
+| ≥99% | 520 / 522 |
+| ≥95% | 522 / 522 |
+| mean per-token rate | **99.9758%** |
+| 100% 未到達 (= 特徴量不足) | **164 ファイル** |
+
+**判定: v8 features は 358 ファイルで原理的に十分**。残り 164 ファイルでは「同 file 内に同じ特徴量パターンで違う選択をする tie token」が存在 = ML 表現力でも分離不可能 = 隠れ状態は file 内にすら存在。
+
+底辺 8 ファイルは TITLE / C0209 / C0507 / C020A / C0306 / C0501 / C1901 / C160C で **per-token 99.84-99.90% 止まり**。これらは全部 "C シリーズ" (キャラクタイベント絵)、共通の encoder 内部 state (パレット位置 / 累積 counter 等) が file 内で切り替わる挙動を持つ可能性。
+
+## 最終結論と次セッション戦略
+
+**ML/ルール路線での天井 (定量的に確定)**:
+- per-token: 75% (実 model) / 99.97% (overfit 上限)
+- per-file: 1/522 〜 358/522 (overfit 上限)
+- 100% 必達は 358 ファイルなら ML/ルール路線でも可能、164 ファイルでは原理的不可
+
+**次セッション最優先**:
+1. **γ DP backtrack を 164 困難ファイルで実装**: TITLE や C シリーズで Leaf 出力を一意に決める constraints を抽出
+2. **v11 CSV 再生成 + Stage 0 v11**: 源 LF2 から完全データ生成すれば cross-tie 衝突がどこまで減るか確認できる (NUC OOM 対策必要、polars chunk 読みに切り替えるか kako-rog Windows 16GB を使う)
+3. **Ghidra で LVNS3.EXE 解析**: SSD `/プロトタイプ/他サークルの同人ゲーム/LEAF/LVNS3/LVNS3.EXE` (decoder のみだが encoder のヒントになる定数や ring 操作は出るかも、session 295 で「タイブレーク規則は出ない」既確認済だが Ghidra の脱コンパイル深度を上げて再挑戦の価値あり)
+
+**SSD パス**: `/media/ariori/Extreme SSD/先人のお手本/Windows95版のTo Heart/LVNS3DAT/` (522 LF2 + 522 PNG、kako-jun 物理 SSD、要 udisksctl mount)
+**v11 binary**: `src/bin/lf2_pairwise_dataset_v11.rs` (84 列、source 必須、無償 git untracked)
+**v8 CSV (生き残り)**: kako-rog Windows `C:\lf2_work\lf2_pairwise_csvs_v8\` 3.3GB
