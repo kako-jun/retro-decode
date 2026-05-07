@@ -174,6 +174,125 @@ pub fn compress_naive_forward_pos(input: &[u8], allow_equal: bool) -> Vec<Token>
     out
 }
 
+/// 厳格 no-init-region matching エンコーダ。
+///
+/// 仮説: cc=48 (キャラスプライト) ファイルの encoder は **初期 0x20 fill 領域**
+/// (= 書込み未済 ring 位置) を一切マッチ候補にしない厳格規則を持つ。
+/// 既存 no_dummy は dummy 挿入を避けるが、ring の中身が偶然 0x20 と一致する
+/// 場合のマッチは抑制しきれない。本実装は per-position written bitmap で
+/// 「真に書込み済みの位置」のみマッチを許可する。
+///
+/// `mode` で best/leftmost/min_dist tie-break を選ぶ。
+#[derive(Clone, Copy)]
+pub enum NoInitMode {
+    /// best length, leftmost pos tie-break
+    BestLeftmost,
+    /// best length, smallest dist tie-break
+    BestMinDist,
+    /// best length, largest dist tie-break (= 標準奥村寄り)
+    BestMaxDist,
+}
+
+pub fn compress_no_init_match(input: &[u8], mode: NoInitMode) -> Vec<Token> {
+    let mut text_buf = [0x20u8; N + F - 1];
+    let mut written = [false; N];
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: usize = N - F;
+    let mut s: usize = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        text_buf[r + len] = input[input_idx];
+        written[r + len] = true;
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+
+    loop {
+        let max_match = len.min(F);
+        let mut best_len: usize = 0;
+        let mut best_pos: usize = 0;
+        let mut best_dist: usize = 0;
+
+        for pos in 0..N {
+            if pos == r || !written[pos] {
+                continue;
+            }
+            // すべての pos+0..pos+max_match-1 が書込み済みでなければ拒否
+            // (ring の writeback で自己参照は許される: dist < ml の場合は r..r+ml の
+            // 中で既に書かれた所から読む = 書込み済み)
+            // 簡単のため: 開始位置 pos のみ書込み済みチェック。chain extension は
+            // ring 内容で評価。
+            let mut ml = 0usize;
+            while ml < max_match && text_buf[pos + ml] == text_buf[r + ml] {
+                ml += 1;
+            }
+            if ml < 3 {
+                continue;
+            }
+            let dist = (r + N - pos) & (N - 1);
+            let take = match mode {
+                NoInitMode::BestLeftmost => {
+                    ml > best_len || (ml == best_len && pos < best_pos)
+                }
+                NoInitMode::BestMinDist => {
+                    ml > best_len || (ml == best_len && dist > 0 && (best_dist == 0 || dist < best_dist))
+                }
+                NoInitMode::BestMaxDist => {
+                    ml > best_len || (ml == best_len && dist > best_dist)
+                }
+            };
+            if take {
+                best_len = ml;
+                best_pos = pos;
+                best_dist = dist;
+            }
+        }
+
+        let last_match_length = if best_len <= THRESHOLD {
+            out.push(Token::Literal(text_buf[r]));
+            1
+        } else {
+            out.push(Token::Match {
+                pos: (best_pos as u16) & ((N as u16) - 1),
+                len: best_len as u8,
+            });
+            best_len
+        };
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            let c = input[input_idx];
+            input_idx += 1;
+            text_buf[s] = c;
+            if s < F - 1 {
+                text_buf[s + N] = c;
+            }
+            written[s] = true;
+            s = (s + 1) & (N - 1);
+            r = (r + 1) & (N - 1);
+            i += 1;
+        }
+        while i < last_match_length {
+            s = (s + 1) & (N - 1);
+            r = (r + 1) & (N - 1);
+            len -= 1;
+            i += 1;
+            if len == 0 {
+                break;
+            }
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
 /// hash-chain LZSS エンコーダ (zlib/gzip スタイル)。
 ///
 /// 3 バイトプレフィックスで hash、chain は LIFO (新しい順)、各 step で

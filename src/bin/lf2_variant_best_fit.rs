@@ -52,6 +52,9 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("naive_first_match", |i: &[u8]| naive_scan_lzss::compress_naive_first_match(i)),
         ("hash_chain_first", |i: &[u8]| naive_scan_lzss::compress_hash_chain(i, naive_scan_lzss::HashMode::FirstMatch)),
         ("hash_chain_best", |i: &[u8]| naive_scan_lzss::compress_hash_chain(i, naive_scan_lzss::HashMode::BestMatch)),
+        ("no_init_leftmost", |i: &[u8]| naive_scan_lzss::compress_no_init_match(i, naive_scan_lzss::NoInitMode::BestLeftmost)),
+        ("no_init_min_dist", |i: &[u8]| naive_scan_lzss::compress_no_init_match(i, naive_scan_lzss::NoInitMode::BestMinDist)),
+        ("no_init_max_dist", |i: &[u8]| naive_scan_lzss::compress_no_init_match(i, naive_scan_lzss::NoInitMode::BestMaxDist)),
         ("okumura_with_tie_strict", |i: &[u8]| okumura_lzss::compress_okumura_with_tie(i, false)),
         ("okumura_with_tie_equal", |i: &[u8]| okumura_lzss::compress_okumura_with_tie(i, true)),
     ]
