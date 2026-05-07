@@ -1360,6 +1360,157 @@ pub fn compress_okumura_no_dummy_left_first(input: &[u8]) -> Vec<Token> {
     compress_okumura_no_dummy_with_bst(input, BstMode::LeftFirst)
 }
 
+/// no_dummy_left_first + lazy lookahead (1 step).
+///
+/// 仮説: Leaf encoder は no_dummy ベースで left_first BST を使い、かつ
+/// 1 step ルックアヘッドの lazy を併用する。compress_okumura_lazy は
+/// dummy + Default BST、no_dummy_left_first は greedy。両方混ぜたものは未試行。
+pub fn compress_okumura_no_dummy_left_first_lazy(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.bst_mode = BstMode::LeftFirst;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    // no_dummy: dummy 挿入なし
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        let pos1 = st.match_position;
+        let len1 = st.match_length as usize;
+
+        let mut take_lazy = false;
+        if len1 > THRESHOLD && len1 < len {
+            let saved_byte_at_r = st.text_buf[r as usize];
+            if input_idx < input.len() {
+                st.delete_node(s);
+                let c = input[input_idx];
+                input_idx += 1;
+                st.text_buf[s as usize] = c;
+                if (s as usize) < F - 1 {
+                    st.text_buf[s as usize + N] = c;
+                }
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                st.insert_node(r);
+            } else {
+                st.delete_node(s);
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                len -= 1;
+                if len > 0 {
+                    st.insert_node(r);
+                } else {
+                    st.match_length = 0;
+                }
+            }
+            if st.match_length as usize > len {
+                st.match_length = len as i32;
+            }
+            let len2 = st.match_length as usize;
+
+            if len2 > len1 {
+                out.push(Token::Literal(saved_byte_at_r));
+                take_lazy = true;
+            } else {
+                out.push(Token::Match {
+                    pos: (pos1 as u16) & ((N as u16) - 1),
+                    len: len1 as u8,
+                });
+                let last_match_length = len1;
+                let mut i = 1usize;
+                while i < last_match_length && input_idx < input.len() {
+                    st.delete_node(s);
+                    let c = input[input_idx];
+                    input_idx += 1;
+                    st.text_buf[s as usize] = c;
+                    if (s as usize) < F - 1 {
+                        st.text_buf[s as usize + N] = c;
+                    }
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    st.insert_node(r);
+                    i += 1;
+                }
+                while i < last_match_length {
+                    st.delete_node(s);
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    len -= 1;
+                    if len > 0 {
+                        st.insert_node(r);
+                    }
+                    i += 1;
+                }
+                if len == 0 {
+                    break;
+                }
+                continue;
+            }
+        }
+        if take_lazy {
+            if len == 0 {
+                break;
+            }
+            continue;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
 /// no_dummy_left_first ベース + 先頭 `early_bytes` までは強制 Literal。
 ///
 /// session 364 first_diff 解析で判明: leaf=lit, oku=match の divergence が
