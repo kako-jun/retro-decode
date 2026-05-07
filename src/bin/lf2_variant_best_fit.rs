@@ -47,6 +47,9 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("okumura_no_dummy_min4", okumura_lzss::compress_okumura_no_dummy_min4),
         ("naive_backward_strict", |i: &[u8]| naive_scan_lzss::compress_naive_backward(i, false)),
         ("naive_backward_equal", |i: &[u8]| naive_scan_lzss::compress_naive_backward(i, true)),
+        ("naive_forward_strict", |i: &[u8]| naive_scan_lzss::compress_naive_forward_pos(i, false)),
+        ("naive_forward_equal", |i: &[u8]| naive_scan_lzss::compress_naive_forward_pos(i, true)),
+        ("naive_first_match", |i: &[u8]| naive_scan_lzss::compress_naive_first_match(i)),
         ("okumura_with_tie_strict", |i: &[u8]| okumura_lzss::compress_okumura_with_tie(i, false)),
         ("okumura_with_tie_equal", |i: &[u8]| okumura_lzss::compress_okumura_with_tie(i, true)),
     ]
