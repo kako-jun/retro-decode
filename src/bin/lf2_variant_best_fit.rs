@@ -57,6 +57,12 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("no_init_max_dist", |i: &[u8]| naive_scan_lzss::compress_no_init_match(i, naive_scan_lzss::NoInitMode::BestMaxDist)),
         ("circular_first", |i: &[u8]| naive_scan_lzss::compress_circular(i, naive_scan_lzss::CircularMode::FirstMatch)),
         ("circular_best", |i: &[u8]| naive_scan_lzss::compress_circular(i, naive_scan_lzss::CircularMode::BestMatch)),
+        ("okumura_lazy_eq", okumura_lzss::compress_okumura_lazy_eq),
+        ("okumura_no_dummy_lazy_eq", okumura_lzss::compress_okumura_no_dummy_lazy_eq),
+        ("okumura_no_dummy_left_first_lazy_eq", okumura_lzss::compress_okumura_no_dummy_left_first_lazy_eq),
+        ("okumura_no_dummy_no_swap_lazy_eq", okumura_lzss::compress_okumura_no_dummy_no_swap_lazy_eq),
+        ("okumura_left_first_lazy_eq", okumura_lzss::compress_okumura_left_first_lazy_eq),
+        ("okumura_no_dummy_left_first_lazy_eq_tie_eq", okumura_lzss::compress_okumura_no_dummy_left_first_lazy_eq_tie_eq),
         ("okumura_with_tie_strict", |i: &[u8]| okumura_lzss::compress_okumura_with_tie(i, false)),
         ("okumura_with_tie_equal", |i: &[u8]| okumura_lzss::compress_okumura_with_tie(i, true)),
     ]

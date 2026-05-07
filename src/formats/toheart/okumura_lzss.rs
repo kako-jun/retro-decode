@@ -1360,6 +1360,307 @@ pub fn compress_okumura_no_dummy_left_first(input: &[u8]) -> Vec<Token> {
     compress_okumura_no_dummy_with_bst(input, BstMode::LeftFirst)
 }
 
+/// Lazy match with `>=` condition (equal length も lazy 採用)。
+/// 既存 compress_okumura_lazy は strict `>` のみ。
+/// 観察 (M14 後の lf2_no_init_diff): C1203/C0101/C0205 で leaf が Literal を
+/// 選び翌 token で **同じ長さ** Match を選ぶ pattern。
+pub fn compress_okumura_lazy_eq(input: &[u8]) -> Vec<Token> {
+    lazy_impl(input, true, false)
+}
+
+/// no_dummy + Default BST + Lazy `>=`
+pub fn compress_okumura_no_dummy_lazy_eq(input: &[u8]) -> Vec<Token> {
+    lazy_impl(input, true, true)
+}
+
+/// no_dummy + LeftFirst BST + Lazy `>=` (= 主要候補と組合せる)
+pub fn compress_okumura_no_dummy_left_first_lazy_eq(input: &[u8]) -> Vec<Token> {
+    lazy_impl_with_bst(input, true, true, BstMode::LeftFirst)
+}
+
+/// no_dummy + NoSwap BST + Lazy `>=`
+pub fn compress_okumura_no_dummy_no_swap_lazy_eq(input: &[u8]) -> Vec<Token> {
+    lazy_impl_with_bst(input, true, true, BstMode::NoSwap)
+}
+
+/// (with) dummy + LeftFirst BST + Lazy `>=`
+pub fn compress_okumura_left_first_lazy_eq(input: &[u8]) -> Vec<Token> {
+    lazy_impl_with_bst(input, true, false, BstMode::LeftFirst)
+}
+
+/// AllowEq tie + Lazy `>=` (no_dummy + LeftFirst)
+pub fn compress_okumura_no_dummy_left_first_lazy_eq_tie_eq(input: &[u8]) -> Vec<Token> {
+    lazy_impl_with_bst_tie(input, true, true, BstMode::LeftFirst, TieMode::AllowEq)
+}
+
+fn lazy_impl_with_bst_tie(
+    input: &[u8],
+    allow_eq: bool,
+    no_dummy: bool,
+    bst_mode: BstMode,
+    tie_mode: TieMode,
+) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = tie_mode;
+    st.bst_mode = bst_mode;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+    if !no_dummy {
+        for i in 1..=F { st.insert_node(r - i as i32); }
+    }
+    st.insert_node(r);
+    loop {
+        if st.match_length as usize > len { st.match_length = len as i32; }
+        let pos1 = st.match_position;
+        let len1 = st.match_length as usize;
+        let mut take_lazy = false;
+        if len1 > THRESHOLD && len1 < len {
+            let saved_byte_at_r = st.text_buf[r as usize];
+            if input_idx < input.len() {
+                st.delete_node(s);
+                let c = input[input_idx];
+                input_idx += 1;
+                st.text_buf[s as usize] = c;
+                if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                st.insert_node(r);
+            } else {
+                st.delete_node(s);
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                len -= 1;
+                if len > 0 { st.insert_node(r); } else { st.match_length = 0; }
+            }
+            if st.match_length as usize > len { st.match_length = len as i32; }
+            let len2 = st.match_length as usize;
+            let lazy_cond = if allow_eq { len2 >= len1 } else { len2 > len1 };
+            if lazy_cond {
+                out.push(Token::Literal(saved_byte_at_r));
+                take_lazy = true;
+            } else {
+                out.push(Token::Match { pos: (pos1 as u16) & ((N as u16) - 1), len: len1 as u8 });
+                let last_match_length = len1;
+                let mut i = 1usize;
+                while i < last_match_length && input_idx < input.len() {
+                    st.delete_node(s);
+                    let c = input[input_idx];
+                    input_idx += 1;
+                    st.text_buf[s as usize] = c;
+                    if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    st.insert_node(r);
+                    i += 1;
+                }
+                while i < last_match_length {
+                    st.delete_node(s);
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    len -= 1;
+                    if len > 0 { st.insert_node(r); }
+                    i += 1;
+                }
+                if len == 0 { break; }
+                continue;
+            }
+        }
+        if take_lazy { if len == 0 { break; } continue; }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match { pos: (st.match_position as u16) & ((N as u16) - 1), len: st.match_length as u8 });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 { st.insert_node(r); }
+            i += 1;
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
+fn lazy_impl(input: &[u8], allow_eq: bool, no_dummy: bool) -> Vec<Token> {
+    lazy_impl_with_bst(input, allow_eq, no_dummy, BstMode::Standard)
+}
+
+fn lazy_impl_with_bst(
+    input: &[u8],
+    allow_eq: bool,
+    no_dummy: bool,
+    bst_mode: BstMode,
+) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.bst_mode = bst_mode;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    if !no_dummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+        let pos1 = st.match_position;
+        let len1 = st.match_length as usize;
+
+        let mut take_lazy = false;
+        if len1 > THRESHOLD && len1 < len {
+            let saved_byte_at_r = st.text_buf[r as usize];
+            if input_idx < input.len() {
+                st.delete_node(s);
+                let c = input[input_idx];
+                input_idx += 1;
+                st.text_buf[s as usize] = c;
+                if (s as usize) < F - 1 {
+                    st.text_buf[s as usize + N] = c;
+                }
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                st.insert_node(r);
+            } else {
+                st.delete_node(s);
+                s = (s + 1) & (N as i32 - 1);
+                r = (r + 1) & (N as i32 - 1);
+                len -= 1;
+                if len > 0 {
+                    st.insert_node(r);
+                } else {
+                    st.match_length = 0;
+                }
+            }
+            if st.match_length as usize > len {
+                st.match_length = len as i32;
+            }
+            let len2 = st.match_length as usize;
+
+            let lazy_cond = if allow_eq { len2 >= len1 } else { len2 > len1 };
+            if lazy_cond {
+                out.push(Token::Literal(saved_byte_at_r));
+                take_lazy = true;
+            } else {
+                out.push(Token::Match {
+                    pos: (pos1 as u16) & ((N as u16) - 1),
+                    len: len1 as u8,
+                });
+                let last_match_length = len1;
+                let mut i = 1usize;
+                while i < last_match_length && input_idx < input.len() {
+                    st.delete_node(s);
+                    let c = input[input_idx];
+                    input_idx += 1;
+                    st.text_buf[s as usize] = c;
+                    if (s as usize) < F - 1 {
+                        st.text_buf[s as usize + N] = c;
+                    }
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    st.insert_node(r);
+                    i += 1;
+                }
+                while i < last_match_length {
+                    st.delete_node(s);
+                    s = (s + 1) & (N as i32 - 1);
+                    r = (r + 1) & (N as i32 - 1);
+                    len -= 1;
+                    if len > 0 {
+                        st.insert_node(r);
+                    }
+                    i += 1;
+                }
+                if len == 0 { break; }
+                continue;
+            }
+        }
+        if take_lazy {
+            if len == 0 { break; }
+            continue;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
 /// no_dummy + LeftFirst BST + AllowEq tie (= 同最大長候補で「より新しい」を採用)。
 /// 既存組み合わせに含まれていなかったセル。
 pub fn compress_okumura_no_dummy_left_first_eq(input: &[u8]) -> Vec<Token> {
