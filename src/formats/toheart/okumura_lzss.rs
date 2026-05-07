@@ -574,9 +574,11 @@ pub fn compress_okumura_basic_no_init(input: &[u8]) -> Vec<Token> {
         let pos1 = (st.match_position & (N as i32 - 1)) as usize;
         let len1 = st.match_length as usize;
 
-        // フィルタ: pos が未書込みなら Literal 強制
-        let force_literal = if len1 > THRESHOLD {
-            !written[pos1]
+        // フィルタ: pos が未書込み AND 入力バイトが 0x20 (= initial fill 値) なら Literal 強制
+        // 観察: leaf は「実質 0x20 列を 0x20 fill で match」する場合のみ拒否し、
+        // 実データの match は context によらず accept する。
+        let force_literal = if len1 > THRESHOLD && !written[pos1] {
+            st.text_buf[r as usize] == 0x20
         } else {
             false
         };
