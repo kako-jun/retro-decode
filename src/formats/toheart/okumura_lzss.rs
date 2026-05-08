@@ -1188,6 +1188,92 @@ pub fn compress_okumura_dummy_then_drop(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// no_dummy + RLE 限定 tail+1 phantom: match_position == r-1 のときだけ
+/// 残窓 len を +1 まで超過させる。non-RLE は std no_dummy と同じ。
+///
+/// session 375 phantom padding finding を狭く適用 (Mode A の wins は全て pos=r-1)。
+/// 広く+1 する full 版は 18 win / 29 regress = -11 で失敗、副作用を消す試行。
+pub fn compress_okumura_no_dummy_tail1(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    st.insert_node(r);
+
+    loop {
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
 /// 入力先頭 F バイトが全て同値ならば奥村原典 (dummy あり)、そうでなければ no_dummy。
 ///
 /// セッション 297 観察: 「奥村だけ当たる 9 ファイル」のうち 5 ファイル

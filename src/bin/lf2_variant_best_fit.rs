@@ -28,6 +28,7 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("okumura_dummy_rev", okumura_lzss::compress_okumura_dummy_rev),
         ("okumura_lazy", okumura_lzss::compress_okumura_lazy),
         ("okumura_no_dummy", okumura_lzss::compress_okumura_no_dummy),
+        ("okumura_no_dummy_tail1", okumura_lzss::compress_okumura_no_dummy_tail1),
         ("okumura_one_dummy_at_rf", okumura_lzss::compress_okumura_one_dummy_at_rf),
         ("okumura_dummy_then_drop", okumura_lzss::compress_okumura_dummy_then_drop),
         ("okumura_uniform_head", okumura_lzss::compress_okumura_uniform_head),

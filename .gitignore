@@ -142,3 +142,6 @@ test_output/
 .claude/settings.local.json
 .serena/
 .mcp.json
+
+# LVNS3 binary (copyright Leaf/Aquaplus, RE local only)
+lvns3_binary/
