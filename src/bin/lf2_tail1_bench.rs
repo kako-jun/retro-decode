@@ -48,6 +48,17 @@ struct Result1 {
     name: String,
     no_dummy: bool,
     tail1: bool,
+    basic_tail1: bool,
+    dtd_tail1: bool,
+    lit_0x20: bool,
+    left_first_tail1: bool,
+    max_pos_tail1: bool,
+    max_dist_tail1: bool,
+    min_dist_tail1: bool,
+    hash_chain_first: bool,
+    hash_chain_best: bool,
+    basic_tail1_full: bool,
+    no_dummy_tail1_full: bool,
 }
 
 fn process(path: &std::path::Path) -> Result<Result1> {
@@ -63,12 +74,35 @@ fn process(path: &std::path::Path) -> Result<Result1> {
     let input = &dec.ring_input;
     let payload = &data[ps..];
 
+    use retro_decode::formats::toheart::naive_scan_lzss::{self, HashMode};
     let p1 = frame_payload(&okumura_lzss::compress_okumura_no_dummy(input));
     let p2 = frame_payload(&okumura_lzss::compress_okumura_no_dummy_tail1(input));
+    let p3 = frame_payload(&okumura_lzss::compress_okumura_basic_tail1(input));
+    let p4 = frame_payload(&okumura_lzss::compress_okumura_dummy_then_drop_tail1(input));
+    let p5 = frame_payload(&okumura_lzss::compress_okumura_no_dummy_lit_for_0x20(input));
+    let p6 = frame_payload(&okumura_lzss::compress_okumura_no_dummy_left_first_tail1(input));
+    let p7 = frame_payload(&okumura_lzss::compress_okumura_no_dummy_max_pos_tail1(input));
+    let p8 = frame_payload(&okumura_lzss::compress_okumura_no_dummy_max_dist_tail1(input));
+    let p9 = frame_payload(&okumura_lzss::compress_okumura_no_dummy_min_dist_tail1(input));
+    let p10 = frame_payload(&naive_scan_lzss::compress_hash_chain(input, HashMode::FirstMatch));
+    let p11 = frame_payload(&naive_scan_lzss::compress_hash_chain(input, HashMode::BestMatch));
+    let p12 = frame_payload(&okumura_lzss::compress_okumura_basic_tail1_full(input));
+    let p13 = frame_payload(&okumura_lzss::compress_okumura_no_dummy_tail1_full(input));
     Ok(Result1 {
         name: path.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string(),
         no_dummy: p1 == *payload,
         tail1: p2 == *payload,
+        basic_tail1: p3 == *payload,
+        dtd_tail1: p4 == *payload,
+        lit_0x20: p5 == *payload,
+        left_first_tail1: p6 == *payload,
+        max_pos_tail1: p7 == *payload,
+        max_dist_tail1: p8 == *payload,
+        min_dist_tail1: p9 == *payload,
+        hash_chain_first: p10 == *payload,
+        hash_chain_best: p11 == *payload,
+        basic_tail1_full: p12 == *payload,
+        no_dummy_tail1_full: p13 == *payload,
     })
 }
 
@@ -122,29 +156,55 @@ fn main() -> ExitCode {
         all
     });
 
-    let n_no_dummy = results.iter().filter(|r| r.no_dummy).count();
-    let n_tail1 = results.iter().filter(|r| r.tail1).count();
-    let n_only_tail1: HashSet<&str> = results.iter().filter(|r| r.tail1 && !r.no_dummy).map(|r| r.name.as_str()).collect();
-    let n_only_no_dummy: HashSet<&str> = results.iter().filter(|r| r.no_dummy && !r.tail1).map(|r| r.name.as_str()).collect();
+    let counts = [
+        ("no_dummy", results.iter().filter(|r| r.no_dummy).count()),
+        ("tail1", results.iter().filter(|r| r.tail1).count()),
+        ("basic_tail1", results.iter().filter(|r| r.basic_tail1).count()),
+        ("dtd_tail1", results.iter().filter(|r| r.dtd_tail1).count()),
+        ("lit_0x20", results.iter().filter(|r| r.lit_0x20).count()),
+        ("left_first_tail1", results.iter().filter(|r| r.left_first_tail1).count()),
+        ("max_pos_tail1", results.iter().filter(|r| r.max_pos_tail1).count()),
+        ("max_dist_tail1", results.iter().filter(|r| r.max_dist_tail1).count()),
+        ("min_dist_tail1", results.iter().filter(|r| r.min_dist_tail1).count()),
+        ("hash_chain_first", results.iter().filter(|r| r.hash_chain_first).count()),
+        ("hash_chain_best", results.iter().filter(|r| r.hash_chain_best).count()),
+        ("basic_tail1_full", results.iter().filter(|r| r.basic_tail1_full).count()),
+        ("no_dummy_tail1_full", results.iter().filter(|r| r.no_dummy_tail1_full).count()),
+    ];
 
-    println!("=== Single-variant bench ===");
-    println!("total files            : {}", results.len());
-    println!("okumura_no_dummy match : {}", n_no_dummy);
-    println!("tail1 match            : {}", n_tail1);
-    println!("delta                  : {:+}", n_tail1 as i64 - n_no_dummy as i64);
-    println!();
-    println!("--- newly matched by tail1 (was failing under no_dummy) [{}] ---", n_only_tail1.len());
-    let mut v: Vec<&str> = n_only_tail1.iter().copied().collect();
-    v.sort();
-    for n in v {
-        println!("+ {}", n);
+    let mut union_set: HashSet<&str> = HashSet::new();
+    for r in &results {
+        if r.no_dummy || r.tail1 || r.basic_tail1 || r.dtd_tail1 || r.lit_0x20 || r.left_first_tail1
+            || r.max_pos_tail1 || r.max_dist_tail1 || r.min_dist_tail1 || r.hash_chain_first || r.hash_chain_best
+            || r.basic_tail1_full || r.no_dummy_tail1_full {
+            union_set.insert(&r.name);
+        }
     }
-    println!();
-    println!("--- regressed (was passing under no_dummy, fails under tail1) [{}] ---", n_only_no_dummy.len());
-    let mut v: Vec<&str> = n_only_no_dummy.iter().copied().collect();
-    v.sort();
-    for n in v {
-        println!("- {}", n);
+
+    println!("=== variant bench ===");
+    println!("total files: {}", results.len());
+    for (n, c) in &counts {
+        println!("  {:30} : {}", n, c);
+    }
+    println!("  {:30} : {} (across these 6 variants only)", "UNION", union_set.len());
+
+    // 各変種の固有 contribution (== match here AND no other in this set matches)
+    // Find files matched by EXACTLY one of the new variants (max_pos/max_dist/min_dist/hash_*)
+    let new_variants_only: Vec<&Result1> = results.iter().filter(|r| {
+        let any_old = r.no_dummy || r.tail1 || r.basic_tail1 || r.dtd_tail1 || r.lit_0x20 || r.left_first_tail1;
+        let any_new = r.max_pos_tail1 || r.max_dist_tail1 || r.min_dist_tail1 || r.hash_chain_first || r.hash_chain_best;
+        any_new && !any_old
+    }).collect();
+    println!("\n=== matched ONLY by new tie/hash variants (not by old 6) ===");
+    println!("  count: {}", new_variants_only.len());
+    for r in new_variants_only.iter().take(20) {
+        let mut tags = vec![];
+        if r.max_pos_tail1 { tags.push("max_pos"); }
+        if r.max_dist_tail1 { tags.push("max_dist"); }
+        if r.min_dist_tail1 { tags.push("min_dist"); }
+        if r.hash_chain_first { tags.push("hc_first"); }
+        if r.hash_chain_best { tags.push("hc_best"); }
+        println!("    {:14} {}", r.name, tags.join(","));
     }
     ExitCode::SUCCESS
 }

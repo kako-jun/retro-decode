@@ -1280,6 +1280,565 @@ pub fn compress_okumura_no_dummy_tail1(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// 奥村原典 (basic, F dummy あり) + RLE tail+1 phantom。
+/// no_dummy BST と異なる pos を返すケース (Mode A 14 ファイル) を狙う。
+pub fn compress_okumura_basic_tail1(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+
+    // 奥村原典: F-1 個の dummy (text_buf 全部 0x20 で位置 r-1..r-F に dummy node) + 本挿入
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    loop {
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
+/// 奥村原典 + 任意 pos の tail+1 phantom (RLE 限定なし)。
+/// Mode A 16 非 RLE 拡張ファイル (TITLE2/C0508/C1701/C1E03/C1002 系) を狙う。
+/// 副作用: 約 -29 regress 想定だが union には貢献の可能性。
+pub fn compress_okumura_basic_tail1_full(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    loop {
+        let len_before = len;
+        let cap = (len + 1).min(F);
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 { st.insert_node(r); }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
+/// no_dummy + 任意 pos の tail+1 phantom (RLE 限定なし)。Mode A 非 RLE 用。
+pub fn compress_okumura_no_dummy_tail1_full(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+    st.insert_node(r);
+
+    loop {
+        let len_before = len;
+        let cap = (len + 1).min(F);
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 { st.insert_node(r); }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
+/// dummy_then_drop (奥村 F dummy → token 0 後に dummy node 削除) + tail+1 RLE.
+pub fn compress_okumura_dummy_then_drop_tail1(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+
+    let mut dummy_positions: Vec<i32> = Vec::with_capacity(F);
+    for i in 1..=F {
+        let p = ((r - i as i32) + N as i32) & (N as i32 - 1);
+        st.insert_node(p);
+        dummy_positions.push(p);
+    }
+    st.insert_node(r);
+
+    let mut first_token_done = false;
+    loop {
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 { st.insert_node(r); }
+            i += 1;
+        }
+        if !first_token_done {
+            first_token_done = true;
+            for p in dummy_positions.iter().copied() {
+                if p == r { continue; }
+                st.delete_node(p);
+            }
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
+/// no_dummy + LeftFirst BST + RLE tail+1 phantom. tail1_rle と LeftFirst の合成。
+pub fn compress_okumura_no_dummy_left_first_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_tail1_with_bst(input, BstMode::LeftFirst)
+}
+
+/// no_dummy + NoSwap BST + RLE tail+1 phantom.
+pub fn compress_okumura_no_dummy_no_swap_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_tail1_with_bst(input, BstMode::NoSwap)
+}
+
+/// no_dummy + tail1_rle の BstMode 切替版。
+fn compress_okumura_no_dummy_tail1_with_bst(input: &[u8], bst_mode: BstMode) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.bst_mode = bst_mode;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    st.insert_node(r);
+
+    loop {
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// no_dummy + tie-break = 最大 pos 値 (= 数値が大きい方優先) + tail1 RLE phantom.
+/// Mode B の「leaf_pos > oku_pos が 65%」観察に基づく。
+pub fn compress_okumura_no_dummy_max_pos_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_tail1_with_tie(input, TieMode::AllowEq)
+}
+
+/// no_dummy + tie-break = 最大距離 (MaxDistTie) + tail1 RLE phantom.
+pub fn compress_okumura_no_dummy_max_dist_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_tail1_with_tie(input, TieMode::MaxDistTie)
+}
+
+/// no_dummy + tie-break = 最小距離 (DistanceTie) + tail1 RLE phantom.
+pub fn compress_okumura_no_dummy_min_dist_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_tail1_with_tie(input, TieMode::DistanceTie)
+}
+
+fn compress_okumura_no_dummy_tail1_with_tie(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = tie_mode;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+    st.insert_node(r);
+
+    loop {
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 { st.insert_node(r); }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 { break; }
+    }
+    out
+}
+
+/// no_dummy + 入力 byte=0x20 のとき literal 強制 (Mode C 対策)。
+/// match_position が r-1 RLE の場合は除外 (RLE は別ルール)。
+pub fn compress_okumura_no_dummy_lit_for_0x20(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    st.insert_node(r);
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        let cur_byte = st.text_buf[r as usize];
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        // 0x20 byte で RLE でない場合は match を捨てて literal にする
+        let force_lit = cur_byte == 0x20 && !is_rle && (st.match_length as usize) > THRESHOLD;
+
+        if force_lit || (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(cur_byte));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
 /// 入力先頭 F バイトが全て同値ならば奥村原典 (dummy あり)、そうでなければ no_dummy。
 ///
 /// セッション 297 観察: 「奥村だけ当たる 9 ファイル」のうち 5 ファイル

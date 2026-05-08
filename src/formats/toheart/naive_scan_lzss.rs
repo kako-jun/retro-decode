@@ -502,7 +502,6 @@ pub fn compress_hash_chain(input: &[u8], mode: HashMode) -> Vec<Token> {
             if len >= 3 {
                 let h = hash3(text_buf[r], text_buf[r + 1], text_buf[r + 2]);
                 prev[r] = head[h];
-                head[r] = r;  // overwrite
                 head[h] = r;
             }
             i += 1;
