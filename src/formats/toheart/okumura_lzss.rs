@@ -1221,6 +1221,7 @@ pub fn compress_okumura_no_dummy_tail1(input: &[u8]) -> Vec<Token> {
         let mp = (st.match_position & (N as i32 - 1)) as usize;
         let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
         let is_rle = mp == r_minus_1;
+        let len_before = len;
         let cap = if is_rle { (len + 1).min(F) } else { len };
         if st.match_length as usize > cap {
             st.match_length = cap as i32;
@@ -1266,6 +1267,11 @@ pub fn compress_okumura_no_dummy_tail1(input: &[u8]) -> Vec<Token> {
             i += 1;
         }
 
+        // tail+1 phantom extension: 残り input を全消費した上で +1 phantom を踏んだ場合、
+        // window は完全に空 (len=0) で終了させる。標準の len 減算では len_before-1 で残ってしまう
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
         if len == 0 {
             break;
         }
