@@ -282,6 +282,15 @@ struct Okumura {
     cur_r: i32,
     /// BST 構造バリアント
     bst_mode: BstMode,
+    /// BST root key 計算モード (Standard = text_buf[r], XorByte2 = text_buf[r] ^ text_buf[r+1])
+    key_mode: KeyMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMode {
+    Byte0,
+    XorByte01,
+    AddByte01Mod256,
 }
 
 impl Okumura {
@@ -296,6 +305,7 @@ impl Okumura {
             tie_mode: TieMode::StrictGt,
             cur_r: 0,
             bst_mode: BstMode::Standard,
+            key_mode: KeyMode::Byte0,
         }
     }
 
@@ -329,7 +339,14 @@ impl Okumura {
         };
         let key_start = r as usize;
         // key = &text_buf[r..]
-        let p_root_idx = N as i32 + 1 + self.text_buf[key_start] as i32;
+        let p_root_byte = match self.key_mode {
+            KeyMode::Byte0 => self.text_buf[key_start],
+            KeyMode::XorByte01 => self.text_buf[key_start] ^ self.text_buf[key_start + 1],
+            KeyMode::AddByte01Mod256 => self
+                .text_buf[key_start]
+                .wrapping_add(self.text_buf[key_start + 1]),
+        };
+        let p_root_idx = N as i32 + 1 + p_root_byte as i32;
         let mut p: i32 = p_root_idx;
 
         self.rson[r as usize] = NIL;
@@ -2110,6 +2127,175 @@ pub fn compress_okumura_no_dummy_len_split15_exh_tail1(input: &[u8]) -> Vec<Toke
 
 pub fn compress_okumura_no_dummy_len_split16_exh_tail1(input: &[u8]) -> Vec<Token> {
     compress_okumura_no_dummy_len_split_exh_tail1(input, 16)
+}
+
+/// no_dummy_tail1 with custom KeyMode (BST root key calculation).
+/// セッション 389 (2026-05-11) 仮説: 実 encoder は BST root key を 1byte ではなく
+/// 2byte hash (XOR or add) で計算しているかもしれない。違う visit 順 → 違う tie 結果。
+fn compress_okumura_no_dummy_tail1_keymode(input: &[u8], key_mode: KeyMode) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.key_mode = key_mode;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
+pub fn compress_okumura_no_dummy_tail1_xor(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_tail1_keymode(input, KeyMode::XorByte01)
+}
+
+pub fn compress_okumura_no_dummy_tail1_add(input: &[u8]) -> Vec<Token> {
+    compress_okumura_no_dummy_tail1_keymode(input, KeyMode::AddByte01Mod256)
+}
+
+/// basic_tail1 with custom KeyMode.
+fn compress_okumura_basic_tail1_keymode(input: &[u8], key_mode: KeyMode) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.key_mode = key_mode;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
+pub fn compress_okumura_basic_tail1_xor(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_tail1_keymode(input, KeyMode::XorByte01)
+}
+
+pub fn compress_okumura_basic_tail1_add(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_tail1_keymode(input, KeyMode::AddByte01Mod256)
 }
 
 /// no_dummy_tail1 + 「len = F (= 18) のみ」exhaustive min-dist override。
