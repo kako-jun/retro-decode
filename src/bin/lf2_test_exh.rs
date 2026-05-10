@@ -34,6 +34,77 @@ fn main() -> ExitCode {
     let min_exh = okumura_lzss::compress_okumura_no_dummy_min_dist_exh_tail1(input);
     let max_exh = okumura_lzss::compress_okumura_no_dummy_max_dist_exh_tail1(input);
     let split13 = okumura_lzss::compress_okumura_no_dummy_len_split13_exh_tail1(input);
+    let basic = okumura_lzss::compress_okumura(input);
+    let basic_tail1 = okumura_lzss::compress_okumura_basic_tail1(input);
+    let basic_stop = okumura_lzss::compress_okumura_basic_tail1_stop_on_input(input);
+    println!("basic tokens:          {}", basic.len());
+    println!("basic_tail1 tokens:    {}", basic_tail1.len());
+    println!("basic_stop tokens:     {}", basic_stop.len());
+
+    // Token-by-token comparison vs leaf for basic_tail1 (oracle claims full match)
+    {
+        let inline_eq = |a: &Token, b: &retro_decode::formats::toheart::lf2_tokens::LeafToken| -> bool {
+            match (a, b) {
+                (Token::Literal(x), retro_decode::formats::toheart::lf2_tokens::LeafToken::Literal(y)) => x == y,
+                (Token::Match { pos: pa, len: la }, retro_decode::formats::toheart::lf2_tokens::LeafToken::Match { pos: pb, len: lb }) => pa == pb && la == lb,
+                _ => false,
+            }
+        };
+        let mut diffs = 0;
+        for i in 0..leaf_tokens.len().min(basic_tail1.len()) {
+            if !inline_eq(&basic_tail1[i], &leaf_tokens[i]) {
+                if diffs < 5 {
+                    println!("[basic_tail1] tok {} diff: leaf={:?} ours={:?}", i, leaf_tokens[i], basic_tail1[i]);
+                }
+                diffs += 1;
+            }
+        }
+        println!("[basic_tail1] total token diffs: {} (leaf.len={}, ours.len={})", diffs, leaf_tokens.len(), basic_tail1.len());
+
+        // Compare bytes
+        let payload = frame_payload(&basic_tail1);
+        let cc = data[0x16] as usize;
+        let ps = 0x18 + cc * 3;
+        let original = &data[ps..];
+        let n_match = payload.iter().zip(original.iter()).take_while(|(a, b)| a == b).count();
+        println!("[basic_tail1 bytes] payload.len={}, original.len={}, match prefix={}", payload.len(), original.len(), n_match);
+        if payload != original {
+            println!("FIRST byte diff at offset {}: ours=0x{:02x} orig=0x{:02x}",
+                n_match,
+                payload.get(n_match).copied().unwrap_or(0),
+                original.get(n_match).copied().unwrap_or(0));
+        }
+    }
+    fn frame_payload(tokens: &[Token]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let flag_pos = out.len();
+            out.push(0);
+            let mut flag_byte: u8 = 0;
+            let mut bits_used = 0;
+            while bits_used < 8 && i < tokens.len() {
+                match tokens[i] {
+                    Token::Literal(b) => {
+                        flag_byte |= 1 << (7 - bits_used);
+                        out.push(b ^ 0xff);
+                    }
+                    Token::Match { pos, len } => {
+                        let p = (pos as usize) & 0x0fff;
+                        let l = ((len as usize) - 3) & 0x0f;
+                        let upper = (l | ((p & 0x0f) << 4)) as u8;
+                        let lower = ((p >> 4) & 0xff) as u8;
+                        out.push(upper ^ 0xff);
+                        out.push(lower ^ 0xff);
+                    }
+                }
+                bits_used += 1;
+                i += 1;
+            }
+            out[flag_pos] = flag_byte ^ 0xff;
+        }
+        out
+    }
 
     println!("file = {}", args[1]);
     println!("leaf tokens: {}", leaf_tokens.len());
