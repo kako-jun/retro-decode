@@ -36,10 +36,54 @@ fn main() -> ExitCode {
     let split13 = okumura_lzss::compress_okumura_no_dummy_len_split13_exh_tail1(input);
     let basic = okumura_lzss::compress_okumura(input);
     let basic_tail1 = okumura_lzss::compress_okumura_basic_tail1(input);
+    let basic_tail1_full = okumura_lzss::compress_okumura_basic_tail1_full(input);
     let basic_stop = okumura_lzss::compress_okumura_basic_tail1_stop_on_input(input);
+    let basic_no_cap = okumura_lzss::compress_okumura_basic_tail1_no_cap(input);
+    println!("basic_no_cap tokens: {}", basic_no_cap.len());
+    if basic_no_cap.len() == leaf_tokens.len() {
+        let inline_eq = |a: &Token, b: &retro_decode::formats::toheart::lf2_tokens::LeafToken| -> bool {
+            match (a, b) {
+                (Token::Literal(x), retro_decode::formats::toheart::lf2_tokens::LeafToken::Literal(y)) => x == y,
+                (Token::Match { pos: pa, len: la }, retro_decode::formats::toheart::lf2_tokens::LeafToken::Match { pos: pb, len: lb }) => pa == pb && la == lb,
+                _ => false,
+            }
+        };
+        let mut diffs = 0;
+        let mut first_diff = None;
+        for i in 0..leaf_tokens.len() {
+            if !inline_eq(&basic_no_cap[i], &leaf_tokens[i]) {
+                if first_diff.is_none() { first_diff = Some(i); }
+                if diffs < 3 {
+                    println!("[basic_no_cap] tok {} diff: leaf={:?} ours={:?}", i, leaf_tokens[i], basic_no_cap[i]);
+                }
+                diffs += 1;
+            }
+        }
+        println!("[basic_no_cap] total diffs: {}, first_diff: {:?}", diffs, first_diff);
+    }
     println!("basic tokens:          {}", basic.len());
     println!("basic_tail1 tokens:    {}", basic_tail1.len());
+    println!("basic_tail1_full tokens: {}", basic_tail1_full.len());
     println!("basic_stop tokens:     {}", basic_stop.len());
+    if basic_tail1_full.len() == leaf_tokens.len() {
+        let inline_eq = |a: &Token, b: &retro_decode::formats::toheart::lf2_tokens::LeafToken| -> bool {
+            match (a, b) {
+                (Token::Literal(x), retro_decode::formats::toheart::lf2_tokens::LeafToken::Literal(y)) => x == y,
+                (Token::Match { pos: pa, len: la }, retro_decode::formats::toheart::lf2_tokens::LeafToken::Match { pos: pb, len: lb }) => pa == pb && la == lb,
+                _ => false,
+            }
+        };
+        let mut diffs = 0;
+        for i in 0..leaf_tokens.len() {
+            if !inline_eq(&basic_tail1_full[i], &leaf_tokens[i]) {
+                if diffs < 3 {
+                    println!("[basic_tail1_full] tok {} diff: leaf={:?} ours={:?}", i, leaf_tokens[i], basic_tail1_full[i]);
+                }
+                diffs += 1;
+            }
+        }
+        println!("[basic_tail1_full] total token diffs: {}", diffs);
+    }
 
     // Token-by-token comparison vs leaf for basic_tail1 (oracle claims full match)
     {

@@ -842,6 +842,163 @@ pub fn compress_okumura_basic_tail1_phantom_lit2(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// basic_tail1 だが、最終 iter の cap 制約を外し BST が返す match_length を
+/// そのまま使う (input 残量より長い Match も emit、decoder 側で truncate)。
+/// C0182 解析: leaf=M(724,18) vs ours=M(724,17) で pos 一致 len 1 短い → cap=len
+/// 制約が原因と判明。
+pub fn compress_okumura_basic_tail1_no_cap(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        // RLE のみ +1 cap、それ以外は cap 無効 = BST が返す長さをそのまま使う
+        // (ただし F=18 が上限)
+        let cap = if is_rle { (len + 1).min(F) } else { F };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        // Effective consumed length is min(last_match_length, len)
+        let effective = last_match_length.min(len);
+        let mut i = 0usize;
+        while i < effective && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < effective {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && effective > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// 同上 no_dummy ベース版。
+pub fn compress_okumura_no_dummy_tail1_no_cap(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { F };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let effective = last_match_length.min(len);
+        let mut i = 0usize;
+        while i < effective && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < effective {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && effective > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
 /// basic_tail1 + 8-token group 完成までの phantom Literal padding。
 /// 残り bit を全て Literal で埋める。
 pub fn compress_okumura_basic_tail1_phantom_lit_pad8(input: &[u8]) -> Vec<Token> {
