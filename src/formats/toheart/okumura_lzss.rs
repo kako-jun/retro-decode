@@ -832,6 +832,29 @@ pub fn compress_okumura_no_dummy_tail1_phantom_lit(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// basic_tail1 + 末尾 2 個の phantom Literal (input 最終 byte 重複)。
+pub fn compress_okumura_basic_tail1_phantom_lit2(input: &[u8]) -> Vec<Token> {
+    let mut out = compress_okumura_basic_tail1(input);
+    if let Some(b) = input.last() {
+        out.push(Token::Literal(*b));
+        out.push(Token::Literal(*b));
+    }
+    out
+}
+
+/// basic_tail1 + 8-token group 完成までの phantom Literal padding。
+/// 残り bit を全て Literal で埋める。
+pub fn compress_okumura_basic_tail1_phantom_lit_pad8(input: &[u8]) -> Vec<Token> {
+    let mut out = compress_okumura_basic_tail1(input);
+    if let Some(b) = input.last() {
+        let pad = (8 - (out.len() % 8)) % 8;
+        for _ in 0..pad {
+            out.push(Token::Literal(*b));
+        }
+    }
+    out
+}
+
 /// 同上の no_dummy 版。
 pub fn compress_okumura_no_dummy_tail1_stop_on_input(input: &[u8]) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
