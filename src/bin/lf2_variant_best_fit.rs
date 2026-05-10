@@ -81,6 +81,12 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("okumura_no_dummy_len_split14_exh_tail1", okumura_lzss::compress_okumura_no_dummy_len_split14_exh_tail1),
         ("okumura_no_dummy_len_split15_exh_tail1", okumura_lzss::compress_okumura_no_dummy_len_split15_exh_tail1),
         ("okumura_no_dummy_len_split16_exh_tail1", okumura_lzss::compress_okumura_no_dummy_len_split16_exh_tail1),
+        ("okumura_no_dummy_min_dist_only18_exh_tail1", okumura_lzss::compress_okumura_no_dummy_min_dist_only18_exh_tail1),
+        ("okumura_basic_min_dist_only18_exh_tail1", okumura_lzss::compress_okumura_basic_min_dist_only18_exh_tail1),
+        ("okumura_basic_min_dist_exh_tail1", okumura_lzss::compress_okumura_basic_min_dist_exh_tail1),
+        ("okumura_basic_max_dist_exh_tail1", okumura_lzss::compress_okumura_basic_max_dist_exh_tail1),
+        ("okumura_basic_len_split8_exh_tail1", okumura_lzss::compress_okumura_basic_len_split8_exh_tail1),
+        ("okumura_basic_len_split13_exh_tail1", okumura_lzss::compress_okumura_basic_len_split13_exh_tail1),
     ]
 }
 

@@ -2112,6 +2112,353 @@ pub fn compress_okumura_no_dummy_len_split16_exh_tail1(input: &[u8]) -> Vec<Toke
     compress_okumura_no_dummy_len_split_exh_tail1(input, 16)
 }
 
+/// no_dummy_tail1 + 「len = F (= 18) のみ」exhaustive min-dist override。
+/// セッション 389 (2026-05-11) データ分析: cand_len=18 の tie 場面で
+/// 99.94% が min_dist 候補 (rank_1) → BST + tail1 の選択を len=18 だけ補正する。
+pub fn compress_okumura_no_dummy_min_dist_only18_exh_tail1(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+
+        // len=F=18 のときだけ exhaustive min-dist override
+        if (st.match_length as usize) == F {
+            let target_len = F;
+            let cur_dist = (r - st.match_position) & mask;
+            let mut best_pos = st.match_position;
+            let mut best_dist = if cur_dist > 0 { cur_dist } else { N as i32 };
+            for cand_pos in 0..(N as i32) {
+                if cand_pos == r {
+                    continue;
+                }
+                let d = (r - cand_pos) & mask;
+                if d == 0 || d >= best_dist {
+                    continue;
+                }
+                let mut l = 0usize;
+                while l < target_len {
+                    let a = st.text_buf[cand_pos as usize + l];
+                    let b = st.text_buf[r as usize + l];
+                    if a != b {
+                        break;
+                    }
+                    l += 1;
+                }
+                if l >= target_len {
+                    best_dist = d;
+                    best_pos = cand_pos;
+                }
+            }
+            st.match_position = best_pos;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// basic_tail1 + len-split exhaustive (短 → max_dist, 長 → min_dist)
+fn compress_okumura_basic_len_split_exh_tail1(input: &[u8], split: u32) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+
+        if (st.match_length as usize) > THRESHOLD {
+            let target_len = st.match_length as usize;
+            let want_min = (target_len as u32) > split;
+            let cur_dist = (r - st.match_position) & mask;
+            let mut best_pos = st.match_position;
+            let mut best_dist = if want_min {
+                if cur_dist > 0 { cur_dist } else { N as i32 }
+            } else {
+                if cur_dist > 0 { cur_dist } else { 0 }
+            };
+            for cand_pos in 0..(N as i32) {
+                if cand_pos == r {
+                    continue;
+                }
+                let d = (r - cand_pos) & mask;
+                if d == 0 {
+                    continue;
+                }
+                let take = if want_min { d < best_dist } else { d > best_dist };
+                if !take {
+                    continue;
+                }
+                let mut l = 0usize;
+                while l < target_len {
+                    let a = st.text_buf[cand_pos as usize + l];
+                    let b = st.text_buf[r as usize + l];
+                    if a != b {
+                        break;
+                    }
+                    l += 1;
+                }
+                if l >= target_len {
+                    best_dist = d;
+                    best_pos = cand_pos;
+                }
+            }
+            st.match_position = best_pos;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
+pub fn compress_okumura_basic_len_split8_exh_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_len_split_exh_tail1(input, 8)
+}
+
+pub fn compress_okumura_basic_len_split13_exh_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_len_split_exh_tail1(input, 13)
+}
+
+pub fn compress_okumura_basic_max_dist_exh_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_len_split_exh_tail1(input, 18)
+}
+
+pub fn compress_okumura_basic_min_dist_exh_tail1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_len_split_exh_tail1(input, 0)
+}
+
+/// 同上の basic ベース版 (basic_tail1 + len=18 min_dist override)
+pub fn compress_okumura_basic_min_dist_only18_exh_tail1(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    // basic mode: F dummy inserts before the real one
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+
+        if (st.match_length as usize) == F {
+            let target_len = F;
+            let cur_dist = (r - st.match_position) & mask;
+            let mut best_pos = st.match_position;
+            let mut best_dist = if cur_dist > 0 { cur_dist } else { N as i32 };
+            for cand_pos in 0..(N as i32) {
+                if cand_pos == r {
+                    continue;
+                }
+                let d = (r - cand_pos) & mask;
+                if d == 0 || d >= best_dist {
+                    continue;
+                }
+                let mut l = 0usize;
+                while l < target_len {
+                    let a = st.text_buf[cand_pos as usize + l];
+                    let b = st.text_buf[r as usize + l];
+                    if a != b {
+                        break;
+                    }
+                    l += 1;
+                }
+                if l >= target_len {
+                    best_dist = d;
+                    best_pos = cand_pos;
+                }
+            }
+            st.match_position = best_pos;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
 /// no_dummy + 入力 byte=0x20 のとき literal 強制 (Mode C 対策)。
 /// match_position が r-1 RLE の場合は除外 (RLE は別ルール)。
 pub fn compress_okumura_no_dummy_lit_for_0x20(input: &[u8]) -> Vec<Token> {
