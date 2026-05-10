@@ -7,4 +7,5 @@ dependencies = [
     "lightgbm>=4.6.0",
     "numpy>=2.4.4",
     "polars>=1.40.1",
+    "scikit-learn>=1.8.0",
 ]
