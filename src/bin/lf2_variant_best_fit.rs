@@ -93,6 +93,7 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("okumura_basic_tail1_add", okumura_lzss::compress_okumura_basic_tail1_add),
         ("okumura_basic_no_init_tail1", okumura_lzss::compress_okumura_basic_no_init_tail1),
         ("okumura_no_dummy_no_init_tail1", okumura_lzss::compress_okumura_no_dummy_no_init_tail1),
+        ("okumura_basic_no_init_strict_tail1", okumura_lzss::compress_okumura_basic_no_init_strict_tail1),
     ]
 }
 

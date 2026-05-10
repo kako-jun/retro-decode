@@ -733,6 +733,91 @@ pub fn compress_okumura_basic_no_init_tail1(input: &[u8]) -> Vec<Token> {
     out
 }
 
+/// no_init 厳格版 + tail1: unwritten pos への match は input byte に関係なく Lit 強制。
+pub fn compress_okumura_basic_no_init_strict_tail1(input: &[u8]) -> Vec<Token> {
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    let mut written = [false; N];
+    for k in 0..F {
+        written[(N - F + k) & (N - 1)] = true;
+    }
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+    let mask: i32 = (N as i32) - 1;
+    loop {
+        let mp = (st.match_position & mask) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & mask) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+        let pos1 = (st.match_position & mask) as usize;
+        let len1 = st.match_length as usize;
+        // 厳格版: input byte に関係なく unwritten pos なら Lit 強制
+        let force_literal = len1 > THRESHOLD && !written[pos1];
+        if force_literal || (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            written[s as usize] = true;
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+    out
+}
+
 /// no_dummy + no_init bitmap + tail1 phantom padding。
 pub fn compress_okumura_no_dummy_no_init_tail1(input: &[u8]) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
