@@ -668,6 +668,154 @@ pub fn compress_okumura_brute_min_dist(input: &[u8]) -> Vec<Token> {
     compress_okumura_brute_impl(input, BruteTie::MinDist)
 }
 
+/// **Hash-chain limited search**. Hypothesis: leaf encoder uses a recency-ordered
+/// chain (head + prev) keyed on a short prefix and walks the chain up to K times,
+/// picking the longest match found (with a specific tie-break). This explains
+/// the "lazy / non-greedy" observation in session 390 (C1301 t767:
+/// no_dummy found Match(0x3ec, 9) but leaf picked Match(0xf5a, 3)).
+///
+/// Implementation:
+/// - hash function: `hash(input[s], input[s+1])` → 16 bits (256×256 buckets, falls back to byte0 only)
+/// - head[hash] = most recent pos with this hash; prev[pos] = earlier pos with same hash
+/// - From head[hash(input[s..s+2])], walk prev up to K times; compute match
+///   length at each visited pos; track longest with chosen tie-break.
+/// - On emit, insert each written position into the chain (head/prev update).
+///
+/// Tie-break:
+/// - `FirstLongest`: among chain-walked visits, pick the first (most recent) position
+///   that achieves the longest length found so far. (Aggressive: as soon as you
+///   see a position with len_so_far_max, keep it; don't overwrite with later one
+///   even if it ties.)
+/// - `LastLongest`: keep updating to most-recent equal-length (max-dist among visited
+///   since chain walks recent → old, "last" = oldest among visited)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainTie {
+    FirstLongest,  // first hit at max_len kept
+    LastLongest,   // last hit at max_len kept (likely oldest in chain)
+}
+
+fn hash16(a: u8, b: u8) -> usize {
+    ((a as usize) << 8) | (b as usize)
+}
+
+fn compress_okumura_chain_impl(input: &[u8], max_chain: usize, tie: ChainTie) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::new();
+    let mut ring = [0x20u8; N];
+    let mut r: usize = N - F;
+    let mut s: usize = 0;
+    let mask: usize = N - 1;
+    let imask: i32 = (N as i32) - 1;
+
+    // Hash table: head + prev chain
+    let n_buckets = 256 * 256;
+    let nil_pos: u16 = 0xffff;
+    let mut head: Vec<u16> = vec![nil_pos; n_buckets];
+    let mut prev_pos: Vec<u16> = vec![nil_pos; N];
+
+    // Helper: insert position `p` into hash chain based on ring[p..p+2]
+    let insert_pos = |head: &mut Vec<u16>, prev_pos: &mut Vec<u16>, ring: &[u8; N], p: usize| {
+        let h = hash16(ring[p], ring[(p + 1) & 0x0fff]);
+        prev_pos[p] = head[h];
+        head[h] = p as u16;
+    };
+
+    // Pre-fill: write initial 0x20 fill positions to chain (positions 0..N-F).
+    // Actually skip pre-filling; the initial 0x20 ring is filled by Okumura too.
+    // We'll insert positions as we write.
+
+    while s < input.len() {
+        let remaining = input.len() - s;
+        let max_len_by_input = remaining.min(F);
+
+        // Search chain
+        let mut best_len: usize = 0;
+        let mut best_pos: usize = 0;
+        let mut best_dist: i32 = 0;
+
+        if max_len_by_input >= 3 && s + 1 < input.len() {
+            let h = hash16(input[s], input[s + 1]);
+            let mut p = head[h];
+            let mut walked = 0usize;
+            while p != nil_pos && walked < max_chain {
+                let pos = p as usize;
+                let dist = ((r as i32 - pos as i32) & imask) as usize;
+                if dist > 0 {
+                    // Compute match length with writeback simulation
+                    let mut l = 0usize;
+                    while l < max_len_by_input {
+                        let rb = if l < dist {
+                            ring[(pos + l) & mask]
+                        } else {
+                            input[s + l - dist]
+                        };
+                        if rb != input[s + l] { break; }
+                        l += 1;
+                    }
+                    if l >= 3 {
+                        if l > best_len {
+                            best_len = l;
+                            best_pos = pos;
+                            best_dist = dist as i32;
+                        } else if l == best_len {
+                            let take = match tie {
+                                ChainTie::FirstLongest => false,  // keep first (already set)
+                                ChainTie::LastLongest => true,    // overwrite with later
+                            };
+                            if take {
+                                best_pos = pos;
+                                best_dist = dist as i32;
+                            }
+                        }
+                    }
+                }
+                p = prev_pos[pos];
+                walked += 1;
+            }
+        }
+        let _ = best_dist;
+
+        if best_len < 3 {
+            // Literal
+            let b = input[s];
+            // Insert current r into chain (we're about to write here)
+            // Actually, insert after writing so ring is updated.
+            ring[r] = b;
+            // Insert r-1's hash now that ring[r-1] is set (well, requires ring[r-1] and ring[r] both)
+            // For simplicity, insert position when we have 2 bytes available there.
+            // We insert ring position r when ring[r] AND ring[r+1] are both written.
+            // Since we write 1 byte here, insert position r-1 (which now has its 2nd byte = ring[r]).
+            let p_to_insert = (r + N - 1) & mask;
+            insert_pos(&mut head, &mut prev_pos, &ring, p_to_insert);
+            out.push(Token::Literal(b));
+            r = (r + 1) & mask;
+            s += 1;
+        } else {
+            out.push(Token::Match { pos: (best_pos as u16) & ((N as u16) - 1), len: best_len as u8 });
+            for k in 0..best_len {
+                let b = input[s + k];
+                ring[r] = b;
+                // After writing ring[r], position r-1 now has its second byte ring[r], so insert r-1.
+                let p_to_insert = (r + N - 1) & mask;
+                insert_pos(&mut head, &mut prev_pos, &ring, p_to_insert);
+                r = (r + 1) & mask;
+            }
+            s += best_len;
+        }
+    }
+
+    out
+}
+
+pub fn compress_okumura_chain4_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 4, ChainTie::LastLongest) }
+pub fn compress_okumura_chain8_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 8, ChainTie::LastLongest) }
+pub fn compress_okumura_chain16_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 16, ChainTie::LastLongest) }
+pub fn compress_okumura_chain32_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 32, ChainTie::LastLongest) }
+pub fn compress_okumura_chain64_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 64, ChainTie::LastLongest) }
+pub fn compress_okumura_chain4_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 4, ChainTie::FirstLongest) }
+pub fn compress_okumura_chain8_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 8, ChainTie::FirstLongest) }
+pub fn compress_okumura_chain16_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 16, ChainTie::FirstLongest) }
+pub fn compress_okumura_chain32_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 32, ChainTie::FirstLongest) }
+
 /// 基本奥村 + 書き込み済み bitmap フィルタ。
 /// match の pos が初期 0x20 fill 領域 (= 未書込み) なら Literal に格下げ。
 ///
