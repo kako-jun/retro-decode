@@ -901,6 +901,92 @@ pub fn compress_okumura_chain3_8(input: &[u8]) -> Vec<Token> { compress_okumura_
 pub fn compress_okumura_chain3_32(input: &[u8]) -> Vec<Token> { compress_okumura_chain3_impl(input, 32, ChainTie::LastLongest) }
 pub fn compress_okumura_chain3_first8(input: &[u8]) -> Vec<Token> { compress_okumura_chain3_impl(input, 8, ChainTie::FirstLongest) }
 
+/// Reverse-order chain: head points to OLDEST entry, next points to NEWER. Walk
+/// from head goes oldest → newer. With FirstLongest tie, picks oldest first.
+fn compress_okumura_chain_rev_impl(input: &[u8], max_chain: usize) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::new();
+    let mut ring = [0x20u8; N];
+    let mut r: usize = N - F;
+    let mut s: usize = 0;
+    let mask: usize = N - 1;
+    let imask: i32 = (N as i32) - 1;
+    let nil_pos: u16 = 0xffff;
+    let n_buckets = 65536;
+    let mut head: Vec<u16> = vec![nil_pos; n_buckets];
+    let mut tail_v: Vec<u16> = vec![nil_pos; n_buckets];  // most-recent pos per bucket
+    let mut next_pos: Vec<u16> = vec![nil_pos; N];
+
+    while s < input.len() {
+        let remaining = input.len() - s;
+        let max_len_by_input = remaining.min(F);
+
+        let mut best_len: usize = 0;
+        let mut best_pos: usize = 0;
+
+        if max_len_by_input >= 3 && s + 1 < input.len() {
+            let h = hash16(input[s], input[s + 1]);
+            let mut p = head[h];
+            let mut walked = 0usize;
+            while p != nil_pos && walked < max_chain {
+                let pos = p as usize;
+                let dist = ((r as i32 - pos as i32) & imask) as usize;
+                if dist > 0 {
+                    let mut l = 0usize;
+                    while l < max_len_by_input {
+                        let rb = if l < dist {
+                            ring[(pos + l) & mask]
+                        } else {
+                            input[s + l - dist]
+                        };
+                        if rb != input[s + l] { break; }
+                        l += 1;
+                    }
+                    if l >= 3 && l > best_len {
+                        best_len = l;
+                        best_pos = pos;
+                    }
+                }
+                p = next_pos[pos];
+                walked += 1;
+            }
+        }
+
+        let insert = |head: &mut Vec<u16>, tail: &mut Vec<u16>, next: &mut Vec<u16>, ring: &[u8; N], p: usize| {
+            let h = hash16(ring[p], ring[(p + 1) & 0x0fff]);
+            // Append to end of chain
+            let t = tail[h];
+            if t == nil_pos { head[h] = p as u16; } else { next[t as usize] = p as u16; }
+            next[p] = nil_pos;
+            tail[h] = p as u16;
+        };
+
+        if best_len < 3 {
+            let b = input[s];
+            ring[r] = b;
+            let p_to_insert = (r + N - 1) & mask;
+            insert(&mut head, &mut tail_v, &mut next_pos, &ring, p_to_insert);
+            out.push(Token::Literal(b));
+            r = (r + 1) & mask;
+            s += 1;
+        } else {
+            out.push(Token::Match { pos: (best_pos as u16) & ((N as u16) - 1), len: best_len as u8 });
+            for k in 0..best_len {
+                let b = input[s + k];
+                ring[r] = b;
+                let p_to_insert = (r + N - 1) & mask;
+                insert(&mut head, &mut tail_v, &mut next_pos, &ring, p_to_insert);
+                r = (r + 1) & mask;
+            }
+            s += best_len;
+        }
+    }
+
+    out
+}
+
+pub fn compress_okumura_chain_rev8(input: &[u8]) -> Vec<Token> { compress_okumura_chain_rev_impl(input, 8) }
+pub fn compress_okumura_chain_rev32(input: &[u8]) -> Vec<Token> { compress_okumura_chain_rev_impl(input, 32) }
+
 /// 基本奥村 + 書き込み済み bitmap フィルタ。
 /// match の pos が初期 0x20 fill 領域 (= 未書込み) なら Literal に格下げ。
 ///
