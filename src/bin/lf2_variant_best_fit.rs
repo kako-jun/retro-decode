@@ -113,6 +113,9 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("okumura_chain8_first", okumura_lzss::compress_okumura_chain8_first),
         ("okumura_chain16_first", okumura_lzss::compress_okumura_chain16_first),
         ("okumura_chain32_first", okumura_lzss::compress_okumura_chain32_first),
+        ("okumura_chain3_8", okumura_lzss::compress_okumura_chain3_8),
+        ("okumura_chain3_32", okumura_lzss::compress_okumura_chain3_32),
+        ("okumura_chain3_first8", okumura_lzss::compress_okumura_chain3_first8),
     ]
 }
 
