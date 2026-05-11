@@ -548,6 +548,126 @@ pub fn compress_okumura_max_dist_tie(input: &[u8]) -> Vec<Token> {
     compress_okumura_impl(input, TieMode::MaxDistTie)
 }
 
+/// **Brute-force longest match search**, NOT BST. At each step scans every ring
+/// position 0..N to find the maximum match length L. Tie-break:
+/// - `BruteTie::MaxDist`: among all positions at max_len, pick the one with largest
+///   (r - pos) & mask (= farthest back in ring).
+/// - `BruteTie::MinDist`: pick smallest distance.
+///
+/// session 389+ bulk_stats finding: 48% of "hopeless" tokens have only ONE
+/// brute-force max-len candidate (= our BST simply misses the longest match).
+/// Among 2-tied, leaf picks max-dist 75% of the time. H/V/S file groups show
+/// 75–82% max-dist preference. Hypothesis: leaf encoder uses brute-force search
+/// + max-dist tie-break for these file groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BruteTie {
+    MaxDist,
+    MinDist,
+}
+
+fn compress_okumura_brute_impl(input: &[u8], tie: BruteTie) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::new();
+    let mut ring = [0x20u8; N];
+    let mut r: usize = N - F;
+    let mut s: usize = 0;
+    let mask: usize = N - 1;
+    let imask: i32 = (N as i32) - 1;
+
+    while s < input.len() {
+        let remaining = input.len() - s;
+        let max_len_by_input = remaining.min(F);
+
+        // Brute-force scan: for each pos, walk match length.
+        // Optimized: avoid 4KB ring copy per pos. Read directly from ring; for
+        // self-referential matches (pos within F-1 bytes back from r), the
+        // write-back means we read what's CURRENTLY in ring (uninitialised at r+),
+        // but since the algorithm extends one byte at a time AND each "would-be
+        // write" of byte k overlaps ring[(r+k) & mask] which is referenced as
+        // ring[(pos+k) & mask] for k < dist, the simple ring read is correct
+        // for non-overlapping cases (dist >= len). For dist < len (self-ref),
+        // the source bytes after dist wraps must equal input[s..s+dist] copies.
+        // To handle this we use the "writeback" model only when needed.
+        let mut best_len: usize = 0;
+        let mut best_pos: usize = 0;
+        let mut best_dist: i32 = 0;
+
+        for pos in 0..N {
+            let dist = ((r as i32 - pos as i32) & imask) as usize;
+            if dist == 0 { continue; }
+
+            let mut l = 0usize;
+            if dist >= max_len_by_input {
+                // Non-overlapping case: simple compare from ring[pos..pos+L] vs input[s..s+L]
+                while l < max_len_by_input {
+                    let rb = ring[(pos + l) & mask];
+                    if rb != input[s + l] { break; }
+                    l += 1;
+                }
+            } else {
+                // Self-referential (RLE-like): bytes after dist would be writeback'd.
+                // The pattern: extension byte k (k < dist) reads ring[(pos+k) & mask];
+                // for k >= dist, it reads what was just written at ring[(r + k - dist) & mask],
+                // which equals input[s + k - dist] (since that's what gets written).
+                // We compare incrementally.
+                while l < max_len_by_input {
+                    let rb = if l < dist {
+                        ring[(pos + l) & mask]
+                    } else {
+                        input[s + l - dist]
+                    };
+                    if rb != input[s + l] { break; }
+                    l += 1;
+                }
+            }
+
+            if l >= 3 {
+                if l > best_len {
+                    best_len = l;
+                    best_pos = pos;
+                    best_dist = dist as i32;
+                } else if l == best_len {
+                    let take = match tie {
+                        BruteTie::MaxDist => (dist as i32) > best_dist,
+                        BruteTie::MinDist => (dist as i32) < best_dist,
+                    };
+                    if take {
+                        best_pos = pos;
+                        best_dist = dist as i32;
+                    }
+                }
+            }
+        }
+
+        if best_len < 3 {
+            let b = input[s];
+            out.push(Token::Literal(b));
+            ring[r] = b;
+            r = (r + 1) & mask;
+            s += 1;
+        } else {
+            out.push(Token::Match { pos: (best_pos as u16) & ((N as u16) - 1), len: best_len as u8 });
+            for k in 0..best_len {
+                let b = input[s + k];
+                ring[r] = b;
+                r = (r + 1) & mask;
+            }
+            s += best_len;
+        }
+    }
+
+    out
+}
+
+/// Brute-force longest match + max-distance tie.
+pub fn compress_okumura_brute_max_dist(input: &[u8]) -> Vec<Token> {
+    compress_okumura_brute_impl(input, BruteTie::MaxDist)
+}
+
+/// Brute-force longest match + min-distance tie.
+pub fn compress_okumura_brute_min_dist(input: &[u8]) -> Vec<Token> {
+    compress_okumura_brute_impl(input, BruteTie::MinDist)
+}
+
 /// 基本奥村 + 書き込み済み bitmap フィルタ。
 /// match の pos が初期 0x20 fill 領域 (= 未書込み) なら Literal に格下げ。
 ///

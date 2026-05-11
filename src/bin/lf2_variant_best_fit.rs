@@ -102,6 +102,8 @@ fn variants() -> Vec<(&'static str, fn(&[u8]) -> Vec<Token>)> {
         ("okumura_basic_tail1_phantom_lit_pad8", okumura_lzss::compress_okumura_basic_tail1_phantom_lit_pad8),
         ("okumura_basic_tail1_no_cap", okumura_lzss::compress_okumura_basic_tail1_no_cap),
         ("okumura_no_dummy_tail1_no_cap", okumura_lzss::compress_okumura_no_dummy_tail1_no_cap),
+        ("okumura_brute_max_dist", okumura_lzss::compress_okumura_brute_max_dist),
+        ("okumura_brute_min_dist", okumura_lzss::compress_okumura_brute_min_dist),
     ]
 }
 
