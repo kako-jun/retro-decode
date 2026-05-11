@@ -987,6 +987,72 @@ fn compress_okumura_chain_rev_impl(input: &[u8], max_chain: usize) -> Vec<Token>
 pub fn compress_okumura_chain_rev8(input: &[u8]) -> Vec<Token> { compress_okumura_chain_rev_impl(input, 8) }
 pub fn compress_okumura_chain_rev32(input: &[u8]) -> Vec<Token> { compress_okumura_chain_rev_impl(input, 32) }
 
+/// basic_tail1 with parameterized initial fill byte.
+/// 仮説: leaf encoder が 0x20 以外の fill 値で ring を初期化していた可能性。
+/// 結果として BST が選ぶ位置が変わる (= 0x20 fill 領域への match を picture data の
+/// match と区別できる)。decoder は 0x20 fill 想定で動くので、encoder が異なる fill
+/// で内部処理しても出力 binary は decoder で正しく decode できる (= 未書込み位置への
+/// match を回避できれば fill 値は何でもよい)。
+fn compress_okumura_basic_tail1_fill_impl(input: &[u8], fill: u8) -> Vec<Token> {
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+    let mut out: Vec<Token> = Vec::new();
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 { return out; }
+    for i in 1..=F { st.insert_node(r - i as i32); }
+    st.insert_node(r);
+    loop {
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let len_before = len;
+        let cap = if is_rle { (len + 1).min(F) } else { len };
+        if st.match_length as usize > cap { st.match_length = cap as i32; }
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match { pos: (st.match_position as u16) & ((N as u16) - 1), len: st.match_length as u8 });
+        }
+        let last_match_length = st.match_length as usize;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 { st.insert_node(r); }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before { len = 0; }
+        if len == 0 { break; }
+    }
+    out
+}
+
+pub fn compress_okumura_basic_tail1_fill00(input: &[u8]) -> Vec<Token> { compress_okumura_basic_tail1_fill_impl(input, 0x00) }
+pub fn compress_okumura_basic_tail1_fillff(input: &[u8]) -> Vec<Token> { compress_okumura_basic_tail1_fill_impl(input, 0xff) }
+
 /// 基本奥村 + 書き込み済み bitmap フィルタ。
 /// match の pos が初期 0x20 fill 領域 (= 未書込み) なら Literal に格下げ。
 ///
