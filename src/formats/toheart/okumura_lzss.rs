@@ -100,10 +100,7 @@ pub fn format_bst_dump(snap: &OkumuraSnapshot, max_nodes: usize) -> String {
         "BST nodes (dad != NIL), cur_r = 0x{:03x}, max {} shown:",
         cur_r as u16, max_nodes
     );
-    let _ = writeln!(
-        s,
-        "    pos    dad    lson   rson   dist   bytes[0..3]"
-    );
+    let _ = writeln!(s, "    pos    dad    lson   rson   dist   bytes[0..3]");
     for pos in 0..N {
         if snap.dad[pos] == NIL {
             continue;
@@ -119,14 +116,7 @@ pub fn format_bst_dump(snap: &OkumuraSnapshot, max_nodes: usize) -> String {
         let _ = writeln!(
             s,
             "    0x{:03x}  0x{:04x} 0x{:04x} 0x{:04x} 0x{:03x}  {:02x} {:02x} {:02x}",
-            pos as u16,
-            snap.dad[pos],
-            snap.lson[pos],
-            snap.rson[pos],
-            dist as u16,
-            b0,
-            b1,
-            b2
+            pos as u16, snap.dad[pos], snap.lson[pos], snap.rson[pos], dist as u16, b0, b1, b2
         );
         count += 1;
     }
@@ -342,9 +332,9 @@ impl Okumura {
         let p_root_byte = match self.key_mode {
             KeyMode::Byte0 => self.text_buf[key_start],
             KeyMode::XorByte01 => self.text_buf[key_start] ^ self.text_buf[key_start + 1],
-            KeyMode::AddByte01Mod256 => self
-                .text_buf[key_start]
-                .wrapping_add(self.text_buf[key_start + 1]),
+            KeyMode::AddByte01Mod256 => {
+                self.text_buf[key_start].wrapping_add(self.text_buf[key_start + 1])
+            }
         };
         let p_root_idx = N as i32 + 1 + p_root_byte as i32;
         let mut p: i32 = p_root_idx;
@@ -518,6 +508,278 @@ impl Okumura {
     }
 }
 
+/// `OkumuraSim` の初期化バリアント (Issue #14 v12)。
+///
+/// - `Basic`: 奥村原典どおり init_tree 後、先頭で F 個の dummy を InsertNode(r-F..r-1) 挿入
+/// - `NoDummy`: dummy 挿入なし（`compress_okumura_no_dummy` の初期化）
+/// - `DummyThenDrop`: dummy 挿入 → token 0 出力直後に残存 dummy を全 DeleteNode
+///   （`compress_okumura_dummy_then_drop` の処理）
+/// - `LeftFirst`: Basic と同じ初期化 + `BstMode::LeftFirst`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimMode {
+    Basic,
+    NoDummy,
+    DummyThenDrop,
+    LeftFirst,
+}
+
+/// Leaf の実トークン列で BST 状態を teacher-forcing 進行させるシミュレータ
+/// (Issue #14 v12: BST 完全状態シミュレーション特徴量)。
+///
+/// 自エンコーダの選択では進めず、`advance` に渡された Leaf 実出力バイト数だけ
+/// 原典 `Encode()` 後半ループと同一の回転 (DeleteNode(s) → text_buf 書込 →
+/// InsertNode(r)) を行う。tie token の直前に `search_trace` を呼ぶと、
+/// その時点の BST を read-only で辿り、max_len に到達する各ノードの
+/// 訪問順位 (rank) と深さ (depth) を返す。
+///
+/// 注: 先読み (text_buf への入力供給) はシミュレータが内部で行う必要があるため、
+/// Issue 仕様の `new(mode)` に加えて入力スライスを受け取る。
+pub struct OkumuraSim<'a> {
+    inner: Okumura,
+    /// ring write head。v8/v11 の ring ループの r と全 token で一致する。
+    pub r: i32,
+    s: i32,
+    /// 残フレーム長 (原典 Encode() の len)
+    len: usize,
+    input: &'a [u8],
+    input_idx: usize,
+    mode: SimMode,
+    dummy_positions: Vec<i32>,
+    first_token_done: bool,
+}
+
+impl<'a> OkumuraSim<'a> {
+    pub fn new(mode: SimMode, input: &'a [u8]) -> Self {
+        let mut st = Okumura::new(0x20);
+        st.tie_mode = TieMode::StrictGt;
+        if matches!(mode, SimMode::LeftFirst) {
+            // init_tree が LeftFirst のとき lson root も初期化するため、先に設定する
+            st.bst_mode = BstMode::LeftFirst;
+        }
+        st.init_tree();
+
+        let r: i32 = (N - F) as i32;
+        let s: i32 = 0;
+
+        // 入力を F バイトまで text_buf[r..] に先読み（原典 Encode() と同一）
+        let mut input_idx: usize = 0;
+        let mut len: usize = 0;
+        while len < F && input_idx < input.len() {
+            st.text_buf[r as usize + len] = input[input_idx];
+            input_idx += 1;
+            len += 1;
+        }
+
+        let mut dummy_positions: Vec<i32> = Vec::new();
+        if len > 0 {
+            match mode {
+                SimMode::Basic | SimMode::LeftFirst => {
+                    // 原典 for (i = 1; i <= F; i++) InsertNode(r - i)
+                    for i in 1..=F {
+                        st.insert_node(r - i as i32);
+                    }
+                }
+                SimMode::NoDummy => {}
+                SimMode::DummyThenDrop => {
+                    for i in 1..=F {
+                        let p = ((r - i as i32) + N as i32) & (N as i32 - 1);
+                        st.insert_node(p);
+                        dummy_positions.push(p);
+                    }
+                }
+            }
+            st.insert_node(r);
+        }
+
+        Self {
+            inner: st,
+            r,
+            s,
+            len,
+            input,
+            input_idx,
+            mode,
+            dummy_positions,
+            first_token_done: false,
+        }
+    }
+
+    /// tie token 直前に呼ぶ read-only トレース。木を一切 mutate しない。
+    ///
+    /// `insert_node` の探索経路 (KeyMode::Byte0 の root key、index 1 からの
+    /// cmp 計算、BstMode ごとの左右規則) を逐語一致で辿り、一致長がちょうど
+    /// `max_len` になるノードを訪問順に `(pos, rank, depth)` で返す。
+    /// rank は 1 始まりの訪問順位、depth は root からの段数。
+    ///
+    /// 原典 insert_node は len == F で探索を打ち切るが、本トレースは
+    /// 全 max_len 候補の rank を得るために NIL まで続行する
+    /// (cmp == 0 のまま右へ降りる。最初の max_len ノード = rank 1 は原典の
+    /// 採用ノードと一致する)。
+    pub fn search_trace(&self, r: i32, max_len: u8) -> Vec<(u16, u32, u8)> {
+        let mut results: Vec<(u16, u32, u8)> = Vec::new();
+        if self.len == 0 {
+            return results;
+        }
+        let key_start = r as usize;
+        // KeyMode::Byte0 固定
+        let root_byte = self.inner.text_buf[key_start];
+        let mut i: i32 = N as i32 + 1 + root_byte as i32;
+        let mut cmp: i32 = match self.inner.bst_mode {
+            BstMode::LeftFirst => -1,
+            _ => 1,
+        };
+        let mut visit: u32 = 0;
+        let mut depth: u8 = 0;
+
+        loop {
+            let go_right = match self.inner.bst_mode {
+                BstMode::LeftFirst => cmp > 0,
+                _ => cmp >= 0,
+            };
+            i = if go_right {
+                self.inner.rson[i as usize]
+            } else {
+                self.inner.lson[i as usize]
+            };
+            if i == NIL {
+                break;
+            }
+            depth = depth.saturating_add(1);
+
+            // insert_node と同一: index 1 から最初の不一致 byte までが一致長
+            let mut j: usize = 1;
+            cmp = 0;
+            while j < F {
+                let a = self.inner.text_buf[key_start + j] as i32;
+                let b = self.inner.text_buf[i as usize + j] as i32;
+                let d = a - b;
+                if d != 0 {
+                    cmp = d;
+                    break;
+                }
+                j += 1;
+            }
+
+            if j as u8 == max_len {
+                visit += 1;
+                results.push((i as u16, visit, depth));
+            }
+        }
+        results
+    }
+
+    /// token 確定後に呼ぶ。原典 Encode() 後半ループと同一の回転を
+    /// `emitted_bytes.len()` (= last_match_length) 回行う。
+    /// Literal は 1 byte、Match は len bytes を渡す (teacher forcing)。
+    pub fn advance(&mut self, emitted_bytes: &[u8]) {
+        if self.len == 0 {
+            return;
+        }
+        // teacher forcing 検証: 出力バイトは現在の coding position の
+        // 先読み内容 text_buf[r..] と一致しているはず
+        #[cfg(debug_assertions)]
+        {
+            let check = emitted_bytes.len().min(self.len);
+            for (k, &b) in emitted_bytes.iter().take(check).enumerate() {
+                debug_assert_eq!(
+                    b,
+                    self.inner.text_buf[self.r as usize + k],
+                    "OkumuraSim::advance: emitted byte {} != lookahead (mode {:?})",
+                    k,
+                    self.mode
+                );
+            }
+        }
+
+        let last_match_length = emitted_bytes.len();
+        let mut i = 0usize;
+        while i < last_match_length && self.input_idx < self.input.len() {
+            self.inner.delete_node(self.s);
+            let c = self.input[self.input_idx];
+            self.input_idx += 1;
+
+            self.inner.text_buf[self.s as usize] = c;
+            if (self.s as usize) < F - 1 {
+                self.inner.text_buf[self.s as usize + N] = c;
+            }
+
+            self.s = (self.s + 1) & (N as i32 - 1);
+            self.r = (self.r + 1) & (N as i32 - 1);
+            self.inner.insert_node(self.r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            self.inner.delete_node(self.s);
+            self.s = (self.s + 1) & (N as i32 - 1);
+            self.r = (self.r + 1) & (N as i32 - 1);
+            self.len -= 1;
+            if self.len > 0 {
+                self.inner.insert_node(self.r);
+            }
+            i += 1;
+        }
+
+        // DummyThenDrop: token 0 の回転が終わった直後に残存 dummy を全削除
+        // (compress_okumura_dummy_then_drop と同一。r 自身は削除しない)
+        if matches!(self.mode, SimMode::DummyThenDrop) && !self.first_token_done {
+            self.first_token_done = true;
+            for k in 0..self.dummy_positions.len() {
+                let p = self.dummy_positions[k];
+                if p == self.r {
+                    continue;
+                }
+                self.inner.delete_node(p);
+            }
+        }
+    }
+
+    /// BST の親子リンク整合を検証する（テスト用）。
+    /// dad != NIL の全ノードについて「親の lson か rson が自分を指す」ことと、
+    /// 各 root からの到達ノードに循環が無いことを確認する。
+    pub fn tree_is_consistent(&self) -> bool {
+        // 親子リンクの相互整合
+        for pos in 0..N {
+            let d = self.inner.dad[pos];
+            if d == NIL {
+                continue;
+            }
+            let du = d as usize;
+            if !(du < N || ((N + 1)..=(N + 256)).contains(&du)) {
+                return false;
+            }
+            if self.inner.lson[du] != pos as i32 && self.inner.rson[du] != pos as i32 {
+                return false;
+            }
+        }
+        // root から辿ってノード数が N を超えたら循環
+        let mut reached = 0usize;
+        let mut stack: Vec<i32> = Vec::new();
+        for root in (N + 1)..=(N + 256) {
+            if self.inner.rson[root] != NIL {
+                stack.push(self.inner.rson[root]);
+            }
+            if matches!(self.inner.bst_mode, BstMode::LeftFirst) && self.inner.lson[root] != NIL {
+                stack.push(self.inner.lson[root]);
+            }
+        }
+        while let Some(p) = stack.pop() {
+            reached += 1;
+            if reached > N {
+                return false;
+            }
+            let pu = p as usize;
+            if self.inner.lson[pu] != NIL {
+                stack.push(self.inner.lson[pu]);
+            }
+            if self.inner.rson[pu] != NIL {
+                stack.push(self.inner.rson[pu]);
+            }
+        }
+        true
+    }
+}
+
 /// 奥村 lzss.c `Encode()` 逐語移植。トークン列を返す。
 ///
 /// `match_position` は 0..N のリングバッファ絶対位置で返る（LF2 decoder の
@@ -533,7 +795,11 @@ pub fn compress_okumura(input: &[u8]) -> Vec<Token> {
 pub fn compress_okumura_with_tie(input: &[u8], allow_equal: bool) -> Vec<Token> {
     compress_okumura_impl(
         input,
-        if allow_equal { TieMode::AllowEq } else { TieMode::StrictGt },
+        if allow_equal {
+            TieMode::AllowEq
+        } else {
+            TieMode::StrictGt
+        },
     )
 }
 
@@ -593,14 +859,18 @@ fn compress_okumura_brute_impl(input: &[u8], tie: BruteTie) -> Vec<Token> {
 
         for pos in 0..N {
             let dist = ((r as i32 - pos as i32) & imask) as usize;
-            if dist == 0 { continue; }
+            if dist == 0 {
+                continue;
+            }
 
             let mut l = 0usize;
             if dist >= max_len_by_input {
                 // Non-overlapping case: simple compare from ring[pos..pos+L] vs input[s..s+L]
                 while l < max_len_by_input {
                     let rb = ring[(pos + l) & mask];
-                    if rb != input[s + l] { break; }
+                    if rb != input[s + l] {
+                        break;
+                    }
                     l += 1;
                 }
             } else {
@@ -615,7 +885,9 @@ fn compress_okumura_brute_impl(input: &[u8], tie: BruteTie) -> Vec<Token> {
                     } else {
                         input[s + l - dist]
                     };
-                    if rb != input[s + l] { break; }
+                    if rb != input[s + l] {
+                        break;
+                    }
                     l += 1;
                 }
             }
@@ -645,7 +917,10 @@ fn compress_okumura_brute_impl(input: &[u8], tie: BruteTie) -> Vec<Token> {
             r = (r + 1) & mask;
             s += 1;
         } else {
-            out.push(Token::Match { pos: (best_pos as u16) & ((N as u16) - 1), len: best_len as u8 });
+            out.push(Token::Match {
+                pos: (best_pos as u16) & ((N as u16) - 1),
+                len: best_len as u8,
+            });
             for k in 0..best_len {
                 let b = input[s + k];
                 ring[r] = b;
@@ -690,8 +965,8 @@ pub fn compress_okumura_brute_min_dist(input: &[u8]) -> Vec<Token> {
 ///   since chain walks recent → old, "last" = oldest among visited)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainTie {
-    FirstLongest,  // first hit at max_len kept
-    LastLongest,   // last hit at max_len kept (likely oldest in chain)
+    FirstLongest, // first hit at max_len kept
+    LastLongest,  // last hit at max_len kept (likely oldest in chain)
 }
 
 fn hash16(a: u8, b: u8) -> usize {
@@ -748,7 +1023,9 @@ fn compress_okumura_chain_impl(input: &[u8], max_chain: usize, tie: ChainTie) ->
                         } else {
                             input[s + l - dist]
                         };
-                        if rb != input[s + l] { break; }
+                        if rb != input[s + l] {
+                            break;
+                        }
                         l += 1;
                     }
                     if l >= 3 {
@@ -758,8 +1035,8 @@ fn compress_okumura_chain_impl(input: &[u8], max_chain: usize, tie: ChainTie) ->
                             best_dist = dist as i32;
                         } else if l == best_len {
                             let take = match tie {
-                                ChainTie::FirstLongest => false,  // keep first (already set)
-                                ChainTie::LastLongest => true,    // overwrite with later
+                                ChainTie::FirstLongest => false, // keep first (already set)
+                                ChainTie::LastLongest => true,   // overwrite with later
                             };
                             if take {
                                 best_pos = pos;
@@ -790,7 +1067,10 @@ fn compress_okumura_chain_impl(input: &[u8], max_chain: usize, tie: ChainTie) ->
             r = (r + 1) & mask;
             s += 1;
         } else {
-            out.push(Token::Match { pos: (best_pos as u16) & ((N as u16) - 1), len: best_len as u8 });
+            out.push(Token::Match {
+                pos: (best_pos as u16) & ((N as u16) - 1),
+                len: best_len as u8,
+            });
             for k in 0..best_len {
                 let b = input[s + k];
                 ring[r] = b;
@@ -806,15 +1086,33 @@ fn compress_okumura_chain_impl(input: &[u8], max_chain: usize, tie: ChainTie) ->
     out
 }
 
-pub fn compress_okumura_chain4_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 4, ChainTie::LastLongest) }
-pub fn compress_okumura_chain8_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 8, ChainTie::LastLongest) }
-pub fn compress_okumura_chain16_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 16, ChainTie::LastLongest) }
-pub fn compress_okumura_chain32_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 32, ChainTie::LastLongest) }
-pub fn compress_okumura_chain64_max(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 64, ChainTie::LastLongest) }
-pub fn compress_okumura_chain4_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 4, ChainTie::FirstLongest) }
-pub fn compress_okumura_chain8_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 8, ChainTie::FirstLongest) }
-pub fn compress_okumura_chain16_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 16, ChainTie::FirstLongest) }
-pub fn compress_okumura_chain32_first(input: &[u8]) -> Vec<Token> { compress_okumura_chain_impl(input, 32, ChainTie::FirstLongest) }
+pub fn compress_okumura_chain4_max(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 4, ChainTie::LastLongest)
+}
+pub fn compress_okumura_chain8_max(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 8, ChainTie::LastLongest)
+}
+pub fn compress_okumura_chain16_max(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 16, ChainTie::LastLongest)
+}
+pub fn compress_okumura_chain32_max(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 32, ChainTie::LastLongest)
+}
+pub fn compress_okumura_chain64_max(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 64, ChainTie::LastLongest)
+}
+pub fn compress_okumura_chain4_first(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 4, ChainTie::FirstLongest)
+}
+pub fn compress_okumura_chain8_first(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 8, ChainTie::FirstLongest)
+}
+pub fn compress_okumura_chain16_first(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 16, ChainTie::FirstLongest)
+}
+pub fn compress_okumura_chain32_first(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_impl(input, 32, ChainTie::FirstLongest)
+}
 
 /// 3-byte hash chain (uses input[s], input[s+1], input[s+2] for 24-bit key).
 fn hash24(a: u8, b: u8, c: u8) -> usize {
@@ -841,7 +1139,7 @@ fn compress_okumura_chain3_impl(input: &[u8], max_chain: usize, tie: ChainTie) -
         let mut best_pos: usize = 0;
 
         if max_len_by_input >= 3 && s + 2 < input.len() {
-            let h = hash24(input[s], input[s+1], input[s+2]);
+            let h = hash24(input[s], input[s + 1], input[s + 2]);
             let mut p = head[h];
             let mut walked = 0usize;
             while p != nil_pos && walked < max_chain {
@@ -855,12 +1153,18 @@ fn compress_okumura_chain3_impl(input: &[u8], max_chain: usize, tie: ChainTie) -
                         } else {
                             input[s + l - dist]
                         };
-                        if rb != input[s + l] { break; }
+                        if rb != input[s + l] {
+                            break;
+                        }
                         l += 1;
                     }
                     if l >= 3 {
-                        if l > best_len { best_len = l; best_pos = pos; }
-                        else if l == best_len && tie == ChainTie::LastLongest { best_pos = pos; }
+                        if l > best_len {
+                            best_len = l;
+                            best_pos = pos;
+                        } else if l == best_len && tie == ChainTie::LastLongest {
+                            best_pos = pos;
+                        }
                     }
                 }
                 p = prev_pos[pos];
@@ -873,7 +1177,11 @@ fn compress_okumura_chain3_impl(input: &[u8], max_chain: usize, tie: ChainTie) -
             ring[r] = b;
             if (r + N - 2) < N + N {
                 let p_to_insert = (r + N - 2) & mask;
-                let h = hash24(ring[p_to_insert], ring[(p_to_insert + 1) & mask], ring[(p_to_insert + 2) & mask]);
+                let h = hash24(
+                    ring[p_to_insert],
+                    ring[(p_to_insert + 1) & mask],
+                    ring[(p_to_insert + 2) & mask],
+                );
                 prev_pos[p_to_insert] = head[h];
                 head[h] = p_to_insert as u16;
             }
@@ -881,12 +1189,19 @@ fn compress_okumura_chain3_impl(input: &[u8], max_chain: usize, tie: ChainTie) -
             r = (r + 1) & mask;
             s += 1;
         } else {
-            out.push(Token::Match { pos: (best_pos as u16) & ((N as u16) - 1), len: best_len as u8 });
+            out.push(Token::Match {
+                pos: (best_pos as u16) & ((N as u16) - 1),
+                len: best_len as u8,
+            });
             for k in 0..best_len {
                 let b = input[s + k];
                 ring[r] = b;
                 let p_to_insert = (r + N - 2) & mask;
-                let h = hash24(ring[p_to_insert], ring[(p_to_insert + 1) & mask], ring[(p_to_insert + 2) & mask]);
+                let h = hash24(
+                    ring[p_to_insert],
+                    ring[(p_to_insert + 1) & mask],
+                    ring[(p_to_insert + 2) & mask],
+                );
                 prev_pos[p_to_insert] = head[h];
                 head[h] = p_to_insert as u16;
                 r = (r + 1) & mask;
@@ -897,9 +1212,15 @@ fn compress_okumura_chain3_impl(input: &[u8], max_chain: usize, tie: ChainTie) -
     out
 }
 
-pub fn compress_okumura_chain3_8(input: &[u8]) -> Vec<Token> { compress_okumura_chain3_impl(input, 8, ChainTie::LastLongest) }
-pub fn compress_okumura_chain3_32(input: &[u8]) -> Vec<Token> { compress_okumura_chain3_impl(input, 32, ChainTie::LastLongest) }
-pub fn compress_okumura_chain3_first8(input: &[u8]) -> Vec<Token> { compress_okumura_chain3_impl(input, 8, ChainTie::FirstLongest) }
+pub fn compress_okumura_chain3_8(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain3_impl(input, 8, ChainTie::LastLongest)
+}
+pub fn compress_okumura_chain3_32(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain3_impl(input, 32, ChainTie::LastLongest)
+}
+pub fn compress_okumura_chain3_first8(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain3_impl(input, 8, ChainTie::FirstLongest)
+}
 
 /// Reverse-order chain: head points to OLDEST entry, next points to NEWER. Walk
 /// from head goes oldest → newer. With FirstLongest tie, picks oldest first.
@@ -913,7 +1234,7 @@ fn compress_okumura_chain_rev_impl(input: &[u8], max_chain: usize) -> Vec<Token>
     let nil_pos: u16 = 0xffff;
     let n_buckets = 65536;
     let mut head: Vec<u16> = vec![nil_pos; n_buckets];
-    let mut tail_v: Vec<u16> = vec![nil_pos; n_buckets];  // most-recent pos per bucket
+    let mut tail_v: Vec<u16> = vec![nil_pos; n_buckets]; // most-recent pos per bucket
     let mut next_pos: Vec<u16> = vec![nil_pos; N];
 
     while s < input.len() {
@@ -938,7 +1259,9 @@ fn compress_okumura_chain_rev_impl(input: &[u8], max_chain: usize) -> Vec<Token>
                         } else {
                             input[s + l - dist]
                         };
-                        if rb != input[s + l] { break; }
+                        if rb != input[s + l] {
+                            break;
+                        }
                         l += 1;
                     }
                     if l >= 3 && l > best_len {
@@ -951,11 +1274,19 @@ fn compress_okumura_chain_rev_impl(input: &[u8], max_chain: usize) -> Vec<Token>
             }
         }
 
-        let insert = |head: &mut Vec<u16>, tail: &mut Vec<u16>, next: &mut Vec<u16>, ring: &[u8; N], p: usize| {
+        let insert = |head: &mut Vec<u16>,
+                      tail: &mut Vec<u16>,
+                      next: &mut Vec<u16>,
+                      ring: &[u8; N],
+                      p: usize| {
             let h = hash16(ring[p], ring[(p + 1) & 0x0fff]);
             // Append to end of chain
             let t = tail[h];
-            if t == nil_pos { head[h] = p as u16; } else { next[t as usize] = p as u16; }
+            if t == nil_pos {
+                head[h] = p as u16;
+            } else {
+                next[t as usize] = p as u16;
+            }
             next[p] = nil_pos;
             tail[h] = p as u16;
         };
@@ -969,7 +1300,10 @@ fn compress_okumura_chain_rev_impl(input: &[u8], max_chain: usize) -> Vec<Token>
             r = (r + 1) & mask;
             s += 1;
         } else {
-            out.push(Token::Match { pos: (best_pos as u16) & ((N as u16) - 1), len: best_len as u8 });
+            out.push(Token::Match {
+                pos: (best_pos as u16) & ((N as u16) - 1),
+                len: best_len as u8,
+            });
             for k in 0..best_len {
                 let b = input[s + k];
                 ring[r] = b;
@@ -984,8 +1318,12 @@ fn compress_okumura_chain_rev_impl(input: &[u8], max_chain: usize) -> Vec<Token>
     out
 }
 
-pub fn compress_okumura_chain_rev8(input: &[u8]) -> Vec<Token> { compress_okumura_chain_rev_impl(input, 8) }
-pub fn compress_okumura_chain_rev32(input: &[u8]) -> Vec<Token> { compress_okumura_chain_rev_impl(input, 32) }
+pub fn compress_okumura_chain_rev8(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_rev_impl(input, 8)
+}
+pub fn compress_okumura_chain_rev32(input: &[u8]) -> Vec<Token> {
+    compress_okumura_chain_rev_impl(input, 32)
+}
 
 /// basic_tail1 with parameterized initial fill byte.
 /// 仮説: leaf encoder が 0x20 以外の fill 値で ring を初期化していた可能性。
@@ -1007,8 +1345,12 @@ fn compress_okumura_basic_tail1_fill_impl(input: &[u8], fill: u8) -> Vec<Token> 
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
-    for i in 1..=F { st.insert_node(r - i as i32); }
+    if len == 0 {
+        return out;
+    }
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
     st.insert_node(r);
     loop {
         let mp = (st.match_position & (N as i32 - 1)) as usize;
@@ -1016,12 +1358,17 @@ fn compress_okumura_basic_tail1_fill_impl(input: &[u8], fill: u8) -> Vec<Token> 
         let is_rle = mp == r_minus_1;
         let len_before = len;
         let cap = if is_rle { (len + 1).min(F) } else { len };
-        if st.match_length as usize > cap { st.match_length = cap as i32; }
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
         if (st.match_length as usize) <= THRESHOLD {
             st.match_length = 1;
             out.push(Token::Literal(st.text_buf[r as usize]));
         } else {
-            out.push(Token::Match { pos: (st.match_position as u16) & ((N as u16) - 1), len: st.match_length as u8 });
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
         }
         let last_match_length = st.match_length as usize;
         let mut i = 0usize;
@@ -1030,7 +1377,9 @@ fn compress_okumura_basic_tail1_fill_impl(input: &[u8], fill: u8) -> Vec<Token> 
             let c = input[input_idx];
             input_idx += 1;
             st.text_buf[s as usize] = c;
-            if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             st.insert_node(r);
@@ -1041,17 +1390,27 @@ fn compress_okumura_basic_tail1_fill_impl(input: &[u8], fill: u8) -> Vec<Token> 
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             len = len.saturating_sub(1);
-            if len > 0 { st.insert_node(r); }
+            if len > 0 {
+                st.insert_node(r);
+            }
             i += 1;
         }
-        if input_idx >= input.len() && last_match_length > len_before { len = 0; }
-        if len == 0 { break; }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
 
-pub fn compress_okumura_basic_tail1_fill00(input: &[u8]) -> Vec<Token> { compress_okumura_basic_tail1_fill_impl(input, 0x00) }
-pub fn compress_okumura_basic_tail1_fillff(input: &[u8]) -> Vec<Token> { compress_okumura_basic_tail1_fill_impl(input, 0xff) }
+pub fn compress_okumura_basic_tail1_fill00(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_tail1_fill_impl(input, 0x00)
+}
+pub fn compress_okumura_basic_tail1_fillff(input: &[u8]) -> Vec<Token> {
+    compress_okumura_basic_tail1_fill_impl(input, 0xff)
+}
 
 /// 基本奥村 + 書き込み済み bitmap フィルタ。
 /// match の pos が初期 0x20 fill 領域 (= 未書込み) なら Literal に格下げ。
@@ -1074,7 +1433,9 @@ pub fn compress_okumura_basic_no_init(input: &[u8]) -> Vec<Token> {
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
+    if len == 0 {
+        return out;
+    }
 
     // 書込み済み bitmap (true = 実データが書かれた位置)
     let mut written = [false; N];
@@ -1142,7 +1503,9 @@ pub fn compress_okumura_basic_no_init(input: &[u8]) -> Vec<Token> {
             }
             i += 1;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -2432,7 +2795,9 @@ pub fn compress_okumura_basic_tail1(input: &[u8]) -> Vec<Token> {
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
+    if len == 0 {
+        return out;
+    }
 
     // 奥村原典: F-1 個の dummy (text_buf 全部 0x20 で位置 r-1..r-F に dummy node) + 本挿入
     for i in 1..=F {
@@ -2486,7 +2851,9 @@ pub fn compress_okumura_basic_tail1(input: &[u8]) -> Vec<Token> {
         if input_idx >= input.len() && last_match_length > len_before {
             len = 0;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -2510,7 +2877,9 @@ pub fn compress_okumura_basic_tail1_full(input: &[u8]) -> Vec<Token> {
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
+    if len == 0 {
+        return out;
+    }
 
     for i in 1..=F {
         st.insert_node(r - i as i32);
@@ -2552,13 +2921,17 @@ pub fn compress_okumura_basic_tail1_full(input: &[u8]) -> Vec<Token> {
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             len = len.saturating_sub(1);
-            if len > 0 { st.insert_node(r); }
+            if len > 0 {
+                st.insert_node(r);
+            }
             i += 1;
         }
         if input_idx >= input.len() && last_match_length > len_before {
             len = 0;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -2580,7 +2953,9 @@ pub fn compress_okumura_no_dummy_tail1_full(input: &[u8]) -> Vec<Token> {
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
+    if len == 0 {
+        return out;
+    }
     st.insert_node(r);
 
     loop {
@@ -2618,13 +2993,17 @@ pub fn compress_okumura_no_dummy_tail1_full(input: &[u8]) -> Vec<Token> {
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             len = len.saturating_sub(1);
-            if len > 0 { st.insert_node(r); }
+            if len > 0 {
+                st.insert_node(r);
+            }
             i += 1;
         }
         if input_idx >= input.len() && last_match_length > len_before {
             len = 0;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -2646,7 +3025,9 @@ pub fn compress_okumura_dummy_then_drop_tail1(input: &[u8]) -> Vec<Token> {
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
+    if len == 0 {
+        return out;
+    }
 
     let mut dummy_positions: Vec<i32> = Vec::with_capacity(F);
     for i in 1..=F {
@@ -2695,20 +3076,26 @@ pub fn compress_okumura_dummy_then_drop_tail1(input: &[u8]) -> Vec<Token> {
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             len = len.saturating_sub(1);
-            if len > 0 { st.insert_node(r); }
+            if len > 0 {
+                st.insert_node(r);
+            }
             i += 1;
         }
         if !first_token_done {
             first_token_done = true;
             for p in dummy_positions.iter().copied() {
-                if p == r { continue; }
+                if p == r {
+                    continue;
+                }
                 st.delete_node(p);
             }
         }
         if input_idx >= input.len() && last_match_length > len_before {
             len = 0;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -2839,7 +3226,9 @@ fn compress_okumura_no_dummy_tail1_with_tie(input: &[u8], tie_mode: TieMode) -> 
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
+    if len == 0 {
+        return out;
+    }
     st.insert_node(r);
 
     loop {
@@ -2880,13 +3269,17 @@ fn compress_okumura_no_dummy_tail1_with_tie(input: &[u8], tie_mode: TieMode) -> 
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             len = len.saturating_sub(1);
-            if len > 0 { st.insert_node(r); }
+            if len > 0 {
+                st.insert_node(r);
+            }
             i += 1;
         }
         if input_idx >= input.len() && last_match_length > len_before {
             len = 0;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -3165,7 +3558,11 @@ fn compress_okumura_no_dummy_len_split_exh_tail1(input: &[u8], split: u32) -> Ve
                 if d == 0 {
                     continue;
                 }
-                let take_dist = if want_min { d < best_dist } else { d > best_dist };
+                let take_dist = if want_min {
+                    d < best_dist
+                } else {
+                    d > best_dist
+                };
                 if !take_dist {
                     continue;
                 }
@@ -3561,9 +3958,17 @@ fn compress_okumura_basic_len_split_exh_tail1(input: &[u8], split: u32) -> Vec<T
             let cur_dist = (r - st.match_position) & mask;
             let mut best_pos = st.match_position;
             let mut best_dist = if want_min {
-                if cur_dist > 0 { cur_dist } else { N as i32 }
+                if cur_dist > 0 {
+                    cur_dist
+                } else {
+                    N as i32
+                }
             } else {
-                if cur_dist > 0 { cur_dist } else { 0 }
+                if cur_dist > 0 {
+                    cur_dist
+                } else {
+                    0
+                }
             };
             for cand_pos in 0..(N as i32) {
                 if cand_pos == r {
@@ -3573,7 +3978,11 @@ fn compress_okumura_basic_len_split_exh_tail1(input: &[u8], split: u32) -> Vec<T
                 if d == 0 {
                     continue;
                 }
-                let take = if want_min { d < best_dist } else { d > best_dist };
+                let take = if want_min {
+                    d < best_dist
+                } else {
+                    d > best_dist
+                };
                 if !take {
                     continue;
                 }
@@ -4184,13 +4593,19 @@ fn lazy_impl_with_bst_tie(
         input_idx += 1;
         len += 1;
     }
-    if len == 0 { return out; }
+    if len == 0 {
+        return out;
+    }
     if !no_dummy {
-        for i in 1..=F { st.insert_node(r - i as i32); }
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
     }
     st.insert_node(r);
     loop {
-        if st.match_length as usize > len { st.match_length = len as i32; }
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
         let pos1 = st.match_position;
         let len1 = st.match_length as usize;
         let mut take_lazy = false;
@@ -4201,7 +4616,9 @@ fn lazy_impl_with_bst_tie(
                 let c = input[input_idx];
                 input_idx += 1;
                 st.text_buf[s as usize] = c;
-                if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+                if (s as usize) < F - 1 {
+                    st.text_buf[s as usize + N] = c;
+                }
                 s = (s + 1) & (N as i32 - 1);
                 r = (r + 1) & (N as i32 - 1);
                 st.insert_node(r);
@@ -4210,16 +4627,25 @@ fn lazy_impl_with_bst_tie(
                 s = (s + 1) & (N as i32 - 1);
                 r = (r + 1) & (N as i32 - 1);
                 len -= 1;
-                if len > 0 { st.insert_node(r); } else { st.match_length = 0; }
+                if len > 0 {
+                    st.insert_node(r);
+                } else {
+                    st.match_length = 0;
+                }
             }
-            if st.match_length as usize > len { st.match_length = len as i32; }
+            if st.match_length as usize > len {
+                st.match_length = len as i32;
+            }
             let len2 = st.match_length as usize;
             let lazy_cond = if allow_eq { len2 >= len1 } else { len2 > len1 };
             if lazy_cond {
                 out.push(Token::Literal(saved_byte_at_r));
                 take_lazy = true;
             } else {
-                out.push(Token::Match { pos: (pos1 as u16) & ((N as u16) - 1), len: len1 as u8 });
+                out.push(Token::Match {
+                    pos: (pos1 as u16) & ((N as u16) - 1),
+                    len: len1 as u8,
+                });
                 let last_match_length = len1;
                 let mut i = 1usize;
                 while i < last_match_length && input_idx < input.len() {
@@ -4227,7 +4653,9 @@ fn lazy_impl_with_bst_tie(
                     let c = input[input_idx];
                     input_idx += 1;
                     st.text_buf[s as usize] = c;
-                    if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+                    if (s as usize) < F - 1 {
+                        st.text_buf[s as usize + N] = c;
+                    }
                     s = (s + 1) & (N as i32 - 1);
                     r = (r + 1) & (N as i32 - 1);
                     st.insert_node(r);
@@ -4238,19 +4666,31 @@ fn lazy_impl_with_bst_tie(
                     s = (s + 1) & (N as i32 - 1);
                     r = (r + 1) & (N as i32 - 1);
                     len -= 1;
-                    if len > 0 { st.insert_node(r); }
+                    if len > 0 {
+                        st.insert_node(r);
+                    }
                     i += 1;
                 }
-                if len == 0 { break; }
+                if len == 0 {
+                    break;
+                }
                 continue;
             }
         }
-        if take_lazy { if len == 0 { break; } continue; }
+        if take_lazy {
+            if len == 0 {
+                break;
+            }
+            continue;
+        }
         if (st.match_length as usize) <= THRESHOLD {
             st.match_length = 1;
             out.push(Token::Literal(st.text_buf[r as usize]));
         } else {
-            out.push(Token::Match { pos: (st.match_position as u16) & ((N as u16) - 1), len: st.match_length as u8 });
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
         }
         let last_match_length = st.match_length as usize;
         let mut i = 0usize;
@@ -4259,7 +4699,9 @@ fn lazy_impl_with_bst_tie(
             let c = input[input_idx];
             input_idx += 1;
             st.text_buf[s as usize] = c;
-            if (s as usize) < F - 1 { st.text_buf[s as usize + N] = c; }
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             st.insert_node(r);
@@ -4270,10 +4712,14 @@ fn lazy_impl_with_bst_tie(
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             len -= 1;
-            if len > 0 { st.insert_node(r); }
+            if len > 0 {
+                st.insert_node(r);
+            }
             i += 1;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -4384,12 +4830,16 @@ fn lazy_impl_with_bst(
                     }
                     i += 1;
                 }
-                if len == 0 { break; }
+                if len == 0 {
+                    break;
+                }
                 continue;
             }
         }
         if take_lazy {
-            if len == 0 { break; }
+            if len == 0 {
+                break;
+            }
             continue;
         }
         if (st.match_length as usize) <= THRESHOLD {
@@ -4426,7 +4876,9 @@ fn lazy_impl_with_bst(
             }
             i += 1;
         }
-        if len == 0 { break; }
+        if len == 0 {
+            break;
+        }
     }
     out
 }
@@ -4453,7 +4905,15 @@ pub fn compress_okumura_no_dummy_left_first_eq(input: &[u8]) -> Vec<Token> {
         return out;
     }
     st.insert_node(r);
-    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    encode_loop(
+        &mut st,
+        &mut out,
+        &mut r,
+        &mut s,
+        &mut input_idx,
+        &mut len,
+        input,
+    );
     out
 }
 
@@ -4477,7 +4937,15 @@ pub fn compress_okumura_no_dummy_eq(input: &[u8]) -> Vec<Token> {
         return out;
     }
     st.insert_node(r);
-    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    encode_loop(
+        &mut st,
+        &mut out,
+        &mut r,
+        &mut s,
+        &mut input_idx,
+        &mut len,
+        input,
+    );
     out
 }
 
@@ -4501,7 +4969,15 @@ pub fn compress_okumura_no_dummy_distance_tie(input: &[u8]) -> Vec<Token> {
         return out;
     }
     st.insert_node(r);
-    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    encode_loop(
+        &mut st,
+        &mut out,
+        &mut r,
+        &mut s,
+        &mut input_idx,
+        &mut len,
+        input,
+    );
     out
 }
 
@@ -4778,7 +5254,15 @@ pub fn compress_okumura_dummy_no_swap(input: &[u8]) -> Vec<Token> {
     }
     st.insert_node(r);
 
-    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    encode_loop(
+        &mut st,
+        &mut out,
+        &mut r,
+        &mut s,
+        &mut input_idx,
+        &mut len,
+        input,
+    );
     out
 }
 
@@ -4807,7 +5291,15 @@ fn compress_okumura_no_dummy_with_bst(input: &[u8], bst_mode: BstMode) -> Vec<To
 
     st.insert_node(r);
 
-    encode_loop(&mut st, &mut out, &mut r, &mut s, &mut input_idx, &mut len, input);
+    encode_loop(
+        &mut st,
+        &mut out,
+        &mut r,
+        &mut s,
+        &mut input_idx,
+        &mut len,
+        input,
+    );
     out
 }
 
@@ -5029,7 +5521,10 @@ mod tests {
                 assert_eq!(*pos, 4078, "first match pos pinned to奥村原典実装の出力");
                 assert_eq!(*len, F as u8, "first match len pinned to F=18");
             }
-            other => panic!("token 26 expected Match {{ pos=4078, len=18 }}, got {:?}", other),
+            other => panic!(
+                "token 26 expected Match {{ pos=4078, len=18 }}, got {:?}",
+                other
+            ),
         }
     }
 
@@ -5061,7 +5556,10 @@ mod tests {
         let input: Vec<u8> = (0..200u32).map(|i| b'A' + (i % 26) as u8).collect();
         let toks = compress_okumura_lazy(&input);
         let decoded = decode_oku_tokens(&toks);
-        assert_eq!(decoded, input, "lazy round-trip on ABC..Z*8 must reproduce input");
+        assert_eq!(
+            decoded, input,
+            "lazy round-trip on ABC..Z*8 must reproduce input"
+        );
     }
 
     #[test]
@@ -5165,6 +5663,113 @@ mod tests {
         let toks = compress_okumura_no_dummy_left_first(&input);
         let decoded = decode_oku_tokens(&toks);
         assert_eq!(decoded, input);
+    }
+
+    /// Issue #14 v12: OkumuraSim の自己検証。
+    ///
+    /// 合成データを LF2 トークン化（compress_okumura の出力を teacher に流用。
+    /// decode すると元入力に戻るので teacher forcing の入力として妥当）し、
+    /// 4 モードの OkumuraSim について:
+    /// - search_trace が返す pos 集合 ⊆ enumerate_match_candidates_with_writeback
+    ///   の max_len 候補集合
+    /// - 全 token で sim.r == ring ループの r
+    /// - advance 後も BST の親子リンク整合が保たれる
+    #[test]
+    fn okumura_sim_trace_subset_and_tree_consistency() {
+        use crate::formats::toheart::lf2_tokens::enumerate_match_candidates_with_writeback;
+        use std::collections::HashSet;
+
+        // 低エントロピー合成入力: 小さいアルファベット + 周期性で tie を多発させる
+        let mut input: Vec<u8> = Vec::new();
+        let mut lcg: u32 = 0x1234_5678;
+        for i in 0..600usize {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = match i % 7 {
+                0..=3 => (i % 4) as u8 + 0x10,          // 周期パターン
+                _ => ((lcg >> 24) & 0x03) as u8 + 0x10, // 4 値ノイズ
+            };
+            input.push(b);
+        }
+
+        let teacher = compress_okumura(&input);
+        // teacher が入力を正しく復元することを前提確認
+        assert_eq!(decode_oku_tokens(&teacher), input);
+
+        let mut sims = [
+            OkumuraSim::new(SimMode::Basic, &input),
+            OkumuraSim::new(SimMode::NoDummy, &input),
+            OkumuraSim::new(SimMode::DummyThenDrop, &input),
+            OkumuraSim::new(SimMode::LeftFirst, &input),
+        ];
+
+        let mut ring = [0x20u8; N];
+        let mut r_ring: usize = N - F;
+        let mut input_pos: usize = 0;
+        let mut trace_hits = 0usize;
+
+        for tok in &teacher {
+            let l = match tok {
+                Token::Literal(_) => 1usize,
+                Token::Match { len, .. } => *len as usize,
+            };
+
+            let candidates =
+                enumerate_match_candidates_with_writeback(&ring, &input, input_pos, r_ring);
+            let max_len = candidates.iter().map(|c| c.len).max().unwrap_or(0);
+            if max_len >= 3 {
+                let cand_pos: HashSet<u16> = candidates
+                    .iter()
+                    .filter(|c| c.len == max_len)
+                    .map(|c| c.pos)
+                    .collect();
+                for sim in &sims {
+                    let mut seen_rank = 0u32;
+                    for (pos, rank, depth) in sim.search_trace(sim.r, max_len) {
+                        assert!(
+                            cand_pos.contains(&pos),
+                            "trace pos 0x{:03x} not in enumerate max_len candidates \
+                             (mode {:?}, input_pos {}, max_len {})",
+                            pos,
+                            sim.mode,
+                            input_pos,
+                            max_len
+                        );
+                        assert_eq!(rank, seen_rank + 1, "rank must be 1-based sequential");
+                        seen_rank = rank;
+                        assert!(depth >= 1);
+                        trace_hits += 1;
+                    }
+                }
+            }
+
+            let end = (input_pos + l).min(input.len());
+            let emitted = &input[input_pos..end];
+            for sim in &mut sims {
+                sim.advance(emitted);
+            }
+            for &b in emitted {
+                ring[r_ring] = b;
+                r_ring = (r_ring + 1) & (N - 1);
+            }
+            input_pos = end;
+
+            for sim in &sims {
+                assert_eq!(
+                    sim.r as usize, r_ring,
+                    "sim.r desync (mode {:?}, input_pos {})",
+                    sim.mode, input_pos
+                );
+                assert!(
+                    sim.tree_is_consistent(),
+                    "BST inconsistent after advance (mode {:?}, input_pos {})",
+                    sim.mode,
+                    input_pos
+                );
+            }
+        }
+        assert_eq!(input_pos, input.len());
+        // trace が一度も候補を返さないならテストとして無意味なので下限を張る
+        assert!(trace_hits > 0, "no trace hits: synthetic input too random");
     }
 
     /// 奥村 token 列を decode してバイト列に戻す簡易デコーダ（テスト専用）。
