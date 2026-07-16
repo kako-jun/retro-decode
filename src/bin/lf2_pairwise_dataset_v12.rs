@@ -196,10 +196,8 @@ fn process_file(
                     };
                     let cand_ow_start = write_count[pos_start];
                     let cand_ow_end = write_count[pos_end];
-                    let cand_dist_mod_w =
-                        (dist as u32).checked_rem(img_w_u as u32).unwrap_or(0);
-                    let cand_dist_div_w =
-                        (dist as u32).checked_div(img_w_u as u32).unwrap_or(0);
+                    let cand_dist_mod_w = (dist as u32).checked_rem(img_w_u as u32).unwrap_or(0);
+                    let cand_dist_div_w = (dist as u32).checked_div(img_w_u as u32).unwrap_or(0);
 
                     // v12: 4 モードの rank/depth
                     let (bst_rank_basic, bst_depth_basic) = trace_lookup(&traces[0], c.pos);
