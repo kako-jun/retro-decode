@@ -132,16 +132,8 @@ fn process_file(
             } else {
                 tie_tokens += 1;
                 let img_w_u = meta.width as usize;
-                let col_pos = if img_w_u > 0 {
-                    (input_pos % img_w_u) as u32
-                } else {
-                    0
-                };
-                let row_pos = if img_w_u > 0 {
-                    (input_pos / img_w_u) as u32
-                } else {
-                    0
-                };
+                let col_pos = input_pos.checked_rem(img_w_u).unwrap_or(0) as u32;
+                let row_pos = input_pos.checked_div(img_w_u).unwrap_or(0) as u32;
                 let in_b = input.get(input_pos).copied().unwrap_or(0);
                 let in_b1 = input.get(input_pos + 1).copied().unwrap_or(0);
                 let in_b2 = input.get(input_pos + 2).copied().unwrap_or(0);
@@ -156,7 +148,9 @@ fn process_file(
                     .copied()
                     .unwrap_or(0);
 
-                // v12: tie token 直前の BST read-only トレース (4 モード)
+                // v12: tie token 直前の BST read-only トレース (4 モード)。
+                // 注: max_len == F の tie は insert_node が full-F 一致ノードを r で
+                // 置換済みのため rank が構造的に 0 に縮退する (集計時は F 群を分離)。
                 let traces: [Vec<(u16, u32, u8)>; 4] = [
                     sims[0].search_trace(sims[0].r, max_len),
                     sims[1].search_trace(sims[1].r, max_len),
@@ -202,16 +196,10 @@ fn process_file(
                     };
                     let cand_ow_start = write_count[pos_start];
                     let cand_ow_end = write_count[pos_end];
-                    let cand_dist_mod_w = if img_w_u > 0 {
-                        (dist as u32) % (img_w_u as u32)
-                    } else {
-                        0
-                    };
-                    let cand_dist_div_w = if img_w_u > 0 {
-                        (dist as u32) / (img_w_u as u32)
-                    } else {
-                        0
-                    };
+                    let cand_dist_mod_w =
+                        (dist as u32).checked_rem(img_w_u as u32).unwrap_or(0);
+                    let cand_dist_div_w =
+                        (dist as u32).checked_div(img_w_u as u32).unwrap_or(0);
 
                     // v12: 4 モードの rank/depth
                     let (bst_rank_basic, bst_depth_basic) = trace_lookup(&traces[0], c.pos);

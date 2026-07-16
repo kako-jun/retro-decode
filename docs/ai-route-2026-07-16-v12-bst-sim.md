@@ -17,7 +17,7 @@ Leaf の実トークン列で奥村 BST を teacher-forcing 進行させるシ�
 | DummyThenDrop | dummy 挿入 → token 0 直後に残存 dummy を全 DeleteNode |
 | LeftFirst | Basic + `BstMode::LeftFirst` (左右反転探索) |
 
-- `search_trace(r, max_len)`: tie token 直前に呼ぶ **read-only** トレース。insert_node と逐語一致の比較経路 (KeyMode::Byte0 root key、index 1 からの cmp 計算、LeftFirst 反転規則) で木を辿り、一致長がちょうど max_len のノードを訪問順に `(pos, rank, depth)` で返す。rank 1 = 原典 insert_node が採用するノード
+- `search_trace(r, max_len)`: tie token 直前に呼ぶ **read-only** トレース。insert_node と逐語一致の比較経路 (KeyMode::Byte0 root key、index 1 からの cmp 計算、LeftFirst 反転規則) で木を辿り、一致長がちょうど max_len のノードを訪問順に `(pos, rank, depth)` で返す。rank 1 = 原典 insert_node が採用するノード。**ただしこれは max_len < F の場合**。max_len == F の tie では、insert_node が full-F 一致ノードを r で置換済みのため trace 時点で元 pos が木に不在となり、rank が構造的に 0 に縮退する。Stage 0/1 の集計では **max_len == F 群を分離して評価する**こと (rank 0 多発を仮説棄却と誤読しない)
 - `advance(emitted_bytes)`: token 確定後、原典 Encode() 後半と同一の回転 (DeleteNode(s) → text_buf 書込 overlap 複製込み → InsertNode(r))。debug ビルドでは emitted bytes と text_buf[r..] の一致も assert
 
 ### lf2_pairwise_dataset_v12 (`src/bin/lf2_pairwise_dataset_v12.rs`)
@@ -39,7 +39,7 @@ cargo run --release --bin lf2_pairwise_dataset_v12 -- <LF2ディレクトリ> <�
 
 ## 検証状況
 
-- 単体テスト緑 (計 15 本、commit `9f75713` + `77ea752`): rank 1 == insert_node 採用ノード (全 4 モード)、Basic の advance が原典 Encode() と全過程で BST 一致、trace の read-only 性・冪等性、境界 (max_len 境界・入力長境界・ring wrap・literal only)・事故パターン (teacher forcing 違反・過長 emitted の debug 検出、DummyThenDrop の dummy 全消滅) など。加えて合成 600 byte の teacher-forcing 全過程で「trace pos 集合 ⊆ enumerate_match_candidates_with_writeback の max_len 候補集合」「全 token で sim.r == ring r」「BST 親子リンク整合・無循環」を assert。lib テスト 32/32 緑
+- 単体テスト緑 (計 15 本、commit `9f75713` + `77ea752`): rank 1 == insert_node 採用ノード (全 4 モード)、Basic の advance が原典 Encode() と全過程で BST 一致、trace の read-only 性・冪等性、境界 (max_len 境界・入力長境界・ring wrap・literal only)・事故パターン (teacher forcing 違反・過長 emitted の debug 検出、DummyThenDrop の dummy 全消滅) など。加えて合成 600 byte の teacher-forcing 全過程で「trace pos 集合 ⊆ enumerate_match_candidates_with_writeback の max_len 候補集合」「全 token で sim.r == ring r」「BST 親子リンク整合・無循環」を assert。okumura モジュール 32/32（lib 全体 46/46）緑
 - debug ビルドで `test_assets/generated` の LF2 3 本を実走: panic なし・全行 61 列・rank/depth に実分布 (rank 17 種、depth 34 種、不在 0/255 も出現)
 - **源 LF2 522 本での本生成と Stage 0 (C1001 での trace 集合 == enumerate max_len 候補のうち木に在るもの assert) は未実施**。物理 SSD 接続待ち
 
