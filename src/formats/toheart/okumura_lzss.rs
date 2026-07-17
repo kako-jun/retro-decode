@@ -734,6 +734,164 @@ impl<'a> OkumuraSim<'a> {
         }
     }
 
+    /// 木全体の read-only 全走査 (Issue #14 Stage 1)。
+    ///
+    /// `search_trace` と独立に、256 root の lson/rson を辿って到達可能な
+    /// 全ノードを列挙し、各ノードについて現在の coding position `r` の
+    /// 先読み key `text_buf[r..r+F]` との一致長 (byte 0 から最初の不一致まで、
+    /// 上限 F) と root からの深さを返す。木は一切 mutate しない。
+    ///
+    /// 返り値: `(pos, match_len, depth)` の Vec。列挙順は root 昇順 ×
+    /// 各 root 内は in-order (左→自分→右)。depth は root 直下の子 = 1。
+    /// Standard 系は rson[root] のみ、LeftFirst は lson[root] も走査する
+    /// (`tree_is_consistent` と同じ規則)。
+    pub fn tree_scan(&self, r: i32) -> Vec<(u16, u8, u8)> {
+        let mut out: Vec<(u16, u8, u8)> = Vec::new();
+        if self.len == 0 {
+            return out;
+        }
+        let key = r as usize;
+        for root in (N + 1)..=(N + 256) {
+            let mut starts: Vec<i32> = Vec::new();
+            if matches!(self.inner.bst_mode, BstMode::LeftFirst) && self.inner.lson[root] != NIL {
+                starts.push(self.inner.lson[root]);
+            }
+            if self.inner.rson[root] != NIL {
+                starts.push(self.inner.rson[root]);
+            }
+            for start in starts {
+                // 反復 in-order。stack には (node, depth) を積む
+                let mut stack: Vec<(i32, u8)> = Vec::new();
+                let mut cur = start;
+                let mut d: u8 = 1;
+                while cur != NIL || !stack.is_empty() {
+                    while cur != NIL {
+                        stack.push((cur, d));
+                        cur = self.inner.lson[cur as usize];
+                        d = d.saturating_add(1);
+                    }
+                    let (node, nd) = stack.pop().unwrap();
+                    let mut ml: u8 = 0;
+                    for j in 0..F {
+                        if self.inner.text_buf[key + j] != self.inner.text_buf[node as usize + j] {
+                            break;
+                        }
+                        ml += 1;
+                    }
+                    out.push((node as u16, ml, nd));
+                    cur = self.inner.rson[node as usize];
+                    d = nd.saturating_add(1);
+                }
+            }
+        }
+        out
+    }
+
+    /// `search_trace` と同一規則で root から NIL まで降りた探索経路を返す
+    /// (Issue #14 Stage 1)。各要素は `(node, went_right)`。先頭要素は
+    /// root インデックス (N+1+byte0) 自身で、`went_right` はそのノードで
+    /// 次にどちらの子へ降りたか。read-only。
+    pub fn search_path(&self, r: i32) -> Vec<(i32, bool)> {
+        let mut path: Vec<(i32, bool)> = Vec::new();
+        if self.len == 0 {
+            return path;
+        }
+        let key_start = r as usize;
+        let root_byte = self.inner.text_buf[key_start];
+        let mut i: i32 = N as i32 + 1 + root_byte as i32;
+        let mut cmp: i32 = match self.inner.bst_mode {
+            BstMode::LeftFirst => -1,
+            _ => 1,
+        };
+        loop {
+            let go_right = match self.inner.bst_mode {
+                BstMode::LeftFirst => cmp > 0,
+                _ => cmp >= 0,
+            };
+            path.push((i, go_right));
+            i = if go_right {
+                self.inner.rson[i as usize]
+            } else {
+                self.inner.lson[i as usize]
+            };
+            if i == NIL {
+                break;
+            }
+            let mut j: usize = 1;
+            cmp = 0;
+            while j < F {
+                let a = self.inner.text_buf[key_start + j] as i32;
+                let b = self.inner.text_buf[i as usize + j] as i32;
+                let d = a - b;
+                if d != 0 {
+                    cmp = d;
+                    break;
+                }
+                j += 1;
+            }
+        }
+        path
+    }
+
+    /// 指定 pos が `search_path(r)` の経路外になった理由を分類する
+    /// (Issue #14 Stage 1)。返り値は `(code, diverge_depth)`:
+    ///
+    /// - 0: 探索経路上にある (rank が付くはずのノード)
+    /// - 1: 木に不在 (dad 連鎖が root に到達しない)
+    /// - 2: 探索 key と root byte が異なる (byte0 不一致)
+    /// - 3: 分岐ノードで探索は左へ、pos は右部分木
+    /// - 4: 分岐ノードで探索は右へ、pos は左部分木
+    ///
+    /// `diverge_depth` は分岐ノードの root からの深さ (root 自身 = 0)。
+    /// code 0/1/2 では 255。
+    pub fn classify_off_path(&self, r: i32, pos: u16) -> (u8, u8) {
+        let p = pos as i32;
+        // dad 連鎖で root まで遡る (root インデックスは N+1..=N+256)
+        let mut chain: Vec<i32> = vec![p];
+        let mut cur = p;
+        let mut steps = 0usize;
+        loop {
+            let d = self.inner.dad[cur as usize];
+            if d == NIL {
+                return (1, 255); // 木に不在
+            }
+            chain.push(d);
+            if d as usize > N {
+                break; // root に到達
+            }
+            cur = d;
+            steps += 1;
+            if steps > N {
+                return (1, 255); // 循環ガード (壊れた木)
+            }
+        }
+        chain.reverse(); // root → ... → pos
+
+        let path = self.search_path(r);
+        if path.is_empty() {
+            return (1, 255);
+        }
+        if path[0].0 != chain[0] {
+            return (2, 255); // root byte 不一致
+        }
+
+        // root から下り、探索経路と祖先連鎖の最深共通ノードを探す
+        let mut k = 0usize;
+        while k + 1 < chain.len() && k < path.len() && path[k].0 == chain[k] {
+            let went_right = path[k].1;
+            let node_right = self.inner.rson[chain[k] as usize] == chain[k + 1];
+            if went_right != node_right {
+                return (if went_right { 4 } else { 3 }, k as u8);
+            }
+            k += 1;
+        }
+        if k + 1 >= chain.len() {
+            return (0, 255); // pos 自身が探索経路上
+        }
+        // ここには来ないはず (共通ノードで必ず分岐が検出される) が、安全側
+        (1, 255)
+    }
+
     /// BST の親子リンク整合を検証する（テスト用）。
     /// dad != NIL の全ノードについて「親の lson か rson が自分を指す」ことと、
     /// 各 root からの到達ノードに循環が無いことを確認する。
@@ -5457,6 +5615,74 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage 1 (Issue #14): tree_scan の基本性質。
+    /// - 列挙 pos に重複がない
+    /// - 列挙集合 == {pos | dad[pos] != NIL} (挿入済みノードが全件列挙される)
+    /// - search_trace の訪問集合 ⊆ tree_scan 集合 (pos / depth / 一致長が整合)
+    /// - classify_off_path: trace 上のノードは code 0、木内ノードは code != 1
+    #[test]
+    fn sim_tree_scan_matches_dad_and_covers_search_trace() {
+        // 反復のある決定的入力 (マッチと tie が発生する)
+        let mut input: Vec<u8> = Vec::new();
+        for k in 0..600usize {
+            input.push(b'A' + (k % 7) as u8);
+            if k % 11 == 0 {
+                input.push(b' ');
+            }
+        }
+
+        for mode in [
+            SimMode::Basic,
+            SimMode::NoDummy,
+            SimMode::DummyThenDrop,
+            SimMode::LeftFirst,
+        ] {
+            let mut sim = OkumuraSim::new(mode, &input);
+            // teacher forcing: 全バイトをリテラル相当で 1 byte ずつ進める
+            let mut idx = 0usize;
+            while idx < input.len() {
+                if idx > 0 && idx % 37 == 0 {
+                    let scan = sim.tree_scan(sim.r);
+
+                    // 重複なし
+                    let mut seen = std::collections::HashSet::new();
+                    for &(pos, _, _) in &scan {
+                        assert!(seen.insert(pos), "duplicate pos {} in tree_scan", pos);
+                    }
+
+                    // dad != NIL の全ノードが列挙される (逆も成り立つ)
+                    let dad_set: std::collections::HashSet<u16> = (0..N)
+                        .filter(|&p| sim.inner.dad[p] != NIL)
+                        .map(|p| p as u16)
+                        .collect();
+                    assert_eq!(seen, dad_set, "tree_scan != dad set (mode {:?})", mode);
+
+                    // search_trace ⊆ tree_scan (max_len を複数試す)
+                    for max_len in [3u8, 4, 18] {
+                        let trace = sim.search_trace(sim.r, max_len);
+                        for &(pos, _rank, depth) in &trace {
+                            let hit = scan.iter().find(|s| s.0 == pos).unwrap_or_else(|| {
+                                panic!("trace pos {} not in tree_scan (mode {:?})", pos, mode)
+                            });
+                            assert_eq!(hit.2, depth, "depth mismatch pos {}", pos);
+                            assert_eq!(hit.1, max_len, "match_len mismatch pos {}", pos);
+                            let (code, _) = sim.classify_off_path(sim.r, pos);
+                            assert_eq!(code, 0, "trace pos {} should be on path", pos);
+                        }
+                    }
+
+                    // 木内ノードは classify で「不在(1)」にならない
+                    for &(pos, _, _) in &scan {
+                        let (code, _) = sim.classify_off_path(sim.r, pos);
+                        assert_ne!(code, 1, "in-tree pos {} classified as absent", pos);
+                    }
+                }
+                sim.advance(&input[idx..idx + 1]);
+                idx += 1;
+            }
+        }
+    }
 
     #[test]
     fn empty_input() {
