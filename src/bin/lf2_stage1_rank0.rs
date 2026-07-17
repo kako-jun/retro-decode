@@ -26,10 +26,9 @@ use std::time::Instant;
 use retro_decode::formats::toheart::lf2_tokens::{
     decompress_to_tokens, enumerate_match_candidates_with_writeback, LeafToken,
 };
-use retro_decode::formats::toheart::okumura_lzss::{OkumuraSim, SimMode};
+use retro_decode::formats::toheart::okumura_lzss::{OkumuraSim, SimMode, F, N};
 
-const N: usize = 4096;
-const F: usize = 18;
+// LF2 framing 定数 (okumura_lzss 側には無い。v12 バイナリと同じローカル定義)
 const LF2_MAGIC: &[u8] = b"LEAF256\0";
 const N_MAX_CAP: usize = 32;
 
@@ -106,7 +105,6 @@ struct GroupStats {
 #[allow(clippy::too_many_arguments)]
 fn process_file(
     label: &str,
-    meta: &FileMeta,
     leaf: &[LeafToken],
     input: &[u8],
     stats: &mut Stats,
@@ -155,8 +153,7 @@ fn process_file(
                         let g = &mut stats.groups[(max_len as usize == F) as usize];
                         g.rank0_events += 1;
                         analyze_rank0(
-                            label, token_idx, meta, &mut sim, leaf_pos, max_len, r, &write_tick,
-                            g, csv,
+                            label, token_idx, &sim, leaf_pos, max_len, r, &write_tick, g, csv,
                         )?;
                     }
                 }
@@ -183,7 +180,6 @@ fn process_file(
             token_idx, input_pos
         );
     }
-    let _ = meta.height;
     Ok(())
 }
 
@@ -191,8 +187,7 @@ fn process_file(
 fn analyze_rank0(
     label: &str,
     token_idx: usize,
-    _meta: &FileMeta,
-    sim: &mut OkumuraSim,
+    sim: &OkumuraSim,
     leaf_pos: u16,
     max_len: u8,
     r: usize,
@@ -229,12 +224,13 @@ fn analyze_rank0(
     let s: Vec<(u16, u8, u8)> = scan.iter().filter(|n| n.1 == max_len).copied().collect();
     let dist_of = |pos: u16| -> u32 { ((r + 0x1000 - pos as usize) & 0x0fff) as u32 };
 
+    let leaf_in_s = s.iter().any(|n| n.0 == leaf_pos);
     let mut flags = (0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8);
     if s.is_empty() {
         stats.s_empty += 1;
     } else {
         stats.s_size_sum += s.len() as u64;
-        if s.iter().any(|n| n.0 == leaf_pos) {
+        if leaf_in_s {
             stats.sel_events += 1;
             let min_pos = s.iter().map(|n| n.0).min().unwrap();
             let max_pos = s.iter().map(|n| n.0).max().unwrap();
@@ -269,9 +265,11 @@ fn analyze_rank0(
     }
 
     if let Some(w) = csv {
+        // 注: is_* フラグは leaf_in_s==1 のときのみ意味を持ち、
+        // 的中率のサマリ集計は s_size>=2 のイベントだけを対象にしている
         writeln!(
             w,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             label,
             token_idx,
             max_len,
@@ -282,6 +280,7 @@ fn analyze_rank0(
             reason,
             diverge_depth,
             s.len(),
+            leaf_in_s as u8,
             flags.0,
             flags.1,
             flags.2,
@@ -289,6 +288,7 @@ fn analyze_rank0(
             flags.4,
             flags.5,
             flags.6,
+            flags.7,
         )?;
     }
     Ok(())
@@ -363,9 +363,11 @@ fn main() -> ExitCode {
         Some(p) => match fs::File::create(p) {
             Ok(f) => {
                 let mut w = BufWriter::new(f);
+                // is_* フラグは leaf_in_s==1 のときのみ有効。
+                // サマリの基準別的中率は s_size>=2 の行だけで集計している
                 if let Err(e) = writeln!(
                     w,
-                    "file,token_idx,max_len,leaf_pos,in_tree,node_match_len,node_depth,reason,diverge_depth,s_size,is_min_pos,is_max_pos,is_inorder_first,is_inorder_last,is_oldest_tick,is_newest_tick,is_min_dist"
+                    "file,token_idx,max_len,leaf_pos,in_tree,node_match_len,node_depth,reason,diverge_depth,s_size,leaf_in_s,is_min_pos,is_max_pos,is_inorder_first,is_inorder_last,is_oldest_tick,is_newest_tick,is_min_dist,is_max_dist"
                 ) {
                     eprintln!("csv write error: {}", e);
                     return ExitCode::from(1);
@@ -415,7 +417,6 @@ fn main() -> ExitCode {
             .to_string();
         match process_file(
             &label,
-            &meta,
             &decoded.tokens,
             &decoded.ring_input,
             &mut stats,

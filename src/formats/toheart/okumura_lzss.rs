@@ -791,7 +791,8 @@ impl<'a> OkumuraSim<'a> {
     /// (Issue #14 Stage 1)。各要素は `(node, went_right)`。先頭要素は
     /// root インデックス (N+1+byte0) 自身で、`went_right` はそのノードで
     /// 次にどちらの子へ降りたか。read-only。
-    pub fn search_path(&self, r: i32) -> Vec<(i32, bool)> {
+    /// (`classify_off_path` の内部用。外部公開の要件が出るまで private)
+    fn search_path(&self, r: i32) -> Vec<(i32, bool)> {
         let mut path: Vec<(i32, bool)> = Vec::new();
         if self.len == 0 {
             return path;
@@ -5837,6 +5838,60 @@ mod tests {
             Token::Match { len, .. } => assert_eq!(len as usize, F),
             Token::Literal(_) => panic!("expected Match"),
         }
+    }
+
+    /// Stage 1 (Issue #14): classify_off_path の code 3/4 の向きを、
+    /// 手組みした既知の小さな木で直接 assert する。
+    ///
+    /// key = "A" + "B"*17。NoDummy の new() 直後は root('A') の右子に
+    /// r=4078 だけが居る。探索は root→右→r で、r 上で key と自分自身の
+    /// 比較 (cmp=0) により Standard 規則で右へ降りる。そこへ:
+    /// - lson[r] = 100      → 探索は右・pos は左部分木 → code 4
+    /// - rson[r] = 200      (text_buf[201]='C' で cmp<0 → 探索は左へ)
+    ///   - rson[200] = 300  → 探索は左・pos は右部分木 → code 3
+    /// - dad==NIL の 500    → code 1 (不在)
+    /// - root('Z') 配下の 600 → code 2 (root byte 不一致)
+    #[test]
+    fn classify_off_path_reports_divergence_direction() {
+        let mut input = vec![b'B'; 20];
+        input[0] = b'A';
+        let mut sim = OkumuraSim::new(SimMode::NoDummy, &input);
+        let r = sim.r; // 4078
+        assert_eq!(r as usize, N - F);
+
+        let st = &mut sim.inner;
+        // 手組み: r の左子 100、右子 200、200 の右子 300
+        st.lson[r as usize] = 100;
+        st.dad[100] = r;
+        st.lson[100] = NIL;
+        st.rson[100] = NIL;
+        st.rson[r as usize] = 200;
+        st.dad[200] = r;
+        st.lson[200] = NIL;
+        st.rson[200] = 300;
+        st.dad[300] = 200;
+        st.lson[300] = NIL;
+        st.rson[300] = NIL;
+        // ノード 200 の内容: byte0='A'、byte1='C' (> key の 'B') → cmp<0 で探索は左へ
+        st.text_buf[200] = b'A';
+        st.text_buf[201] = b'C';
+        // 別 root ('Z') 配下のノード 600
+        let root_z = N + 1 + b'Z' as usize;
+        st.rson[root_z] = 600;
+        st.dad[600] = root_z as i32;
+        st.lson[600] = NIL;
+        st.rson[600] = NIL;
+
+        // 探索経路上 (r 自身)
+        assert_eq!(sim.classify_off_path(r, r as u16), (0, 255));
+        // code 4: 分岐ノード r (depth 1) で探索は右、pos=100 は左部分木
+        assert_eq!(sim.classify_off_path(r, 100), (4, 1));
+        // code 3: 分岐ノード 200 (depth 2) で探索は左、pos=300 は右部分木
+        assert_eq!(sim.classify_off_path(r, 300), (3, 2));
+        // code 1: dad==NIL → 木に不在
+        assert_eq!(sim.classify_off_path(r, 500), (1, 255));
+        // code 2: root byte 不一致 ('Z' 配下)
+        assert_eq!(sim.classify_off_path(r, 600), (2, 255));
     }
 
     #[test]

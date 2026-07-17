@@ -48,3 +48,36 @@ cargo run --release --bin lf2_pairwise_dataset_v12 -- <LF2ディレクトリ> <�
 1. 522 本で v12 dataset 生成 → cross-tie 衝突グループを再集計
 2. **衝突 0**: rank 特徴量が Leaf のタイブレイクを完全決定 → 決定木抽出 → Rust encoder 化
 3. **微減にとどまる**: BST 状態仮説を棄却 → 姉妹ファイル並走ダンプ (シリーズ文脈の直接観測) へ転進
+
+## Stage 1: rank=0 の正体解明 (2026-07-17, Issue #14)
+
+Stage 0 で leaf 採用候補の `bst_rank_basic==0` が 13.23% (527,909 行) 残った。仮説「rank=0 は木に不在ではなく、木に在るが探索経路外」を ground truth で検証するフェーズ。
+
+### 追加 API (`OkumuraSim`, いずれも read-only)
+
+- `tree_scan(r) -> Vec<(pos, match_len, depth)>`: `search_trace` と独立に、256 root の lson/rson を全走査して到達可能な**全ノード**を列挙する ground truth。各ノードについて coding position `r` の先読み key との一致長 (byte 0 から、上限 F) と root からの深さを返す。列挙順は root 昇順 × 各 root 内 in-order (左→自分→右)
+- `search_path(r)` (private): insert_node と同一規則で root→NIL の探索経路を `(node, went_right)` で返す。`classify_off_path` の内部用
+- `classify_off_path(r, pos) -> (code, diverge_depth)`: pos が探索経路外になった理由の分類。0=経路上 / 1=木に不在 / 2=root byte 不一致 / 3=分岐で探索は左・pos は右部分木 / 4=探索は右・pos は左部分木。`diverge_depth` は分岐ノードの深さ (root=0、code 0/1/2 は 255)
+
+### lf2_stage1_rank0 (`src/bin/lf2_stage1_rank0.rs`)
+
+v12 と同じ teacher-forcing (Basic sim のみ) で 522 本を回し、leaf 採用候補が rank0 になる tie token ごとに tree_scan で in-tree 率・一致長・深さ・経路外理由・選択基準 (min/max pos、in-order 端、write tick 最古/最新、min/max dist) の的中率を集計して stdout に出す。**max_len==F 群 (swap-with-r で旧ノードが構造的に木から消える既知縮退) と max_len<F 群を分離して報告する**。
+
+```bash
+# 全 522 本 (release 推奨、v12 と同程度の実行時間想定)
+cargo run --release --bin lf2_stage1_rank0 -- .local_data/lvns3
+
+# 動作確認用: ファイル数制限・per-event CSV 詳細出力
+cargo run --bin lf2_stage1_rank0 -- .local_data/lvns3 --limit 8 --csv /tmp/stage1.csv
+```
+
+CSV 詳細の注意: `is_*` フラグ列は `leaf_in_s==1` の行でのみ意味を持ち、サマリの基準別的中率は **`s_size>=2` (弁別力のあるイベント) だけ**で集計している。
+
+### 判定フローにおける位置づけ
+
+上記「判定フロー」の 2 (衝突 0 → encoder 化) に進む前段。rank=1 (86.66%) はそのまま使えるが、rank=0 の 13.23% は「rank 特徴量が定義できない」領域なので、その正体を
+
+- **max_len==F 縮退** (swap-with-r。tree_scan でも不在) → rank とは別の規則 (置換直前のノードの復元など) が必要
+- **木に在るが経路外** (code 3/4) → 探索経路の拡張 (全走査 rank) で特徴量化できる
+
+の 2 群に切り分け、encoder 化に必要な追加規則を決める。8 本スモークでは rank0 の 98.73% が max_len==F 縮退、残る max_len<F 群は 100% が「木に在り一致長も max_len」で仮説成立だった (本判定は 522 本フルランで行う)。
