@@ -81,3 +81,67 @@ CSV 詳細の注意: `is_*` フラグ列は `leaf_in_s==1` の行でのみ意味
 - **木に在るが経路外** (code 3/4) → 探索経路の拡張 (全走査 rank) で特徴量化できる
 
 の 2 群に切り分け、encoder 化に必要な追加規則を決める。8 本スモークでは rank0 の 98.73% が max_len==F 縮退、残る max_len<F 群は 100% が「木に在り一致長も max_len」で仮説成立だった (本判定は 522 本フルランで行う)。
+
+## Stage 3: 複合規則エンコーダの実装と負結果 (2026-07-17, Issue #14)
+
+Stage 2 で確定した複合タイブレイク規則を自走エンコーダ `compress_okumura_rank1_minage`
+(`src/formats/toheart/okumura_lzss.rs`) として実装し、522 本で byte-exact を実測した。
+
+### 実装
+
+- ベースは Basic (dummy 挿入・StrictGt)。基底 `compress_okumura_impl_hooked` に
+  override フック (`MinAgeFullFHook`) を挿す構造で、hook 無しは従来 impl と同一挙動
+- 出力 Match が `match_length == F` のときのみ、Leaf 実 ring の shadow 状態
+  (ring + write_tick、v12 の `cand_age_start` と同一定義) から full-F 候補を列挙し、
+  min-age (最も新しく書かれた) 候補へ `match_position` を差し替える
+- **適用条件は Stage 2 の検証範囲に限定**: full-F 候補 2..=32 (v12 N_MAX_CAP)・
+  min-age 一意・age != u32::MAX。範囲外 (未書込み 0x20 領域の縮退 tie、
+  full-F 候補が最大 1,277 個・全候補 age=MAX) では insert_node の選択を維持する。
+  無条件適用の初版はこの縮退 tie で Basic の正解を壊すバグがあった (修正済み)
+
+### 結果 (負結果)
+
+| 計測 | 本数 |
+|---|---|
+| rank1_minage byte-exact | **165/522 (31.61%)** |
+| 素の Basic (payload 一致) | 165/522 |
+| 既存 variant union (`lf2_variant_best_fit` 再計測) | 257/522 |
+| union への上積み | **0 本** |
+
+- 一致集合は Basic と**完全同一** (gained 0 / lost 0)。さらに全 522 本の
+  トークン照合 (`--vsbasic`) で **Basic との相違 0 ファイル** — 適用条件下の
+  min-age 選択は常に insert_node の選択と一致した
+- 結論: **規則 1 (full-F min-age) は「Basic の insert_node 選択の記述」であり、
+  Basic を超える修正力を持たない**。Stage 2 の的中率 100.00% は teacher forcing
+  下で Basic 由来の選択を言い当てていただけだった
+
+### first-divergence census (先頭 120 本、修正後)
+
+| 分類 | 本数 | 意味 |
+|---|---|---|
+| TIE_SUBF | 94 | max_len<F tie で rank-1 ≠ Leaf (規則 2 の per-tie 0.27% ミスがファイル単位で複利) |
+| LEAF_NOT_CAND | 17 | Leaf トークンが候補列挙に不在 (tail overrun / hopeless 系。例: C0102 は残 12 バイトで len13) |
+| KIND_DIFF | 7 | Literal vs Match の種別相違 |
+| LEN_DIFF | 1 | 同種 Match の長さ相違 |
+| MATCH | 1 | 完全一致 |
+
+次の攻略先は full-F 規則ではなく、(a) max_len<F tie の残り 0.27% の判別、
+(b) tail overrun / hopeless 系、(c) Literal/Match 種別差。
+「規則違反 0 = 228 本」は teacher forcing 前提の数字で、自走では tie 以外の
+1 発 divergence で届かない構造だった。
+
+### ツール
+
+```bash
+# 522 本 byte-exact 実測 (一致リストは .local_data/stage3_matched.txt)
+cargo run --release --bin lf2_stage3_verify -- .local_data/lvns3 [--limit N] [--out matched.txt]
+
+# 1 ファイルの最初の相違点と候補 age の詳細
+cargo run --release --bin lf2_stage3_debug -- <FILE.LF2>
+
+# first-divergence の分類 census (name,class,diff_idx,input_pos)
+cargo run --release --bin lf2_stage3_debug -- --summary <DIR> [N]
+
+# Basic とのトークン相違数 (override の実効測定)
+cargo run --release --bin lf2_stage3_debug -- --vsbasic <DIR> [N]
+```
