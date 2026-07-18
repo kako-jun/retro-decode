@@ -162,6 +162,14 @@ fn main() -> ExitCode {
         let mut n_accepted_dummy = 0usize;
         let mut accepted_len_set: Vec<usize> = Vec::new();
         let mut accepted_pos_near_init = 0usize; // 初期 r=N-F=4078 近傍 (±20) の件数
+                                                 // write_tick 偽陽性ギャップ: 初期 F バイト先読み充填 (`r..r+F-1` =
+                                                 // 4078..4095、text_buf[r+len]=input[input_idx] で書かれる) は
+                                                 // write_tick を更新しないため、この範囲は実データが書かれていても
+                                                 // 「未書込み」と誤判定される。本ツールで contradiction_found が
+                                                 // 全件 true になるのはこの偽陽性が主因 (該当バイトの pos はほぼ
+                                                 // 4078 以降・0 近辺の wraparound に集中する)。ブートストラップ
+                                                 // ダミーノード帯 [4060,4077] は r=4078 未満でこの偽陽性範囲に
+                                                 // 含まれないため、rej_pos の局在という Stage 10-4 の結論には影響しない。
         let mut contradiction_found = false;
 
         // divergence 点 (di) 時点のスナップショットを保持する

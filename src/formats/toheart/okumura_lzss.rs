@@ -5634,6 +5634,12 @@ pub(crate) enum DummyMode {
     /// ダミーノード帯 (r=N-F=4078 なので 4060..=4077) に collapse する) を
     /// 受けた絞り込み variant 群 (Stage 10-5)。
     ///
+    /// `in_bootstrap_band` / `at_bootstrap_edge` の帯判定はいずれも
+    /// **match の開始位置 (`match_position`) のみ**で行う。窓全体
+    /// (`match_position..match_position+match_length`) が帯とどれだけ
+    /// overlap するかは見ていない (窓の「未書込み」判定自体は別途
+    /// `any_unwritten`/`all_unwritten` で窓全体を見る)。
+    ///
     /// v1: 候補位置がダミーノード帯かつ窓が全域未書込みなら不採用。
     RejectBootstrapUnwritten,
     /// v2: v1 に加えて `match_length > 10` のときのみ不採用にする
@@ -5649,6 +5655,9 @@ pub(crate) enum DummyMode {
 /// N/F は定数なのでこの範囲も定数 (4060..=4077)。
 const BOOTSTRAP_DUMMY_LO: usize = N - F - F; // r - F = 4078 - 18 = 4060
 const BOOTSTRAP_DUMMY_HI: usize = N - F - 1; // r - 1 = 4078 - 1  = 4077
+/// 帯の端2スロット (`r-1`, `r-2` = 4077, 4076): 最も新しく挿入されたダミー
+/// ノード。`DummyMode::RejectBootstrapEdge` (v3) が狙う範囲。
+const BOOTSTRAP_DUMMY_EDGE_LO: usize = N - F - 2; // r - 2 = 4078 - 2 = 4076
 
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
     compress_okumura_impl_hooked(input, tie_mode, None, TailMode::Clip)
@@ -5695,10 +5704,12 @@ fn compress_okumura_impl_hooked_traced(
     st.tie_mode = tie_mode;
     st.init_tree();
 
-    // Stage 10-3: 各リングスロットへの最終書込み input_pos。u32::MAX = 未書込み
-    // (`DummyMode::Allow` の既存呼び出しでは常に確保するが未使用のままで挙動に
-    // 影響しない。安価な固定長配列なのでコストは無視できる)。
-    let mut write_tick: Vec<u32> = vec![u32::MAX; N];
+    // Stage 10-3: 各リングスロットへの最終書込み input_pos。u32::MAX = 未書込み。
+    // `DummyMode::Allow` (既存呼び出し全て) では確保も更新も一切行わない
+    // (レビュー指摘: 無条件確保はコストが無駄。`None` のときは判定ブロック
+    // 自体に到達しない設計)。
+    let mut write_tick: Option<Vec<u32>> =
+        (!matches!(dummy_mode, DummyMode::Allow)).then(|| vec![u32::MAX; N]);
 
     let mut out: Vec<Token> = Vec::new();
 
@@ -5755,32 +5766,36 @@ fn compress_okumura_impl_hooked_traced(
         // 不採用ならその場で Literal にフォールバックする (match_length=1 に
         // 落として下の THRESHOLD 分岐に流す。これは既存の「マッチが短すぎて
         // Literal になる」経路と完全に同じ扱い)。
-        if !matches!(dummy_mode, DummyMode::Allow) && st.match_length as usize > THRESHOLD {
-            let pos = (st.match_position as usize) & (N - 1);
-            let mlen = st.match_length as usize;
-            let mut any_unwritten = false;
-            let mut all_unwritten = true;
-            for k in 0..mlen {
-                if write_tick[(pos + k) & (N - 1)] == u32::MAX {
-                    any_unwritten = true;
-                } else {
-                    all_unwritten = false;
+        // `write_tick` が `None` (= `DummyMode::Allow`) のときはこのブロック
+        // 自体に入らない (既存経路は判定コスト・確保コストとも一切発生しない)。
+        if let Some(write_tick) = write_tick.as_ref() {
+            if st.match_length as usize > THRESHOLD {
+                let pos = (st.match_position as usize) & (N - 1);
+                let mlen = st.match_length as usize;
+                let mut any_unwritten = false;
+                let mut all_unwritten = true;
+                for k in 0..mlen {
+                    if write_tick[(pos + k) & (N - 1)] == u32::MAX {
+                        any_unwritten = true;
+                    } else {
+                        all_unwritten = false;
+                    }
                 }
-            }
-            let in_bootstrap_band = pos >= BOOTSTRAP_DUMMY_LO && pos <= BOOTSTRAP_DUMMY_HI;
-            let at_bootstrap_edge = pos == BOOTSTRAP_DUMMY_HI || pos == BOOTSTRAP_DUMMY_HI - 1;
-            let reject = match dummy_mode {
-                DummyMode::Allow => false,
-                DummyMode::RejectAny => any_unwritten,
-                DummyMode::RejectAllUnwritten => all_unwritten,
-                DummyMode::RejectBootstrapUnwritten => in_bootstrap_band && all_unwritten,
-                DummyMode::RejectBootstrapUnwrittenLenGt10 => {
-                    in_bootstrap_band && all_unwritten && mlen > 10
+                let in_bootstrap_band = pos >= BOOTSTRAP_DUMMY_LO && pos <= BOOTSTRAP_DUMMY_HI;
+                let at_bootstrap_edge = pos == BOOTSTRAP_DUMMY_HI || pos == BOOTSTRAP_DUMMY_EDGE_LO;
+                let reject = match dummy_mode {
+                    DummyMode::Allow => false,
+                    DummyMode::RejectAny => any_unwritten,
+                    DummyMode::RejectAllUnwritten => all_unwritten,
+                    DummyMode::RejectBootstrapUnwritten => in_bootstrap_band && all_unwritten,
+                    DummyMode::RejectBootstrapUnwrittenLenGt10 => {
+                        in_bootstrap_band && all_unwritten && mlen > 10
+                    }
+                    DummyMode::RejectBootstrapEdge => at_bootstrap_edge,
+                };
+                if reject {
+                    st.match_length = 1;
                 }
-                DummyMode::RejectBootstrapEdge => at_bootstrap_edge,
-            };
-            if reject {
-                st.match_length = 1;
             }
         }
 
@@ -5823,10 +5838,12 @@ fn compress_okumura_impl_hooked_traced(
                 st.text_buf[s as usize + N] = c;
             }
             // Stage 10-3: このスロットに実データが書かれた input_pos を記録
-            // (DummyMode::Allow のときも常に更新するが未使用のまま。既存の
-            // write_tick 定義 [write_tick[slot] = 最後に書いた byte の
-            // input_pos] と同一の規約)。
-            write_tick[s as usize] = (input_idx - 1) as u32;
+            // (`DummyMode::Allow` では `write_tick` が `None` のため更新自体
+            // 発生しない。既存の write_tick 定義 [write_tick[slot] = 最後に
+            // 書いた byte の input_pos] と同一の規約)。
+            if let Some(write_tick) = write_tick.as_mut() {
+                write_tick[s as usize] = (input_idx - 1) as u32;
+            }
 
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
