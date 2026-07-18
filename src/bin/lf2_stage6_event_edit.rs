@@ -174,7 +174,7 @@ struct Event {
     op_id: u64,
     tick: u64,
     kind: EventKind,
-    #[allow(dead_code)]
+    /// イベント対象ノード (delete の p / insert の r)
     node: i32,
     /// del-two/del-one で昇格したノード q、ins-swap で置換された旧ノード p (それ以外 NIL)
     node2: i32,
@@ -961,6 +961,7 @@ struct TwoSol {
 ///   --exhaustive で窓内全 del-two に拡大
 /// - 2編集目候補は 1編集目適用後の再生を record し直して列挙する
 ///   (編集後はイベント種が変わりうるため、無編集 record の使い回しは不正確)
+///
 /// 返り値: (解リスト, 試行数, 打ち切りしたか)
 fn two_edit_search(
     ctx: &WindowCtx,
@@ -1355,5 +1356,90 @@ mod tests {
         assert!(ev
             .iter()
             .any(|e| matches!(e.kind, EventKind::DelLeaf | EventKind::DelOne | EventKind::DelTwo)));
+    }
+
+    /// staging 等価性: base から edits=[(op1,e1),(op2,e2)] を一発適用した再生と、
+    /// 「e1 だけ適用 → op1 実行後に clone → e2 を設定して続行」の staged 再生が
+    /// 同一の木・同一 trace になること (--two-edit のスナップショット再利用の正当性)。
+    #[test]
+    fn two_edit_staging_equivalence() {
+        // edits_preserve_bst_invariants と同じ合成入力
+        let mut x: u32 = 0xcafe1234;
+        let block: Vec<u8> = (0..500)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x & 0x3f) as u8
+            })
+            .collect();
+        let mut input = Vec::new();
+        for _ in 0..4 {
+            input.extend_from_slice(&block);
+        }
+        input.extend((0..5000).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x & 0x3f) as u8
+        }));
+        let mut probe = Sim::new(input.clone());
+        probe.advance(400);
+        let base = probe.clone();
+        let mut enumr = base.clone();
+        enumr.record = Some(Vec::new());
+        enumr.advance(6600);
+        let events = enumr.record.take().unwrap();
+        let e1_ops: Vec<u64> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::DelTwo)
+            .map(|e| e.op_id)
+            .take(5)
+            .collect();
+        assert!(!e1_ops.is_empty());
+        for &op1 in &e1_ops {
+            // op1 より後のイベントから各編集タイプの e2 を 1 つずつ選ぶ
+            let e2_cands: Vec<(u64, EditType)> = EditType::ALL
+                .iter()
+                .filter_map(|ty| {
+                    events
+                        .iter()
+                        .find(|e| e.op_id > op1 + 100 && ty.applicable(e.kind))
+                        .map(|e| (e.op_id, *ty))
+                })
+                .collect();
+            assert!(!e2_cands.is_empty());
+            for &(op2, ty2) in &e2_cands {
+                // 一発適用
+                let mut one_shot = base.clone();
+                one_shot.edits = vec![(op1, EditType::DelPromoteOther), (op2, ty2)];
+                one_shot.advance(6600);
+                // staged: e1 のみ適用で op1 実行まで進め、clone に e2 を設定して続行
+                let mut sim1 = base.clone();
+                sim1.edits = vec![(op1, EditType::DelPromoteOther)];
+                let mut advanced = 0usize;
+                while sim1.op_counter < op1 {
+                    sim1.advance(1);
+                    advanced += 1;
+                }
+                let mut sim2 = sim1.clone();
+                sim2.edits = vec![(op2, ty2)];
+                sim2.advance(6600 - advanced);
+                assert_eq!(one_shot.text, sim2.text, "op1={} op2={} {:?}", op1, op2, ty2);
+                assert_eq!(one_shot.lson, sim2.lson, "op1={} op2={} {:?}", op1, op2, ty2);
+                assert_eq!(one_shot.rson, sim2.rson, "op1={} op2={} {:?}", op1, op2, ty2);
+                assert_eq!(one_shot.dad, sim2.dad, "op1={} op2={} {:?}", op1, op2, ty2);
+                assert_eq!(one_shot.r, sim2.r);
+                assert_eq!(one_shot.op_counter, sim2.op_counter);
+                assert_eq!(
+                    one_shot.trace(one_shot.r, 5),
+                    sim2.trace(sim2.r, 5),
+                    "trace mismatch op1={} op2={} {:?}",
+                    op1,
+                    op2,
+                    ty2
+                );
+            }
+        }
     }
 }

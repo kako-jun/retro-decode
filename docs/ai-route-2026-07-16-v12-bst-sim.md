@@ -183,7 +183,8 @@ cargo run --release --bin lf2_stage6_event_edit -- \
   (同種/異種ペア比率) を出す
 - `--exhaustive`: --two-edit の 1編集目候補を窓内全 del-two に拡大 (既定は
   heuristic: 対象 tie のクラスタ = trace 候補 + Leaf 採用ノードに、削除対象 p
-  か昇格ノード q が触れる del-two だけ)
+  か昇格ノード q が触れる del-two だけ)。--exhaustive は **1編集目のイベント
+  全数化であってタイプ全数化ではない** (1編集目は del_promote_other 固定のまま)
 - `--max-solutions`: --two-edit の 1 ti あたり解列挙上限 (既定 200、超えたら打ち切り)
 
 **判定範囲の割り切り**: 各編集の合否判定は窓内 `[snap_ti, target.ti]` の tie に
@@ -217,10 +218,15 @@ cargo run --release --bin lf2_stage6_event_edit -- \
 `--two-edit` 掃引 (heuristic on、1,505 秒):
 
 - 違反 224 件 = **単一解あり 74 / 二重解あり 12 / 二重でも解なし 138**
+  (「解なし 138」は heuristic 条件付きの数値。1編集目候補を対象 tie クラスタに
+  触る del-two に絞った範囲での結果であり、全数探索での不在証明ではない)
 - 二重解 12 件は**全て同種ペア (del_promote_other × 2)**、異種ペア 0 件、
   全件 broken=0。skip/swap 系は 2編集目としても一度も現れず
 - **初違反 ti=861 は --exhaustive (窓内全 del-two 1,263 × 全 2編集目 =
   5,621,835 ペア、22.6 分) でも解なし**
+- 解なし 138 のスポット全数追認: ti=967 (6,719,973 ペア)・ti=4025
+  (10,234,707 ペア)・ti=7455 (9,447,062 ペア) を --exhaustive で追試し
+  **3 件とも解なし**。heuristic 起因の見逃しではないことを部分的に裏取り
 
 解釈: (A) 見つかる解は全部 del_promote_other ペアだが、二重化で救えたのは
 150 件中 12 件だけ (単一→二重の増分が小さい)。(B) 異種ペア/条件性 →
