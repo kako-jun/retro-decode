@@ -5602,7 +5602,7 @@ impl MinAgeFullFHook {
 }
 
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
-    compress_okumura_impl_hooked(input, tie_mode, None)
+    compress_okumura_impl_hooked(input, tie_mode, None, false)
 }
 
 /// 奥村 lzss.c `Encode()` 逐語移植の共通実装。
@@ -5610,10 +5610,16 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
 /// `hook` が `None` のとき従来の `compress_okumura_impl` と完全に同一の挙動。
 /// `Some` のときのみ、出力 Match の `match_length == F` の箇所で
 /// `MinAgeFullFHook::override_full_f_pos` による `match_position` 差し替えを試みる。
+///
+/// `tail_relax` が `true` のとき、入力末尾で `match_length` を残り入力バイト数
+/// (`len`) にクリップする処理をスキップする (Issue #14 Stage 9)。insert_node が
+/// text_buf 上で見つけた一致長をそのまま採用することで、Leaf が末尾で残り入力
+/// より長い match を出すケース (LEAF_NOT_CAND) を再現する。
 fn compress_okumura_impl_hooked(
     input: &[u8],
     tie_mode: TieMode,
     mut hook: Option<&mut MinAgeFullFHook>,
+    tail_relax: bool,
 ) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
@@ -5646,8 +5652,8 @@ fn compress_okumura_impl_hooked(
     st.insert_node(r);
 
     loop {
-        // match_length をフレーム残量に丸める
-        if st.match_length as usize > len {
+        // match_length をフレーム残量に丸める (tail_relax 時は末尾でスキップ)
+        if !tail_relax && st.match_length as usize > len {
             st.match_length = len as i32;
         }
 
@@ -5697,7 +5703,9 @@ fn compress_okumura_impl_hooked(
         }
 
         // 入力が尽きた後の残り処理: len を減らしつつ DeleteNode
-        while i < last_match_length {
+        // tail_relax で match_length が len を超えることがあるため、
+        // len が 0 に達したら (すでにエンコード完了のため) それ以上進めない。
+        while i < last_match_length && len > 0 {
             st.delete_node(s);
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
@@ -5739,7 +5747,19 @@ fn compress_okumura_impl_hooked(
 /// (write_tick[slot] = その slot に最後に書いた byte の input_pos)
 pub fn compress_okumura_rank1_minage(input: &[u8]) -> Vec<Token> {
     let mut hook = MinAgeFullFHook::new();
-    compress_okumura_impl_hooked(input, TieMode::StrictGt, Some(&mut hook))
+    compress_okumura_impl_hooked(input, TieMode::StrictGt, Some(&mut hook), false)
+}
+
+/// Stage 9 (Issue #14): 末尾緩和 (tail-relaxed) variant。
+///
+/// ベースは `compress_okumura` (Basic: dummy 挿入あり・StrictGt・hook なし) と
+/// 完全に同じだが、入力末尾で `match_length` を残り入力バイト数にクリップする
+/// 処理を行わない。素の奥村実装は末尾で「残り入力バイト数より長い match」を
+/// 出せないが、Leaf 実エンコーダはこれを出す (例: C0102.LF2 は残り12バイトの
+/// 位置で長さ13の match)。デコーダは出力先頭の残り分さえ入力と一致していれば
+/// 正しく decode できるため、この緩和で該当ファイルの byte-exact 化を狙う。
+pub fn compress_okumura_tail_relaxed(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked(input, TieMode::StrictGt, None, true)
 }
 
 #[cfg(test)]

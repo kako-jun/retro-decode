@@ -201,3 +201,25 @@ cargo run --release --bin lf2_stage6_event_edit -- \
 でも「常に後継者」でもなく**条件依存で昇格先を選ぶ規則** (または削除順序自体の
 系統差) が最有力仮説。次手は解あり 74 件の del-two イベントの局所特徴
 (p/q の位置関係・部分木形状・距離) からの共通条件抽出。
+
+### Stage 9: tail-relaxed variant (Issue #14)
+
+**動機**: clean100.txt (tie 規則完全一致 100 本) のうち 44 本が first-divergence
+分類 LEAF_NOT_CAND (Leaf のトークンが insert_node 候補集合に無い)。C0102.LF2 の
+例では、残り入力 12 バイトの位置で Leaf が長さ 13 の match を出すが、素の奥村
+実装は `match_length` を残り入力バイト数にクリップして最大 12 に丸めてしまう。
+
+**変更**: `compress_okumura_impl_hooked` に `tail_relax: bool` を追加し、`true`
+のとき末尾での `match_length > len` クリップをスキップ。新規 public 関数
+`compress_okumura_tail_relaxed` として追加 (既存の `compress_okumura` /
+`compress_okumura_rank1_minage` は無変更)。
+
+**実測 (負の結果)**: `lf2_stage9_verify` で 522 本中 131/522 一致 (Basic/rank1
+の 165 本から **回帰**)。新規獲得 3 本 (clean100 の LEAF_NOT_CAND 群)、喪失 36
+本。動機となった C0102 自体も未解決 (token 11060 で leaf len=13 に対し
+insert_node の未クリップ長は 18)。原因: `match_length > len` は末尾特有ではなく
+通常のファイル終端処理でも高頻度に発生し、insert_node が text_buf 上の古いリング
+残骸を使って過大な長さ (F まで) を返すため、多くのファイルで誤った長さの
+match を出してしまう。「insert_node の生の長さをそのまま使う」という仮説は
+C0102 の実測 (18 ≠ 13) で否定された。Stage 9 はここで停止し、別の緩和策は
+試みない。
