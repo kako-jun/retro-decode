@@ -132,6 +132,51 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    if args[1] == "--vsbasic" {
+        // 各ファイルで Basic とのトークン相違数 (= override が実際に選択を
+        // 変えた箇所数の下限) を集計する
+        let mut files: Vec<_> = fs::read_dir(&args[2])
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("LF2"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        if let Some(n) = args.get(3).and_then(|v| v.parse::<usize>().ok()) {
+            files.truncate(n);
+        }
+        let mut files_diff = 0usize;
+        let mut total = 0usize;
+        for f in &files {
+            let data = fs::read(f).unwrap();
+            if &data[0..8] != LF2_MAGIC {
+                continue;
+            }
+            let width = u16::from_le_bytes([data[12], data[13]]);
+            let height = u16::from_le_bytes([data[14], data[15]]);
+            let ps = 0x18 + (data[0x16] as usize) * 3;
+            let Ok(decoded) = decompress_to_tokens(&data[ps..], width, height) else {
+                continue;
+            };
+            total += 1;
+            let a = retro_decode::formats::toheart::okumura_lzss::compress_okumura(
+                &decoded.ring_input,
+            );
+            let b = compress_okumura_rank1_minage(&decoded.ring_input);
+            let ndiff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count()
+                + a.len().abs_diff(b.len());
+            if ndiff > 0 {
+                files_diff += 1;
+                println!("{},{}", f.file_name().unwrap().to_str().unwrap(), ndiff);
+            }
+        }
+        eprintln!("files={} files_with_diff_vs_basic={}", total, files_diff);
+        return ExitCode::SUCCESS;
+    }
     let data = fs::read(&args[1]).expect("read");
     assert_eq!(&data[0..8], LF2_MAGIC);
     let width = u16::from_le_bytes([data[12], data[13]]);
