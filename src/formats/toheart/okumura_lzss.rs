@@ -5625,6 +5625,15 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
 ///
 /// `tail_mode` で入力末尾での `match_length` クリップ規則を切り替える
 /// (Issue #14 Stage 9 / Stage 9-2)。`TailMode` のドキュメント参照。
+fn compress_okumura_impl_hooked(
+    input: &[u8],
+    tie_mode: TieMode,
+    hook: Option<&mut MinAgeFullFHook>,
+    tail_mode: TailMode,
+) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(input, tie_mode, hook, tail_mode, None)
+}
+
 /// Stage 9-2c 用トレース1ステップ: cap 適用前の生の match_length/match_position、
 /// その時点の残り入力バイト数 (`len`)、cap 適用後の match_length。
 #[derive(Debug, Clone, Copy)]
@@ -5633,15 +5642,6 @@ pub struct TailTraceStep {
     pub raw_match_position: i32,
     pub remaining: usize,
     pub capped_match_length: i32,
-}
-
-fn compress_okumura_impl_hooked(
-    input: &[u8],
-    tie_mode: TieMode,
-    hook: Option<&mut MinAgeFullFHook>,
-    tail_mode: TailMode,
-) -> Vec<Token> {
-    compress_okumura_impl_hooked_traced(input, tie_mode, hook, tail_mode, None)
 }
 
 fn compress_okumura_impl_hooked_traced(
