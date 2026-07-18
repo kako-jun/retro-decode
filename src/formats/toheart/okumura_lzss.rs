@@ -5601,8 +5601,20 @@ impl MinAgeFullFHook {
     }
 }
 
+/// 末尾 (入力残り `len` バイトの局面) での `match_length` クリップ規則 (Issue #14 Stage 9)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailMode {
+    /// 素の奥村実装: `match_length` を残り入力バイト数 (`len`) にクリップする。
+    Clip,
+    /// Stage 9 当初案: クリップを一切行わない (insert_node の生一致長をそのまま採用)。
+    Unbounded,
+    /// Stage 9-2 (実測から導出): `match_length` を `len + 1` にクリップする。
+    /// LEAF_NOT_CAND 44 本全数で `tail_len - remaining == 1` だった観測に基づく。
+    Plus1,
+}
+
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
-    compress_okumura_impl_hooked(input, tie_mode, None)
+    compress_okumura_impl_hooked(input, tie_mode, None, TailMode::Clip)
 }
 
 /// 奥村 lzss.c `Encode()` 逐語移植の共通実装。
@@ -5610,10 +5622,34 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
 /// `hook` が `None` のとき従来の `compress_okumura_impl` と完全に同一の挙動。
 /// `Some` のときのみ、出力 Match の `match_length == F` の箇所で
 /// `MinAgeFullFHook::override_full_f_pos` による `match_position` 差し替えを試みる。
+///
+/// `tail_mode` で入力末尾での `match_length` クリップ規則を切り替える
+/// (Issue #14 Stage 9 / Stage 9-2)。`TailMode` のドキュメント参照。
 fn compress_okumura_impl_hooked(
     input: &[u8],
     tie_mode: TieMode,
+    hook: Option<&mut MinAgeFullFHook>,
+    tail_mode: TailMode,
+) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(input, tie_mode, hook, tail_mode, None)
+}
+
+/// Stage 9-2c 用トレース1ステップ: cap 適用前の生の match_length/match_position、
+/// その時点の残り入力バイト数 (`len`)、cap 適用後の match_length。
+#[derive(Debug, Clone, Copy)]
+pub struct TailTraceStep {
+    pub raw_match_length: i32,
+    pub raw_match_position: i32,
+    pub remaining: usize,
+    pub capped_match_length: i32,
+}
+
+fn compress_okumura_impl_hooked_traced(
+    input: &[u8],
+    tie_mode: TieMode,
     mut hook: Option<&mut MinAgeFullFHook>,
+    tail_mode: TailMode,
+    mut trace: Option<&mut Vec<TailTraceStep>>,
 ) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
@@ -5646,9 +5682,27 @@ fn compress_okumura_impl_hooked(
     st.insert_node(r);
 
     loop {
-        // match_length をフレーム残量に丸める
-        if st.match_length as usize > len {
-            st.match_length = len as i32;
+        // match_length をフレーム残量に丸める (Clip のみ)。Unbounded は丸めなし、
+        // Plus1 は len+1 まで許容する (Stage 9-2)。
+        let cap = match tail_mode {
+            TailMode::Clip => Some(len),
+            TailMode::Unbounded => None,
+            TailMode::Plus1 => Some(len + 1),
+        };
+        let raw_match_length = st.match_length;
+        let raw_match_position = st.match_position;
+        if let Some(cap) = cap {
+            if st.match_length as usize > cap {
+                st.match_length = cap as i32;
+            }
+        }
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(TailTraceStep {
+                raw_match_length,
+                raw_match_position,
+                remaining: len,
+                capped_match_length: st.match_length,
+            });
         }
 
         // 出力
@@ -5697,7 +5751,13 @@ fn compress_okumura_impl_hooked(
         }
 
         // 入力が尽きた後の残り処理: len を減らしつつ DeleteNode
-        while i < last_match_length {
+        // `&& len > 0` は underflow ガード。TailMode::Unbounded / Plus1 では
+        // `last_match_length > len` (出力 match が実残り入力より長い) が起こり得て、
+        // このガードが無いと `len -= 1` が len==0 の状態で呼ばれ usize underflow
+        // で panic する。TailMode::Clip では match_length を必ず len 以下に
+        // クリップするため (`if st.match_length as usize > cap { ... }` 参照)、
+        // この分岐は絶対に発火しない (このガードは Unbounded/Plus1 専用の保険)。
+        while i < last_match_length && len > 0 {
             st.delete_node(s);
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
@@ -5739,7 +5799,46 @@ fn compress_okumura_impl_hooked(
 /// (write_tick[slot] = その slot に最後に書いた byte の input_pos)
 pub fn compress_okumura_rank1_minage(input: &[u8]) -> Vec<Token> {
     let mut hook = MinAgeFullFHook::new();
-    compress_okumura_impl_hooked(input, TieMode::StrictGt, Some(&mut hook))
+    compress_okumura_impl_hooked(input, TieMode::StrictGt, Some(&mut hook), TailMode::Clip)
+}
+
+/// Stage 9 (Issue #14): 末尾緩和 (tail-relaxed) variant。クリップを一切行わない
+/// (`TailMode::Unbounded`)。
+///
+/// ベースは `compress_okumura` (Basic: dummy 挿入あり・StrictGt・hook なし) と
+/// 完全に同じだが、入力末尾で `match_length` を残り入力バイト数にクリップする
+/// 処理を行わない。素の奥村実装は末尾で「残り入力バイト数より長い match」を
+/// 出せないが、Leaf 実エンコーダはこれを出す (例: C0102.LF2 は残り12バイトの
+/// 位置で長さ13の match)。
+///
+/// **Stage 9 実測の負結果**: この単純なクリップ解除は 131/522 に回帰する
+/// (Basic の 165/522 を下回る)。Stage 9-2 の実測 (LEAF_NOT_CAND 44 本全数で
+/// `tail_len - remaining == 1`) を受けて `compress_okumura_tail_plus1` を追加した。
+pub fn compress_okumura_tail_relaxed(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked(input, TieMode::StrictGt, None, TailMode::Unbounded)
+}
+
+/// Stage 9-2 (Issue #14): 末尾クリップを `remaining + 1` に緩和する variant。
+///
+/// LEAF_NOT_CAND 44 本全数の実測で `leaf の tail token 長 - divergence 時点の
+/// 入力残りバイト数 == 1` だったことに基づく仮説の実装。
+pub fn compress_okumura_tail_plus1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked(input, TieMode::StrictGt, None, TailMode::Plus1)
+}
+
+/// Stage 9-2c (Issue #14) デバッグ用: `compress_okumura_tail_plus1` と同じ挙動で
+/// トークン列を出力しつつ、各ステップの cap 適用前の生 match_length/match_position
+/// もトレースとして返す。
+pub fn compress_okumura_tail_plus1_traced(input: &[u8]) -> (Vec<Token>, Vec<TailTraceStep>) {
+    let mut trace = Vec::new();
+    let tokens = compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        Some(&mut trace),
+    );
+    (tokens, trace)
 }
 
 #[cfg(test)]
@@ -5835,7 +5934,13 @@ mod tests {
         // 最後のトークンが 3 回目の P の full-F match で、min-age の 2 回目
         // コピー (ring pos 0) を指すこと
         let last = *toks.last().unwrap();
-        assert_eq!(last, Token::Match { pos: 0, len: F as u8 });
+        assert_eq!(
+            last,
+            Token::Match {
+                pos: 0,
+                len: F as u8
+            }
+        );
     }
 
     /// Stage 3: 巨大 tie (n_max > 32, 全候補未書込みの縮退 tie) では override
@@ -6917,5 +7022,120 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Stage 9-2 (Issue #14): `compress_okumura_tail_plus1` は末尾で
+    /// `match_length` を `remaining + 1` までしか許容しない (Clip の `remaining`
+    /// より 1 大きいだけで、無制限ではない)。
+    ///
+    /// "AB AB" は末尾 "AB" が先頭 "AB" の再掲で、text_buf の overlap 領域が
+    /// (`Okumura::new(0x20)` の) スペース初期値のため、tree 上の一致は実入力の
+    /// 3 バイト ("AB " まで) + 1 バイトの overlap 一致で raw_match_length=4 まで
+    /// 伸びる。Clip は remaining=3 に切り詰めて `Match{len:3}`、Plus1 は
+    /// remaining+1=4 まで許容して `Match{len:4}` になる。
+    #[test]
+    fn plus1_clips_to_remaining_plus_one_not_unbounded() {
+        let input = b"AB AB";
+        let clip = compress_okumura(input);
+        let (plus1, trace) = compress_okumura_tail_plus1_traced(input);
+
+        assert_eq!(
+            decode_oku_tokens(&clip),
+            input,
+            "Clip must roundtrip exactly"
+        );
+        // Plus1 は末尾トークンが実入力より 1 バイト長いため、decode は入力そのままの
+        // prefix + overrun 1 バイトになる (Stage 9 の狙いどおり: LF2 decoder は画像の
+        // 実ピクセル数までしか読まないので、この overrun バイトは無害)。
+        let plus1_decoded = decode_oku_tokens(&plus1);
+        assert_eq!(
+            &plus1_decoded[..input.len()],
+            input,
+            "Plus1 decode must reproduce input as a prefix"
+        );
+        assert_eq!(
+            plus1_decoded.len(),
+            input.len() + 1,
+            "Plus1 overruns by exactly 1 byte (the whole point of remaining+1)"
+        );
+
+        let clip_last_len = match clip.last() {
+            Some(Token::Match { len, .. }) => *len as usize,
+            other => panic!("expected trailing Match in Clip, got {:?}", other),
+        };
+        let plus1_last_len = match plus1.last() {
+            Some(Token::Match { len, .. }) => *len as usize,
+            other => panic!("expected trailing Match in Plus1, got {:?}", other),
+        };
+        let last_step = trace.last().expect("trace must be non-empty");
+
+        assert_eq!(
+            clip_last_len, last_step.remaining,
+            "Clip clips to remaining"
+        );
+        assert_eq!(
+            plus1_last_len,
+            last_step.remaining + 1,
+            "Plus1 clips to remaining+1, not unbounded (raw_match_length={})",
+            last_step.raw_match_length
+        );
+        assert!(
+            (last_step.raw_match_length as usize) > last_step.remaining,
+            "test fixture must exercise an actual clip (raw > remaining), got raw={}",
+            last_step.raw_match_length
+        );
+    }
+
+    /// Stage 9-2c (Issue #14) で確認した閾値越え副作用の回帰テスト。
+    ///
+    /// `remaining == 2` の局面で raw match が 3 (overlap 領域のスペース初期値
+    /// との偶然一致) まで伸びると、Clip は `remaining=2` に切り詰めて
+    /// `match_length <= THRESHOLD` (=2) となり Literal 2 個になるが、Plus1 は
+    /// `remaining+1=3` を許容するため THRESHOLD を超えて Match(len=3) に化ける。
+    /// broken30 の `other_kind_diff` 6 本 (H11/H31/CBAK_05/CMON_03/S29E/S30D) は
+    /// すべてこの境界で発生した (Stage 9-2c 実測)。
+    #[test]
+    fn plus1_can_flip_literal_to_match_at_remaining_two_threshold() {
+        let input = b"XXXXXAB AB";
+        let clip = compress_okumura(input);
+        let (plus1, trace) = compress_okumura_tail_plus1_traced(input);
+
+        assert_eq!(
+            decode_oku_tokens(&clip),
+            input,
+            "Clip must roundtrip exactly"
+        );
+        let plus1_decoded = decode_oku_tokens(&plus1);
+        assert_eq!(
+            &plus1_decoded[..input.len()],
+            input,
+            "Plus1 decode must reproduce input as a prefix (overrun byte follows)"
+        );
+
+        // 末尾 2 バイト ("AB") の局面: remaining==2
+        let last_step = trace.last().expect("trace must be non-empty");
+        assert_eq!(last_step.remaining, 2, "fixture must land on remaining==2");
+        assert!(
+            last_step.raw_match_length as usize >= last_step.remaining + 1,
+            "fixture must have a raw match reaching remaining+1 or beyond (got {})",
+            last_step.raw_match_length
+        );
+
+        // Clip: remaining=2 は THRESHOLD 以下 → 末尾は Literal 2 個
+        let clip_tail = &clip[clip.len() - 2..];
+        assert!(
+            clip_tail.iter().all(|t| matches!(t, Token::Literal(_))),
+            "Clip must fall back to literals at remaining==2, got {:?}",
+            clip_tail
+        );
+
+        // Plus1: remaining+1=3 は THRESHOLD 超 → 末尾が Match(len=3) に化ける
+        match plus1.last() {
+            Some(Token::Match { len, .. }) => assert_eq!(*len, 3),
+            other => panic!(
+                "expected Plus1 to flip to a Match(len=3) at this boundary, got {:?}",
+                other
+            ),
+        }
     }
 }

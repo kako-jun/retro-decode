@@ -236,3 +236,57 @@ cargo run --release --bin lf2_stage6_event_edit -- \
 ti=861 が 560 万ペアでも直らないことは「少数イベントの反転」仮説の棄却材料。
 次手は Stage 6 の解 139 件 + Stage 8 の 12 ペアの del-two 局所特徴
 (p/q 位置関係・部分木形状・距離) から昇格条件式を学習・抽出する方向。
+
+### Stage 9: tail-relaxed variant (Issue #14)
+
+**動機**: clean100.txt (tie 規則完全一致 100 本) のうち 44 本が first-divergence
+分類 LEAF_NOT_CAND (Leaf のトークンが insert_node 候補集合に無い)。C0102.LF2 の
+例では、残り入力 12 バイトの位置で Leaf が長さ 13 の match を出すが、素の奥村
+実装は `match_length` を残り入力バイト数にクリップして最大 12 に丸めてしまう。
+
+**変更**: `compress_okumura_impl_hooked` に `tail_relax: bool` を追加し、`true`
+のとき末尾での `match_length > len` クリップをスキップ。新規 public 関数
+`compress_okumura_tail_relaxed` として追加 (既存の `compress_okumura` /
+`compress_okumura_rank1_minage` は無変更)。
+
+**実測 (負の結果)**: `lf2_stage9_verify` で 522 本中 131/522 一致 (Basic/rank1
+の 165 本から **回帰**)。新規獲得 3 本 (clean100 の LEAF_NOT_CAND 群)、喪失 36
+本。動機となった C0102 自体も未解決 (token 11060 で leaf len=13 に対し
+insert_node の未クリップ長は 18)。原因: `match_length > len` は末尾特有ではなく
+通常のファイル終端処理でも高頻度に発生し、insert_node が text_buf 上の古いリング
+残骸を使って過大な長さ (F まで) を返すため、多くのファイルで誤った長さの
+match を出してしまう。「insert_node の生の長さをそのまま使う」という仮説は
+C0102 の実測 (18 ≠ 13) で否定された。Stage 9 はここで停止し、別の緩和策は
+試みない。
+
+### Stage 9-2〜9-2d: Clip/Plus1 の2実装亜種判明 (Issue #14、2026-07-18)
+
+**Stage 9-2 (分布実測)**: Stage 9 の LEAF_NOT_CAND 44 本全数について、
+divergence 点の「Leaf のトークン長 (`tail_len`)」と「その時点の入力残り
+バイト数 (`remaining`)」を計測。**`tail_len - remaining == 1` が 44/44 全数で
+成立 (例外 0)**。単純な無制限緩和 (Stage 9) ではなく、「クリップの上限を
+`remaining` ではなく `remaining + 1` にする」規則を示唆。
+
+`TailMode::Clip / Unbounded / Plus1` の 3 値に整理し、`Plus1` (`remaining + 1`
+までクリップ) を実装 (`compress_okumura_tail_plus1`)。522 本フル計測で
+**167/522** (Basic 165 から fixed32・broken30 の入れ替わりで正味 +2)。
+
+**Stage 9-2c (broken30 の切り分け)**: Plus1 で新たに崩れた 30 本を
+teacher-forcing トレースで解析 (cap 適用前の生 match_length/position も
+比較)。**タイ/候補選択差は 0/30 で棄却**。全 30 本が「Leaf は実際には
+`Clip=remaining` と `Clip=remaining+1` の 2 実装亜種を使い分けている」ケースだった:
+
+- 24 本: Leaf の実長が `remaining` ちょうど (Plus1 が `remaining+1` まで
+  過剰に伸ばしていた。候補 position は Leaf と完全一致、タイではない)
+- 6 本: `remaining==2` の境界で `remaining+1=3` が THRESHOLD (=2) を跨ぎ、
+  Plus1 が Literal を Match(len=3) に化けさせていた
+  (`H11/H31/CBAK_05/CMON_03/S29E/S30D`)
+
+**Stage 9-2d (per-file フォールバック)**: 「まず Clip (Basic) で再圧縮・
+不一致なら Plus1 で再挑戦」の per-file フォールバックを実装
+(`lf2_stage9_2d_verify`)。522 本フル計測で **197/522** (Basic 165 +
+fixed32 の 32 本、内訳 clip=165 / plus1=32) と事前予測どおり一致。
+
+**結論**: Leaf の末尾クリップ規則は単一規則ではなく、ファイル単位で
+`Clip=remaining` 系と `Clip=remaining+1` 系の 2 実装亜種に分岐している
+(判別条件は未解明)。次手はこの 2 亜種の分岐条件の特定。
