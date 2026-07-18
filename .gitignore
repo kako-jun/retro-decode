@@ -146,3 +146,4 @@ test_output/
 
 # LVNS3 binary (copyright Leaf/Aquaplus, RE local only)
 lvns3_binary/
+.local_data/
