@@ -39,7 +39,7 @@ pub enum Token {
 /// - `StrictGt`: 奥村原典 `>`。同一長候補は最初に見つかった (BST 訪問順) を採用
 /// - `AllowEq`:  `>=`。同一長候補は最後に訪れたノードで上書き
 /// - `DistanceTie`: `>` だが、同一長のときに ring write head `r` への距離が
-///                  近いほうを採用（Leaf 系エンコーダの観測されたバイアス）
+///   近いほうを採用（Leaf 系エンコーダの観測されたバイアス）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TieMode {
     StrictGt,

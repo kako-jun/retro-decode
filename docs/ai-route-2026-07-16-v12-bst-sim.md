@@ -175,6 +175,17 @@ cargo run --release --bin lf2_stage6_event_edit -- \
 - `--self-test`: スナップショット (Clone) 復元後の無編集再生がベースラインと
   完全一致することを実ファイルで検証
 - `--dump-ties`: 全 tie の判定結果を CSV 出力 (groups.parquet との突合用)
+- `--two-edit`: 二重編集探索 (Stage 8-1)。1編集目は del_promote_other 限定
+  (Stage 6 の 139 解が 100% del_promote_other だった知見による枝刈り)、
+  2編集目は 1編集目の op 以降の全編集タイプ。2編集目候補は 1編集目適用後の
+  再生を record し直して列挙する (編集後はイベント種が変わりうるため)。
+  `--ti` 省略時は「単一編集解なしの全違反」を自動掃引し、解の組成サマリ
+  (同種/異種ペア比率) を出す
+- `--exhaustive`: --two-edit の 1編集目候補を窓内全 del-two に拡大 (既定は
+  heuristic: 対象 tie のクラスタ = trace 候補 + Leaf 採用ノードに、削除対象 p
+  か昇格ノード q が触れる del-two だけ)。--exhaustive は **1編集目のイベント
+  全数化であってタイプ全数化ではない** (1編集目は del_promote_other 固定のまま)
+- `--max-solutions`: --two-edit の 1 ti あたり解列挙上限 (既定 200、超えたら打ち切り)
 
 **判定範囲の割り切り**: 各編集の合否判定は窓内 `[snap_ti, target.ti]` の tie に
 限定している。出力の「broken=0」は**窓内**副作用ゼロの意味であり、窓外 (対象 ti
@@ -202,6 +213,30 @@ cargo run --release --bin lf2_stage6_event_edit -- \
 系統差) が最有力仮説。次手は解あり 74 件の del-two イベントの局所特徴
 (p/q の位置関係・部分木形状・距離) からの共通条件抽出。
 
+### Stage 8-1: 二重編集の実測結果 (C0602、2026-07-18)
+
+`--two-edit` 掃引 (heuristic on、1,505 秒):
+
+- 違反 224 件 = **単一解あり 74 / 二重解あり 12 / 二重でも解なし 138**
+  (「解なし 138」は heuristic 条件付きの数値。1編集目候補を対象 tie クラスタに
+  触る del-two に絞った範囲での結果であり、全数探索での不在証明ではない)
+- 二重解 12 件は**全て同種ペア (del_promote_other × 2)**、異種ペア 0 件、
+  全件 broken=0。skip/swap 系は 2編集目としても一度も現れず
+- **初違反 ti=861 は --exhaustive (窓内全 del-two 1,263 × 全 2編集目 =
+  5,621,835 ペア、22.6 分) でも解なし**
+- 解なし 138 のスポット全数追認: ti=967 (6,719,973 ペア)・ti=4025
+  (10,234,707 ペア)・ti=7455 (9,447,062 ペア) を --exhaustive で追試し
+  **3 件とも解なし**。heuristic 起因の見逃しではないことを部分的に裏取り
+
+解釈: (A) 見つかる解は全部 del_promote_other ペアだが、二重化で救えたのは
+150 件中 12 件だけ (単一→二重の増分が小さい)。(B) 異種ペア/条件性 →
+異種ペアは 0。編集回数を増やしても skip/swap 系は寄与しない。
+つまり違反の説明はイベント単発/ペアの摂動ではなく、**del-two 昇格規則そのものの
+条件依存差** (毎回の del-two で Leaf が別の選択をしうる) に収束する。
+ti=861 が 560 万ペアでも直らないことは「少数イベントの反転」仮説の棄却材料。
+次手は Stage 6 の解 139 件 + Stage 8 の 12 ペアの del-two 局所特徴
+(p/q 位置関係・部分木形状・距離) から昇格条件式を学習・抽出する方向。
+
 ### Stage 9: tail-relaxed variant (Issue #14)
 
 **動機**: clean100.txt (tie 規則完全一致 100 本) のうち 44 本が first-divergence
@@ -223,3 +258,35 @@ insert_node の未クリップ長は 18)。原因: `match_length > len` は末�
 match を出してしまう。「insert_node の生の長さをそのまま使う」という仮説は
 C0102 の実測 (18 ≠ 13) で否定された。Stage 9 はここで停止し、別の緩和策は
 試みない。
+
+### Stage 9-2〜9-2d: Clip/Plus1 の2実装亜種判明 (Issue #14、2026-07-18)
+
+**Stage 9-2 (分布実測)**: Stage 9 の LEAF_NOT_CAND 44 本全数について、
+divergence 点の「Leaf のトークン長 (`tail_len`)」と「その時点の入力残り
+バイト数 (`remaining`)」を計測。**`tail_len - remaining == 1` が 44/44 全数で
+成立 (例外 0)**。単純な無制限緩和 (Stage 9) ではなく、「クリップの上限を
+`remaining` ではなく `remaining + 1` にする」規則を示唆。
+
+`TailMode::Clip / Unbounded / Plus1` の 3 値に整理し、`Plus1` (`remaining + 1`
+までクリップ) を実装 (`compress_okumura_tail_plus1`)。522 本フル計測で
+**167/522** (Basic 165 から fixed32・broken30 の入れ替わりで正味 +2)。
+
+**Stage 9-2c (broken30 の切り分け)**: Plus1 で新たに崩れた 30 本を
+teacher-forcing トレースで解析 (cap 適用前の生 match_length/position も
+比較)。**タイ/候補選択差は 0/30 で棄却**。全 30 本が「Leaf は実際には
+`Clip=remaining` と `Clip=remaining+1` の 2 実装亜種を使い分けている」ケースだった:
+
+- 24 本: Leaf の実長が `remaining` ちょうど (Plus1 が `remaining+1` まで
+  過剰に伸ばしていた。候補 position は Leaf と完全一致、タイではない)
+- 6 本: `remaining==2` の境界で `remaining+1=3` が THRESHOLD (=2) を跨ぎ、
+  Plus1 が Literal を Match(len=3) に化けさせていた
+  (`H11/H31/CBAK_05/CMON_03/S29E/S30D`)
+
+**Stage 9-2d (per-file フォールバック)**: 「まず Clip (Basic) で再圧縮・
+不一致なら Plus1 で再挑戦」の per-file フォールバックを実装
+(`lf2_stage9_2d_verify`)。522 本フル計測で **197/522** (Basic 165 +
+fixed32 の 32 本、内訳 clip=165 / plus1=32) と事前予測どおり一致。
+
+**結論**: Leaf の末尾クリップ規則は単一規則ではなく、ファイル単位で
+`Clip=remaining` 系と `Clip=remaining+1` 系の 2 実装亜種に分岐している
+(判別条件は未解明)。次手はこの 2 亜種の分岐条件の特定。
