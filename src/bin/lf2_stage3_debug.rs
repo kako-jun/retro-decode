@@ -110,19 +110,33 @@ fn summarize(path: &std::path::Path) {
         (LeafToken::Literal(_), Token::Literal(_)) => "KIND_DIFF", // 値違いは無いはず
         _ => "KIND_DIFF",
     };
+    // Stage 9-2: LEAF_NOT_CAND の tail 長解析用。
+    // tail_len = leaf のトークン長 (Match のみ)、remaining = このトークン開始時点の
+    // 入力残りバイト数 (input.len() - input_pos)。diff = tail_len - remaining。
+    let (tail_len, remaining, diff): (String, String, String) = match &decoded.tokens[di] {
+        LeafToken::Match { len: ll, .. } => {
+            let rem = input.len() - input_pos;
+            (
+                ll.to_string(),
+                rem.to_string(),
+                ((*ll as i64) - (rem as i64)).to_string(),
+            )
+        }
+        _ => ("-".to_string(), "-".to_string(), "-".to_string()),
+    };
     println!(
-        "{},{},{},{}",
-        name,
-        class,
-        di,
-        input_pos
+        "{},{},{},{},{},{},{}",
+        name, class, di, input_pos, tail_len, remaining, diff
     );
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <FILE.LF2> | --summary <DIR> [N] | --vsbasic <DIR> [N]", args[0]);
+        eprintln!(
+            "usage: {} <FILE.LF2> | --summary <DIR> [N] | --vsbasic <DIR> [N]",
+            args[0]
+        );
         return ExitCode::from(2);
     }
     if (args[1] == "--summary" || args[1] == "--vsbasic") && args.len() < 3 {
@@ -181,12 +195,11 @@ fn main() -> ExitCode {
                 continue;
             };
             total += 1;
-            let a = retro_decode::formats::toheart::okumura_lzss::compress_okumura(
-                &decoded.ring_input,
-            );
+            let a =
+                retro_decode::formats::toheart::okumura_lzss::compress_okumura(&decoded.ring_input);
             let b = compress_okumura_rank1_minage(&decoded.ring_input);
-            let ndiff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count()
-                + a.len().abs_diff(b.len());
+            let ndiff =
+                a.iter().zip(b.iter()).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len());
             if ndiff > 0 {
                 files_diff += 1;
                 println!(
@@ -200,7 +213,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let data = fs::read(&args[1]).expect("read");
-    assert!(data.len() >= 0x18 && &data[0..8] == LF2_MAGIC, "not an LF2 file");
+    assert!(
+        data.len() >= 0x18 && &data[0..8] == LF2_MAGIC,
+        "not an LF2 file"
+    );
     let width = u16::from_le_bytes([data[12], data[13]]);
     let height = u16::from_le_bytes([data[14], data[15]]);
     let colors = data[0x16] as usize;
@@ -226,7 +242,11 @@ fn main() -> ExitCode {
         }
     }
     let Some(di) = diff_idx else {
-        println!("no token diff (len leaf={} mine={})", decoded.tokens.len(), mine.len());
+        println!(
+            "no token diff (len leaf={} mine={})",
+            decoded.tokens.len(),
+            mine.len()
+        );
         return ExitCode::SUCCESS;
     };
 
