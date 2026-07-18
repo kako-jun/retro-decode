@@ -176,6 +176,8 @@ struct Event {
     kind: EventKind,
     #[allow(dead_code)]
     node: i32,
+    /// del-two/del-one で昇格したノード q、ins-swap で置換された旧ノード p (それ以外 NIL)
+    node2: i32,
 }
 
 #[derive(Clone)]
@@ -192,9 +194,8 @@ struct Sim {
     tick: u64,
     /// insert/delete 呼び出しごとに 1 増える大域 op カウンタ
     op_counter: u64,
-    /// 編集対象 op と編集タイプ (None なら無編集再生)
-    edit_op: Option<u64>,
-    edit_type: EditType,
+    /// 編集対象 (op, 編集タイプ) の列 (空なら無編集再生)。最大 2 要素。
+    edits: Vec<(u64, EditType)>,
     /// skip_insert で遅延された挿入ノード (次 tick 冒頭で挿入)
     pending_insert: Option<i32>,
     /// skip_delete で遅延された削除ノード (次 tick 冒頭で削除)
@@ -217,8 +218,7 @@ impl Sim {
             len: 0,
             tick: 0,
             op_counter: 0,
-            edit_op: None,
-            edit_type: EditType::SkipInsert,
+            edits: Vec::new(),
             pending_insert: None,
             pending_delete: None,
             record: None,
@@ -246,8 +246,8 @@ impl Sim {
 
     /// 奥村原典 InsertNode と同一 (match 更新は teacher forcing のため不要)。
     /// `leaf_attach` が真なら full-F 一致時も置換せず右へ降り続けて葉として挿入する。
-    /// 戻り値: full-F 置換 (swap) が起きたか。
-    fn insert(&mut self, r: i32, leaf_attach: bool) -> bool {
+    /// 戻り値: full-F 置換 (swap) が起きた場合は置換された旧ノード p、なければ NIL。
+    fn insert(&mut self, r: i32, leaf_attach: bool) -> i32 {
         let ks = r as usize;
         let mut cmp: i32 = 1;
         let mut p: i32 = N as i32 + 1 + self.text[ks] as i32;
@@ -260,14 +260,14 @@ impl Sim {
                 } else {
                     self.rson[p as usize] = r;
                     self.dad[r as usize] = p;
-                    return false;
+                    return NIL;
                 }
             } else if self.lson[p as usize] != NIL {
                 p = self.lson[p as usize];
             } else {
                 self.lson[p as usize] = r;
                 self.dad[r as usize] = p;
-                return false;
+                return NIL;
             }
             let mut i: usize = 1;
             cmp = 0;
@@ -297,15 +297,15 @@ impl Sim {
             self.lson[dp as usize] = r;
         }
         self.dad[p as usize] = NIL;
-        true
+        p
     }
 
     /// 奥村原典 DeleteNode と同一。`promote_other` が真なら del-two で
     /// 前任者でなく後継者 (右部分木最小) を昇格する。
-    /// 戻り値: イベント種。
-    fn delete(&mut self, p: i32, promote_other: bool) -> EventKind {
+    /// 戻り値: (イベント種, 昇格ノード q または NIL)。
+    fn delete(&mut self, p: i32, promote_other: bool) -> (EventKind, i32) {
         if self.dad[p as usize] == NIL {
-            return EventKind::DelAbsent;
+            return (EventKind::DelAbsent, NIL);
         }
         let (q, kind): (i32, EventKind) = if self.rson[p as usize] == NIL {
             let k = if self.lson[p as usize] == NIL {
@@ -355,27 +355,35 @@ impl Sim {
             self.lson[dp as usize] = q;
         }
         self.dad[p as usize] = NIL;
-        kind
+        (kind, q)
     }
 
     /// tick 冒頭の遅延イベント消化 → delete(s) → text 書込 → s/r 前進 → insert(r)。
-    /// insert/delete それぞれで op_counter を進め、edit_op に一致したら編集を適用する。
+    /// insert/delete それぞれで op_counter を進め、edits に一致したら編集を適用する。
+    fn edit_at(&self, op: u64) -> Option<EditType> {
+        self.edits
+            .iter()
+            .find(|(eop, _)| *eop == op)
+            .map(|(_, ty)| *ty)
+    }
+
     fn step_delete(&mut self, target: i32) {
         self.op_counter += 1;
         let op = self.op_counter;
-        if self.edit_op == Some(op) && self.edit_type == EditType::SkipDelete {
+        let edit = self.edit_at(op);
+        if edit == Some(EditType::SkipDelete) {
             self.pending_delete = Some(target);
             return;
         }
-        let promote_other =
-            self.edit_op == Some(op) && self.edit_type == EditType::DelPromoteOther;
-        let kind = self.delete(target, promote_other);
+        let promote_other = edit == Some(EditType::DelPromoteOther);
+        let (kind, q) = self.delete(target, promote_other);
         if let Some(rec) = self.record.as_mut() {
             rec.push(Event {
                 op_id: op,
                 tick: self.tick,
                 kind,
                 node: target,
+                node2: q,
             });
         }
     }
@@ -383,23 +391,24 @@ impl Sim {
     fn step_insert(&mut self, target: i32) {
         self.op_counter += 1;
         let op = self.op_counter;
-        if self.edit_op == Some(op) && self.edit_type == EditType::SkipInsert {
+        let edit = self.edit_at(op);
+        if edit == Some(EditType::SkipInsert) {
             self.pending_insert = Some(target);
             return;
         }
-        let leaf_attach =
-            self.edit_op == Some(op) && self.edit_type == EditType::SwapLeafAttach;
+        let leaf_attach = edit == Some(EditType::SwapLeafAttach);
         let swapped = self.insert(target, leaf_attach);
         if let Some(rec) = self.record.as_mut() {
             rec.push(Event {
                 op_id: op,
                 tick: self.tick,
-                kind: if swapped {
+                kind: if swapped != NIL {
                     EventKind::InsSwap
                 } else {
                     EventKind::Ins
                 },
                 node: target,
+                node2: swapped,
             });
         }
     }
@@ -534,16 +543,23 @@ struct Args {
     limit: Option<usize>,
     self_test: bool,
     dump_ties: Option<String>,
+    two_edit: bool,
+    exhaustive: bool,
+    max_solutions: usize,
 }
 
 fn usage_exit(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     eprintln!(
         "usage: lf2_stage6_event_edit [--file PATH] [--ti N] [--window N] \
-         [--limit N] [--self-test] [--dump-ties PATH]"
+         [--limit N] [--self-test] [--dump-ties PATH] \
+         [--two-edit] [--exhaustive] [--max-solutions N]"
     );
     eprintln!(
         "  --ti は違反でない tie も指定可 (編集で正常 tie を壊さないかの検証用途)"
+    );
+    eprintln!(
+        "  --two-edit: 二重編集探索 (Stage 8)。--ti 省略時は単一編集解なしの全違反を掃引"
     );
     std::process::exit(2);
 }
@@ -556,6 +572,9 @@ fn parse_args() -> Args {
         limit: None,
         self_test: false,
         dump_ties: None,
+        two_edit: false,
+        exhaustive: false,
+        max_solutions: 200,
     };
     let argv: Vec<String> = env::args().skip(1).collect();
     let next_val = |argv: &[String], i: usize| -> String {
@@ -599,6 +618,20 @@ fn parse_args() -> Args {
             }
             "--dump-ties" => {
                 args.dump_ties = Some(next_val(&argv, i));
+                i += 2;
+            }
+            "--two-edit" => {
+                args.two_edit = true;
+                i += 1;
+            }
+            "--exhaustive" => {
+                args.exhaustive = true;
+                i += 1;
+            }
+            "--max-solutions" => {
+                args.max_solutions = next_val(&argv, i)
+                    .parse()
+                    .unwrap_or_else(|_| usage_exit("--max-solutions は整数"));
                 i += 2;
             }
             other => usage_exit(&format!("unknown arg: {}", other)),
@@ -650,6 +683,12 @@ fn main() {
         return;
     }
 
+    // Stage 8: --ti 省略の --two-edit は「単一編集解なしの全違反」を自動掃引
+    if args.two_edit && args.ti.is_none() {
+        two_edit_sweep(&tokens, &input, &ties, &args);
+        return;
+    }
+
     // 2. 対象 ti と窓
     // --ti は違反でない tie の指定も意図的に許容する
     // (編集が正常 tie を壊さないことを検証する用途)
@@ -665,39 +704,15 @@ fn main() {
         target.ti, target.tick_start, target.max_len, target.chosen, target.baseline_ok
     );
 
-    let window_start_tick = target.tick_start.saturating_sub(args.window);
-    // 窓開始以前で最後のトークン境界を探す
-    let mut snap_ti: usize = 0;
-    let mut snap_tick: u64 = 0;
-    {
-        let mut tick: u64 = 0;
-        for (ti, tok) in tokens.iter().enumerate() {
-            if tick > window_start_tick || ti >= target.ti {
-                break;
-            }
-            snap_ti = ti;
-            snap_tick = tick;
-            tick += tok.emit_len() as u64;
-        }
-    }
+    let ctx = build_window(&tokens, &input, &ties, target, args.window);
+    let (snap_ti, base, window_ties) = (ctx.snap_ti, &ctx.base, &ctx.window_ties);
     println!(
         "window: [{}, {}) snapshot at token {} (tick {})",
-        window_start_tick, target.tick_start, snap_ti, snap_tick
+        target.tick_start.saturating_sub(args.window),
+        target.tick_start,
+        snap_ti,
+        ctx.base.tick
     );
-
-    // 3. スナップショットまで進める
-    let mut base = Sim::new(input.clone());
-    for tok in &tokens[..snap_ti] {
-        base.advance(tok.emit_len());
-    }
-    assert_eq!(base.tick, snap_tick);
-
-    // 窓内で判定対象になる tie (snap_ti <= ti <= target.ti)
-    let window_ties: Vec<TieInfo> = ties
-        .iter()
-        .filter(|t| t.ti >= snap_ti && t.ti <= target.ti)
-        .cloned()
-        .collect();
     println!(
         "window ties: {} (ok={} viol={})",
         window_ties.len(),
@@ -711,7 +726,7 @@ fn main() {
         let mut ok = true;
         // clone を窓内再生して各 tie の判定がベースラインと一致するか確認
         let mut cursor = snap_ti;
-        for t in &window_ties {
+        for t in window_ties {
             for tok in &tokens[cursor..t.ti] {
                 clone.advance(tok.emit_len());
             }
@@ -733,14 +748,7 @@ fn main() {
     }
 
     // 4. 窓内イベントの列挙 (record パス)
-    let events: Vec<Event> = {
-        let mut enumr = base.clone();
-        enumr.record = Some(Vec::new());
-        for tok in &tokens[snap_ti..target.ti] {
-            enumr.advance(tok.emit_len());
-        }
-        enumr.record.take().unwrap()
-    };
+    let events = &ctx.events;
     let n_ins = events
         .iter()
         .filter(|e| matches!(e.kind, EventKind::Ins | EventKind::InsSwap))
@@ -771,50 +779,14 @@ fn main() {
         n_del2
     );
 
+    if args.two_edit {
+        run_two_edit(&ctx, &tokens, args.exhaustive, args.max_solutions, true);
+        return;
+    }
+
     // 5. 総当たり: 各イベント × 適用可能編集で差分再生
     let t1 = std::time::Instant::now();
-    // (op_id, tick, edit, broken, fixed_others)
-    let mut solutions: Vec<(u64, u64, EditType, usize, usize)> = Vec::new();
-    let mut tried: usize = 0;
-    let event_iter: Vec<&Event> = match args.limit {
-        Some(l) => events.iter().take(l).collect(),
-        None => events.iter().collect(),
-    };
-    for ev in &event_iter {
-        for edit in EditType::ALL {
-            if !edit.applicable(ev.kind) {
-                continue;
-            }
-            tried += 1;
-            let mut sim = base.clone();
-            sim.edit_op = Some(ev.op_id);
-            sim.edit_type = edit;
-            // op_counter はスナップショット時点から続きで数えたいが、
-            // record パスと同一初期値である必要がある。base.op_counter を保持済み。
-            let mut target_ok = false;
-            let mut broken = 0usize;
-            let mut fixed_others = 0usize;
-            let mut cursor = snap_ti;
-            for t in &window_ties {
-                for tok in &tokens[cursor..t.ti] {
-                    sim.advance(tok.emit_len());
-                }
-                cursor = t.ti;
-                let tr = sim.trace(sim.r, t.max_len);
-                let ok_now = !tr.is_empty() && tr[0] == t.chosen;
-                if t.ti == target.ti {
-                    target_ok = ok_now;
-                } else if t.baseline_ok && !ok_now {
-                    broken += 1;
-                } else if !t.baseline_ok && ok_now {
-                    fixed_others += 1;
-                }
-            }
-            if target_ok {
-                solutions.push((ev.op_id, ev.tick, edit, broken, fixed_others));
-            }
-        }
-    }
+    let (solutions, tried) = single_edit_search(&ctx, &tokens, args.limit);
     println!(
         "brute force: tried={} edits in {:.1}s",
         tried,
@@ -826,9 +798,10 @@ fn main() {
         println!(
             "==> 単一編集解なし: ti={} は窓内 {} イベント × 編集タイプ全組合せで rank1 一致にならない",
             target.ti,
-            event_iter.len()
+            events.len()
         );
     } else {
+        let mut solutions = solutions;
         solutions.sort_by_key(|&(_, _, _, broken, _)| broken);
         println!(
             "==> 解 {} 件 (op_id, event_tick, edit_type, 壊れる正常tie数, 直る他違反数):",
@@ -846,6 +819,360 @@ fn main() {
         }
         let clean = solutions.iter().filter(|s| s.3 == 0).count();
         println!("  うち副作用ゼロ (broken=0): {}", clean);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 窓構築と探索 (Stage 6 単一編集 / Stage 8 二重編集)
+// ---------------------------------------------------------------------------
+
+/// 対象 tie の窓スナップショット一式。
+struct WindowCtx {
+    target: TieInfo,
+    snap_ti: usize,
+    /// 窓開始トークン境界の状態
+    base: Sim,
+    /// 判定対象 tie (snap_ti <= ti <= target.ti)
+    window_ties: Vec<TieInfo>,
+    /// 窓内イベント (無編集 record パス)
+    events: Vec<Event>,
+}
+
+fn build_window(
+    tokens: &[Token],
+    input: &[u8],
+    ties: &[TieInfo],
+    target: TieInfo,
+    window: u64,
+) -> WindowCtx {
+    let window_start_tick = target.tick_start.saturating_sub(window);
+    // 窓開始以前で最後のトークン境界を探す
+    let mut snap_ti: usize = 0;
+    {
+        let mut tick: u64 = 0;
+        for (ti, tok) in tokens.iter().enumerate() {
+            if tick > window_start_tick || ti >= target.ti {
+                break;
+            }
+            snap_ti = ti;
+            tick += tok.emit_len() as u64;
+        }
+    }
+    let mut base = Sim::new(input.to_vec());
+    for tok in &tokens[..snap_ti] {
+        base.advance(tok.emit_len());
+    }
+    let window_ties: Vec<TieInfo> = ties
+        .iter()
+        .filter(|t| t.ti >= snap_ti && t.ti <= target.ti)
+        .cloned()
+        .collect();
+    let events: Vec<Event> = {
+        let mut enumr = base.clone();
+        enumr.record = Some(Vec::new());
+        for tok in &tokens[snap_ti..target.ti] {
+            enumr.advance(tok.emit_len());
+        }
+        enumr.record.take().unwrap()
+    };
+    WindowCtx {
+        target,
+        snap_ti,
+        base,
+        window_ties,
+        events,
+    }
+}
+
+/// 編集設定済みの sim を token cursor から対象 ti まで再生し、
+/// (対象が rank1 一致か, 壊れた正常 tie 数, 直った他違反数) を返す。
+/// 判定は ti >= cursor の窓内 tie に限定。
+fn eval_replay(
+    mut sim: Sim,
+    ctx: &WindowCtx,
+    tokens: &[Token],
+    mut cursor: usize,
+) -> (bool, usize, usize) {
+    let mut target_ok = false;
+    let mut broken = 0usize;
+    let mut fixed_others = 0usize;
+    for t in &ctx.window_ties {
+        if t.ti < cursor {
+            continue;
+        }
+        for tok in &tokens[cursor..t.ti] {
+            sim.advance(tok.emit_len());
+        }
+        cursor = t.ti;
+        let tr = sim.trace(sim.r, t.max_len);
+        let ok_now = !tr.is_empty() && tr[0] == t.chosen;
+        if t.ti == ctx.target.ti {
+            target_ok = ok_now;
+        } else if t.baseline_ok && !ok_now {
+            broken += 1;
+        } else if !t.baseline_ok && ok_now {
+            fixed_others += 1;
+        }
+    }
+    (target_ok, broken, fixed_others)
+}
+
+type SingleSol = (u64, u64, EditType, usize, usize); // (op_id, tick, edit, broken, fixed)
+
+fn single_edit_search(
+    ctx: &WindowCtx,
+    tokens: &[Token],
+    limit: Option<usize>,
+) -> (Vec<SingleSol>, usize) {
+    let mut solutions = Vec::new();
+    let mut tried = 0usize;
+    let n = limit.unwrap_or(ctx.events.len()).min(ctx.events.len());
+    for ev in &ctx.events[..n] {
+        for edit in EditType::ALL {
+            if !edit.applicable(ev.kind) {
+                continue;
+            }
+            tried += 1;
+            let mut sim = ctx.base.clone();
+            sim.edits = vec![(ev.op_id, edit)];
+            let (target_ok, broken, fixed) = eval_replay(sim, ctx, tokens, ctx.snap_ti);
+            if target_ok {
+                solutions.push((ev.op_id, ev.tick, edit, broken, fixed));
+            }
+        }
+    }
+    (solutions, tried)
+}
+
+/// 二重編集の解: (edit1 op/tick, edit2 op/tick/type, broken)
+struct TwoSol {
+    op1: u64,
+    tick1: u64,
+    op2: u64,
+    tick2: u64,
+    ty2: EditType,
+    broken: usize,
+}
+
+/// Stage 8: 二重編集の総当たり。
+/// - 1編集目は del_promote_other 限定 (Stage 6 の 139 解が 100% del_promote_other)
+/// - 既定 heuristic: 1編集目候補を「対象 tie のクラスタ (trace 候補 + Leaf 採用ノード)
+///   に触る del-two (削除対象 p か昇格ノード q がクラスタ員)」に絞る。
+///   --exhaustive で窓内全 del-two に拡大
+/// - 2編集目候補は 1編集目適用後の再生を record し直して列挙する
+///   (編集後はイベント種が変わりうるため、無編集 record の使い回しは不正確)
+/// 返り値: (解リスト, 試行数, 打ち切りしたか)
+fn two_edit_search(
+    ctx: &WindowCtx,
+    tokens: &[Token],
+    exhaustive: bool,
+    max_solutions: usize,
+) -> (Vec<TwoSol>, usize, bool) {
+    // 対象 tie のクラスタ: ベースラインで target 直前まで再生して trace
+    let cluster: Vec<i32> = {
+        let mut sim = ctx.base.clone();
+        for tok in &tokens[ctx.snap_ti..ctx.target.ti] {
+            sim.advance(tok.emit_len());
+        }
+        let mut c = sim.trace(sim.r, ctx.target.max_len);
+        if !c.contains(&ctx.target.chosen) {
+            c.push(ctx.target.chosen);
+        }
+        c
+    };
+    let e1_cands: Vec<&Event> = ctx
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::DelTwo)
+        .filter(|e| exhaustive || cluster.contains(&e.node) || cluster.contains(&e.node2))
+        .collect();
+
+    let mut solutions: Vec<TwoSol> = Vec::new();
+    let mut tried = 0usize;
+    let mut capped = false;
+    'outer: for e1 in &e1_cands {
+        // 1編集目を適用して e1 実行直後のトークン境界まで進める
+        let mut sim1 = ctx.base.clone();
+        sim1.edits = vec![(e1.op_id, EditType::DelPromoteOther)];
+        let mut cursor = ctx.snap_ti;
+        while sim1.op_counter < e1.op_id && cursor < ctx.target.ti {
+            sim1.advance(tokens[cursor].emit_len());
+            cursor += 1;
+        }
+        // 1編集目適用後の残り窓を record し直して 2編集目候補を列挙
+        let events2: Vec<Event> = {
+            let mut rec = sim1.clone();
+            rec.record = Some(Vec::new());
+            for tok in &tokens[cursor..ctx.target.ti] {
+                rec.advance(tok.emit_len());
+            }
+            rec.record.take().unwrap()
+        };
+        for e2 in &events2 {
+            if e2.op_id <= e1.op_id {
+                continue;
+            }
+            for ty2 in EditType::ALL {
+                if !ty2.applicable(e2.kind) {
+                    continue;
+                }
+                tried += 1;
+                let mut sim2 = sim1.clone();
+                sim2.edits = vec![(e2.op_id, ty2)];
+                let (target_ok, broken, _) = eval_replay(sim2, ctx, tokens, cursor);
+                if target_ok {
+                    solutions.push(TwoSol {
+                        op1: e1.op_id,
+                        tick1: e1.tick,
+                        op2: e2.op_id,
+                        tick2: e2.tick,
+                        ty2,
+                        broken,
+                    });
+                    if solutions.len() >= max_solutions {
+                        capped = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    (solutions, tried, capped)
+}
+
+fn run_two_edit(
+    ctx: &WindowCtx,
+    tokens: &[Token],
+    exhaustive: bool,
+    max_solutions: usize,
+    verbose: bool,
+) -> (Vec<TwoSol>, usize, bool) {
+    let t0 = std::time::Instant::now();
+    let (mut solutions, tried, capped) = two_edit_search(ctx, tokens, exhaustive, max_solutions);
+    if verbose {
+        println!(
+            "two-edit: tried={} pairs in {:.1}s{}",
+            tried,
+            t0.elapsed().as_secs_f64(),
+            if capped { " (打ち切り)" } else { "" }
+        );
+        if solutions.is_empty() {
+            println!(
+                "==> 二重編集解なし (heuristic={}): ti={}",
+                if exhaustive { "off" } else { "on" },
+                ctx.target.ti
+            );
+        } else {
+            solutions.sort_by_key(|s| s.broken);
+            println!(
+                "==> 二重編集解 {} 件 (edit1=del_promote_other 固定):",
+                solutions.len()
+            );
+            for s in solutions.iter().take(20) {
+                println!(
+                    "  e1: op={} tick={} del_promote_other + e2: op={} tick={} {} broken={}",
+                    s.op1,
+                    s.tick1,
+                    s.op2,
+                    s.tick2,
+                    s.ty2.name(),
+                    s.broken
+                );
+            }
+            if solutions.len() > 20 {
+                println!("  ... (先頭 20 件のみ表示)");
+            }
+            print_two_edit_summary(&solutions);
+        }
+    }
+    (solutions, tried, capped)
+}
+
+/// Stage 8 掃引: 全違反について単一編集解の有無を確認し、
+/// 解なしの違反だけ二重編集探索を回す。
+fn two_edit_sweep(tokens: &[Token], input: &[u8], ties: &[TieInfo], args: &Args) {
+    let violations: Vec<TieInfo> = ties.iter().filter(|t| !t.baseline_ok).cloned().collect();
+    let t0 = std::time::Instant::now();
+    let mut single_solved = 0usize;
+    let mut two_solved = 0usize;
+    let mut unsolved: Vec<usize> = Vec::new();
+    let mut all_solutions: Vec<TwoSol> = Vec::new();
+    let mut capped_tis = 0usize;
+    for v in &violations {
+        let ctx = build_window(tokens, input, ties, *v, args.window);
+        let (ssol, _) = single_edit_search(&ctx, tokens, None);
+        if !ssol.is_empty() {
+            single_solved += 1;
+            println!("ti={}: 単一編集解あり ({}件) → skip", v.ti, ssol.len());
+            continue;
+        }
+        let (sols, tried, capped) =
+            run_two_edit(&ctx, tokens, args.exhaustive, args.max_solutions, false);
+        if capped {
+            capped_tis += 1;
+        }
+        if sols.is_empty() {
+            unsolved.push(v.ti);
+            println!("ti={}: 二重編集解なし (tried={})", v.ti, tried);
+        } else {
+            two_solved += 1;
+            let clean = sols.iter().filter(|s| s.broken == 0).count();
+            let same = sols
+                .iter()
+                .filter(|s| s.ty2 == EditType::DelPromoteOther)
+                .count();
+            println!(
+                "ti={}: 二重編集解 {} 件{} (broken=0: {}, e2同種: {}, tried={})",
+                v.ti,
+                sols.len(),
+                if capped { "+" } else { "" },
+                clean,
+                same,
+                tried
+            );
+            all_solutions.extend(sols);
+        }
+    }
+    println!(
+        "\n==> 掃引完了 ({:.0}s): 違反 {} 件 = 単一解あり {} / 二重解あり {} / 二重でも解なし {}{}",
+        t0.elapsed().as_secs_f64(),
+        violations.len(),
+        single_solved,
+        two_solved,
+        unsolved.len(),
+        if capped_tis > 0 {
+            format!(" (打ち切り {} ti)", capped_tis)
+        } else {
+            String::new()
+        }
+    );
+    if !all_solutions.is_empty() {
+        println!("二重編集解の組成 (全 ti 集計):");
+        print_two_edit_summary(&all_solutions);
+    }
+    if !unsolved.is_empty() {
+        println!("二重編集でも解なしの ti: {:?}", unsolved);
+    }
+}
+
+fn print_two_edit_summary(solutions: &[TwoSol]) {
+    let mut by_ty2: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for s in solutions {
+        *by_ty2.entry(s.ty2.name()).or_insert(0) += 1;
+    }
+    let same = by_ty2.get("del_promote_other").copied().unwrap_or(0);
+    let clean = solutions.iter().filter(|s| s.broken == 0).count();
+    let mut pairs: Vec<_> = by_ty2.iter().collect();
+    pairs.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    println!(
+        "  組成: 同種ペア(del_promote_other x2)={} / 異種ペア={} / broken=0: {}",
+        same,
+        solutions.len() - same,
+        clean
+    );
+    for (name, n) in pairs {
+        println!("    e2={}: {}", name, n);
     }
 }
 
@@ -988,8 +1315,7 @@ mod tests {
         ] {
             for &op in ops.iter() {
                 let mut sim = base.clone();
-                sim.edit_op = Some(op);
-                sim.edit_type = edit;
+                sim.edits = vec![(op, edit)];
                 sim.advance(6600);
                 assert_bst_invariants(&sim);
             }
@@ -1000,7 +1326,7 @@ mod tests {
         assert_bst_invariants(&plain);
     }
 
-    /// 無編集 (edit_op=None) の clone 再生が、clone 元をそのまま進めた場合と
+    /// 無編集 (edits 空) の clone 再生が、clone 元をそのまま進めた場合と
     /// 完全一致すること (編集フックの素通り性)。
     #[test]
     fn no_edit_passthrough() {
