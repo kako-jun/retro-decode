@@ -5613,6 +5613,52 @@ pub(crate) enum TailMode {
     Plus1,
 }
 
+/// 未書込みリング領域 (0x20 初期埋め) へのマッチ許可規則 (Issue #14 Stage 10-3)。
+///
+/// Stage 10-2 の観測で、KIND_DIFF 49 本中 42 本 (86%) で Sim の match position が
+/// 「一度も実際に書き込まれていない」ダミー初期化領域 (`write_tick` 未設定) を
+/// 指していると判明。「Leaf は一度も書き込まれていない領域へのマッチを許可
+/// しない」という仮説を検証する variant。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DummyMode {
+    /// 既存挙動 (無変更): 未書込み領域へのマッチも許可する。
+    Allow,
+    /// マッチ窓 (`match_position..match_position+match_length`) に未書込み
+    /// スロットが1つでも含まれれば、そのマッチ候補を不採用にし Literal に
+    /// フォールバックする。
+    RejectAny,
+    /// マッチ窓が**全域**未書込みの場合のみ不採用にする
+    /// (一部だけ未書込みの窓は許可する、より緩い規則)。
+    RejectAllUnwritten,
+    /// Stage 10-4 の発見 (拒否候補は例外なく `[r-F, r-1]` = ブートストラップ
+    /// ダミーノード帯 (r=N-F=4078 なので 4060..=4077) に collapse する) を
+    /// 受けた絞り込み variant 群 (Stage 10-5)。
+    ///
+    /// `in_bootstrap_band` / `at_bootstrap_edge` の帯判定はいずれも
+    /// **match の開始位置 (`match_position`) のみ**で行う。窓全体
+    /// (`match_position..match_position+match_length`) が帯とどれだけ
+    /// overlap するかは見ていない (窓の「未書込み」判定自体は別途
+    /// `any_unwritten`/`all_unwritten` で窓全体を見る)。
+    ///
+    /// v1: 候補位置がダミーノード帯かつ窓が全域未書込みなら不採用。
+    RejectBootstrapUnwritten,
+    /// v2: v1 に加えて `match_length > 10` のときのみ不採用にする
+    /// (Stage 10-4 実測: Leaf 採用済み fully-unwritten 窓の最大長は 10)。
+    RejectBootstrapUnwrittenLenGt10,
+    /// v3: 窓条件を問わず、候補位置が帯の端 (4076 or 4077、r に最も近い =
+    /// 最も新しいダミーノード) ならそれだけで不採用にする。
+    RejectBootstrapEdge,
+}
+
+/// Stage 10-4 で確認したブートストラップダミーノード帯: `insert_node(r-i)`
+/// (i=1..=F, r=N-F=4078) が挿入する合成ノードの位置範囲 `[r-F, r-1]`。
+/// N/F は定数なのでこの範囲も定数 (4060..=4077)。
+const BOOTSTRAP_DUMMY_LO: usize = N - F - F; // r - F = 4078 - 18 = 4060
+const BOOTSTRAP_DUMMY_HI: usize = N - F - 1; // r - 1 = 4078 - 1  = 4077
+/// 帯の端2スロット (`r-1`, `r-2` = 4077, 4076): 最も新しく挿入されたダミー
+/// ノード。`DummyMode::RejectBootstrapEdge` (v3) が狙う範囲。
+const BOOTSTRAP_DUMMY_EDGE_LO: usize = N - F - 2; // r - 2 = 4078 - 2 = 4076
+
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
     compress_okumura_impl_hooked(input, tie_mode, None, TailMode::Clip)
 }
@@ -5625,13 +5671,15 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
 ///
 /// `tail_mode` で入力末尾での `match_length` クリップ規則を切り替える
 /// (Issue #14 Stage 9 / Stage 9-2)。`TailMode` のドキュメント参照。
+///
+/// `dummy_mode` は既定で `DummyMode::Allow` (無変更) を使う内部ヘルパー。
 fn compress_okumura_impl_hooked(
     input: &[u8],
     tie_mode: TieMode,
     hook: Option<&mut MinAgeFullFHook>,
     tail_mode: TailMode,
 ) -> Vec<Token> {
-    compress_okumura_impl_hooked_traced(input, tie_mode, hook, tail_mode, None)
+    compress_okumura_impl_hooked_traced(input, tie_mode, hook, tail_mode, DummyMode::Allow, None)
 }
 
 /// Stage 9-2c 用トレース1ステップ: cap 適用前の生の match_length/match_position、
@@ -5649,11 +5697,19 @@ fn compress_okumura_impl_hooked_traced(
     tie_mode: TieMode,
     mut hook: Option<&mut MinAgeFullFHook>,
     tail_mode: TailMode,
+    dummy_mode: DummyMode,
     mut trace: Option<&mut Vec<TailTraceStep>>,
 ) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
     st.init_tree();
+
+    // Stage 10-3: 各リングスロットへの最終書込み input_pos。u32::MAX = 未書込み。
+    // `DummyMode::Allow` (既存呼び出し全て) では確保も更新も一切行わない
+    // (レビュー指摘: 無条件確保はコストが無駄。`None` のときは判定ブロック
+    // 自体に到達しない設計)。
+    let mut write_tick: Option<Vec<u32>> =
+        (!matches!(dummy_mode, DummyMode::Allow)).then(|| vec![u32::MAX; N]);
 
     let mut out: Vec<Token> = Vec::new();
 
@@ -5705,6 +5761,44 @@ fn compress_okumura_impl_hooked_traced(
             });
         }
 
+        // Stage 10-3: 未書込みリング領域へのマッチを不採用にする (dummy_mode)。
+        // マッチとして採用されるサイズ (> THRESHOLD) のときだけ判定する。
+        // 不採用ならその場で Literal にフォールバックする (match_length=1 に
+        // 落として下の THRESHOLD 分岐に流す。これは既存の「マッチが短すぎて
+        // Literal になる」経路と完全に同じ扱い)。
+        // `write_tick` が `None` (= `DummyMode::Allow`) のときはこのブロック
+        // 自体に入らない (既存経路は判定コスト・確保コストとも一切発生しない)。
+        if let Some(write_tick) = write_tick.as_ref() {
+            if st.match_length as usize > THRESHOLD {
+                let pos = (st.match_position as usize) & (N - 1);
+                let mlen = st.match_length as usize;
+                let mut any_unwritten = false;
+                let mut all_unwritten = true;
+                for k in 0..mlen {
+                    if write_tick[(pos + k) & (N - 1)] == u32::MAX {
+                        any_unwritten = true;
+                    } else {
+                        all_unwritten = false;
+                    }
+                }
+                let in_bootstrap_band = pos >= BOOTSTRAP_DUMMY_LO && pos <= BOOTSTRAP_DUMMY_HI;
+                let at_bootstrap_edge = pos == BOOTSTRAP_DUMMY_HI || pos == BOOTSTRAP_DUMMY_EDGE_LO;
+                let reject = match dummy_mode {
+                    DummyMode::Allow => false,
+                    DummyMode::RejectAny => any_unwritten,
+                    DummyMode::RejectAllUnwritten => all_unwritten,
+                    DummyMode::RejectBootstrapUnwritten => in_bootstrap_band && all_unwritten,
+                    DummyMode::RejectBootstrapUnwrittenLenGt10 => {
+                        in_bootstrap_band && all_unwritten && mlen > 10
+                    }
+                    DummyMode::RejectBootstrapEdge => at_bootstrap_edge,
+                };
+                if reject {
+                    st.match_length = 1;
+                }
+            }
+        }
+
         // 出力
         if (st.match_length as usize) <= THRESHOLD {
             st.match_length = 1;
@@ -5742,6 +5836,13 @@ fn compress_okumura_impl_hooked_traced(
             // s < F-1 のときは末尾 overlap 領域にもコピー
             if (s as usize) < F - 1 {
                 st.text_buf[s as usize + N] = c;
+            }
+            // Stage 10-3: このスロットに実データが書かれた input_pos を記録
+            // (`DummyMode::Allow` では `write_tick` が `None` のため更新自体
+            // 発生しない。既存の write_tick 定義 [write_tick[slot] = 最後に
+            // 書いた byte の input_pos] と同一の規約)。
+            if let Some(write_tick) = write_tick.as_mut() {
+                write_tick[s as usize] = (input_idx - 1) as u32;
             }
 
             s = (s + 1) & (N as i32 - 1);
@@ -5836,9 +5937,135 @@ pub fn compress_okumura_tail_plus1_traced(input: &[u8]) -> (Vec<Token>, Vec<Tail
         TieMode::StrictGt,
         None,
         TailMode::Plus1,
+        DummyMode::Allow,
         Some(&mut trace),
     );
     (tokens, trace)
+}
+
+/// Stage 10-3 (Issue #14): Clip + 未書込み領域マッチ不採用 (`DummyMode::RejectAny`)。
+///
+/// マッチ窓に未書込みスロットが1つでも含まれれば Literal にフォールバックする。
+/// Stage 10-2 で KIND_DIFF 49 本中 42 本が Sim 側の未書込み領域マッチだったこと
+/// を受けた仮説「Leaf は一度も書き込まれていない領域へのマッチを許可しない」の検証。
+pub fn compress_okumura_clip_no_dummy_any(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectAny,
+        None,
+    )
+}
+
+/// Stage 10-3 (Issue #14): Plus1 + 未書込み領域マッチ不採用 (`DummyMode::RejectAny`)。
+pub fn compress_okumura_plus1_no_dummy_any(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectAny,
+        None,
+    )
+}
+
+/// Stage 10-3 (Issue #14): Clip + 未書込み領域マッチ不採用 (`DummyMode::RejectAllUnwritten`、
+/// 窓全体が未書込みのときのみ不採用にする緩い規則)。
+pub fn compress_okumura_clip_no_dummy_all(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectAllUnwritten,
+        None,
+    )
+}
+
+/// Stage 10-3 (Issue #14): Plus1 + 未書込み領域マッチ不採用 (`DummyMode::RejectAllUnwritten`)。
+pub fn compress_okumura_plus1_no_dummy_all(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectAllUnwritten,
+        None,
+    )
+}
+
+/// Stage 10-5 (Issue #14) v1: Clip + `DummyMode::RejectBootstrapUnwritten`。
+pub fn compress_okumura_clip_no_bootstrap_v1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectBootstrapUnwritten,
+        None,
+    )
+}
+
+/// Stage 10-5 (Issue #14) v1: Plus1 + `DummyMode::RejectBootstrapUnwritten`。
+pub fn compress_okumura_plus1_no_bootstrap_v1(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectBootstrapUnwritten,
+        None,
+    )
+}
+
+/// Stage 10-5 (Issue #14) v2: Clip + `DummyMode::RejectBootstrapUnwrittenLenGt10`。
+pub fn compress_okumura_clip_no_bootstrap_v2(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectBootstrapUnwrittenLenGt10,
+        None,
+    )
+}
+
+/// Stage 10-5 (Issue #14) v2: Plus1 + `DummyMode::RejectBootstrapUnwrittenLenGt10`。
+pub fn compress_okumura_plus1_no_bootstrap_v2(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectBootstrapUnwrittenLenGt10,
+        None,
+    )
+}
+
+/// Stage 10-5 (Issue #14) v3: Clip + `DummyMode::RejectBootstrapEdge`。
+pub fn compress_okumura_clip_no_bootstrap_v3(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectBootstrapEdge,
+        None,
+    )
+}
+
+/// Stage 10-5 (Issue #14) v3: Plus1 + `DummyMode::RejectBootstrapEdge`。
+pub fn compress_okumura_plus1_no_bootstrap_v3(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectBootstrapEdge,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -7136,6 +7363,53 @@ mod tests {
                 "expected Plus1 to flip to a Match(len=3) at this boundary, got {:?}",
                 other
             ),
+        }
+    }
+
+    /// Stage 10-5 (Issue #14): `DummyMode::RejectBootstrapUnwritten` (v1) は
+    /// ブートストラップダミーノード帯 `[N-F-F, N-F-1]` (= `[4060, 4077]`) への
+    /// 全域未書込みマッチだけを不採用にする。
+    ///
+    /// 20 バイトの空白列 (0x20) は、リング初期化そのものが 0x20 のため token 0
+    /// の時点で「木に挿入済みのノードは最初の F 個のダミー (r-1..r-F =
+    /// 4077..4060) と r=4078 だけ」という奥村ブートストラップの構造がそのまま
+    /// 露出し、Basic (Clip, dummy 許可) は帯の中の pos=4060 を選ぶ
+    /// (Stage 10-4 で観測した「拒否候補は帯に collapse する」の再現)。
+    /// v1 はこれを不採用にし、literal 1 個を挟んで帯の外 (pos=4078、実際の
+    /// 先読みバッファ) の候補に切り替わる。
+    #[test]
+    fn no_bootstrap_v1_rejects_dummy_node_band_match() {
+        let input = vec![0x20u8; 20];
+        let base = compress_okumura(&input);
+        let v1 = compress_okumura_clip_no_bootstrap_v1(&input);
+
+        assert_eq!(decode_oku_tokens(&base), input, "Basic must roundtrip");
+        assert_eq!(decode_oku_tokens(&v1), input, "v1 must roundtrip");
+
+        match base.first() {
+            Some(Token::Match { pos, .. }) => {
+                assert!(
+                    (*pos as usize) >= BOOTSTRAP_DUMMY_LO && (*pos as usize) <= BOOTSTRAP_DUMMY_HI,
+                    "test fixture must exercise a bootstrap-band match in Basic, got pos={}",
+                    pos
+                );
+            }
+            other => panic!("expected Basic to open with a Match, got {:?}", other),
+        }
+
+        // v1: 帯内マッチが不採用になり、まず Literal になる
+        assert!(
+            matches!(v1.first(), Some(Token::Literal(_))),
+            "v1 must reject the bootstrap-band match and fall back to Literal first, got {:?}",
+            v1.first()
+        );
+        // その後の Match は帯の外を指す
+        if let Some(Token::Match { pos, .. }) = v1.get(1) {
+            assert!(
+                !((*pos as usize) >= BOOTSTRAP_DUMMY_LO && (*pos as usize) <= BOOTSTRAP_DUMMY_HI),
+                "v1's fallback Match must point outside the bootstrap band, got pos={}",
+                pos
+            );
         }
     }
 }
