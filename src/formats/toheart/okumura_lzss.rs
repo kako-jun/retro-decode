@@ -5648,6 +5648,14 @@ pub(crate) enum DummyMode {
     /// v3: 窓条件を問わず、候補位置が帯の端 (4076 or 4077、r に最も近い =
     /// 最も新しいダミーノード) ならそれだけで不採用にする。
     RejectBootstrapEdge,
+    /// Stage 11-4 (Issue #14) v4: v1 の write_tick 偽陽性を補正した精緻化版。
+    /// 候補窓の**全バイトが「bootstrap 合成 0x20」のみ**で構成される場合に
+    /// 限り不採用にする。初期先読み充填領域 (`r..r+F-1` = 4078..4095、実
+    /// データ) は `is_real_slot` で常に「実在」扱いにするため、帯 [4060,4077]
+    /// 始まりの候補でも窓が 4078 以降の実データにまたがれば許可される
+    /// (帯端 4077 の救済)。位置帯 (`in_bootstrap_band`) は判定に使わない
+    /// (v1/v2/v3 と異なり、窓の内容だけで判定する)。
+    RejectPureBootstrap,
 }
 
 /// Stage 10-4 で確認したブートストラップダミーノード帯: `insert_node(r-i)`
@@ -5658,6 +5666,12 @@ const BOOTSTRAP_DUMMY_HI: usize = N - F - 1; // r - 1 = 4078 - 1  = 4077
 /// 帯の端2スロット (`r-1`, `r-2` = 4077, 4076): 最も新しく挿入されたダミー
 /// ノード。`DummyMode::RejectBootstrapEdge` (v3) が狙う範囲。
 const BOOTSTRAP_DUMMY_EDGE_LO: usize = N - F - 2; // r - 2 = 4078 - 2 = 4076
+/// 初期先読み充填領域: `r_init..r_init+F-1` = `4078..4095`。実データだが
+/// write_tick は更新されない (Stage 10-4 の偽陽性ギャップ)。
+/// `DummyMode::RejectPureBootstrap` (v4) はこの範囲を「実在」として扱う
+/// ことでこの偽陽性を補正する。
+const INITIAL_LOOKAHEAD_LO: usize = N - F; // r_init = 4078
+const INITIAL_LOOKAHEAD_HI: usize = N - 1; // 4095
 
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
     compress_okumura_impl_hooked(input, tie_mode, None, TailMode::Clip)
@@ -5783,6 +5797,14 @@ fn compress_okumura_impl_hooked_traced(
                 }
                 let in_bootstrap_band = pos >= BOOTSTRAP_DUMMY_LO && pos <= BOOTSTRAP_DUMMY_HI;
                 let at_bootstrap_edge = pos == BOOTSTRAP_DUMMY_HI || pos == BOOTSTRAP_DUMMY_EDGE_LO;
+                // v4: 窓の全バイトが「実在しない (未書込み かつ 初期先読み充填域
+                // でもない)」場合のみ true。初期先読み充填域 (4078..4095) は
+                // write_tick 未更新でも「実在」扱いする (Stage 10-4 の偽陽性補正)。
+                let all_pure_bootstrap = (0..mlen).all(|k| {
+                    let slot = (pos + k) & (N - 1);
+                    let is_lookahead = slot >= INITIAL_LOOKAHEAD_LO && slot <= INITIAL_LOOKAHEAD_HI;
+                    write_tick[slot] == u32::MAX && !is_lookahead
+                });
                 let reject = match dummy_mode {
                     DummyMode::Allow => false,
                     DummyMode::RejectAny => any_unwritten,
@@ -5792,6 +5814,7 @@ fn compress_okumura_impl_hooked_traced(
                         in_bootstrap_band && all_unwritten && mlen > 10
                     }
                     DummyMode::RejectBootstrapEdge => at_bootstrap_edge,
+                    DummyMode::RejectPureBootstrap => all_pure_bootstrap,
                 };
                 if reject {
                     st.match_length = 1;
@@ -6064,6 +6087,30 @@ pub fn compress_okumura_plus1_no_bootstrap_v3(input: &[u8]) -> Vec<Token> {
         None,
         TailMode::Plus1,
         DummyMode::RejectBootstrapEdge,
+        None,
+    )
+}
+
+/// Stage 11-4 (Issue #14) v4: Clip + `DummyMode::RejectPureBootstrap`。
+pub fn compress_okumura_clip_no_bootstrap_v4(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectPureBootstrap,
+        None,
+    )
+}
+
+/// Stage 11-4 (Issue #14) v4: Plus1 + `DummyMode::RejectPureBootstrap`。
+pub fn compress_okumura_plus1_no_bootstrap_v4(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectPureBootstrap,
         None,
     )
 }
