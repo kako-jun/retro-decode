@@ -5676,23 +5676,38 @@ pub fn compress_okumura_rank1_minage(input: &[u8]) -> Vec<Token> {
         } else {
             let mut pos = (st.match_position as u16) & ((N as u16) - 1);
             if st.match_length as usize == F {
-                // full-F tie 規則: 全 full-F 候補から cand_age_start 最小を採用
+                // full-F tie 規則: full-F 候補から cand_age_start 最小を採用。
+                // ただし Stage 2 の検証データは n_max <= 32 (v12 N_MAX_CAP) の
+                // グループに限られるため、それを超える巨大 tie (未書込み 0x20
+                // 領域の縮退 tie 等) は規則の適用範囲外 → insert_node の選択を維持。
+                // 最小 age が一意でない場合 (全候補未書込み u32::MAX 等) も
+                // 規則では決められないので insert_node の選択を維持する。
+                const N_MAX_CAP: usize = 32;
                 let candidates =
                     enumerate_match_candidates_with_writeback(&ring, input, input_pos, shadow_r);
-                let mut best: Option<(u32, u16)> = None;
-                for c in candidates.iter().filter(|c| c.len as usize == F) {
-                    let ps = (c.pos as usize) & 0x0fff;
-                    let age = if write_tick[ps] == u32::MAX {
-                        u32::MAX
-                    } else {
-                        (input_pos as u32).saturating_sub(write_tick[ps])
-                    };
-                    if best.map_or(true, |(best_age, _)| age < best_age) {
-                        best = Some((age, c.pos));
+                let full: Vec<(u32, u16)> = candidates
+                    .iter()
+                    .filter(|c| c.len as usize == F)
+                    .map(|c| {
+                        let ps = (c.pos as usize) & 0x0fff;
+                        let age = if write_tick[ps] == u32::MAX {
+                            u32::MAX
+                        } else {
+                            (input_pos as u32).saturating_sub(write_tick[ps])
+                        };
+                        (age, c.pos)
+                    })
+                    .collect();
+                if full.len() >= 2 && full.len() <= N_MAX_CAP {
+                    let min_age = full.iter().map(|&(a, _)| a).min().unwrap();
+                    let mins: Vec<u16> = full
+                        .iter()
+                        .filter(|&&(a, _)| a == min_age)
+                        .map(|&(_, p)| p)
+                        .collect();
+                    if mins.len() == 1 && min_age != u32::MAX {
+                        pos = mins[0];
                     }
-                }
-                if let Some((_, best_pos)) = best {
-                    pos = best_pos;
                 }
             }
             out.push(Token::Match {
@@ -5825,21 +5840,35 @@ mod tests {
     /// Stage 3: full-F tie の override で min-age (最も新しく書かれた) 候補が
     /// 選ばれることを確認する。
     ///
-    /// 入力 = スペース 54 個。初期 ring は全 slot 0x20 なので毎トークン
-    /// full-F 候補が大量に tie する。
-    /// - token0 (input_pos=0): 全 slot 未書込み → 全候補 age=u32::MAX で同着、
-    ///   列挙順 (pos 昇順) 先頭の pos=0 を採用
-    /// - token1 (input_pos=18): slot 4078..4095 が tick 0..17 で書込み済み。
-    ///   min age = 直近書込み slot 4095 (age=1)
-    /// - token2 (input_pos=36): slot 0..17 が tick 18..35 → min age = pos 17
+    /// 入力 = P(18byte 固有パターン) + P + 固有 filler 30byte + P。
+    /// 3 回目の P に対する full-F 候補は書込み済み 2 箇所のみ:
+    /// - 1 回目の P: ring 4078..4095 (tick 0..17)  → age 66
+    /// - 2 回目の P: ring 0..17    (tick 18..35) → age 48 (min)
+    /// n_max=2 (<=32)・min age 一意なので override が発動し pos=0 を選ぶ。
     #[test]
     fn rank1_minage_full_f_override_picks_most_recent_write() {
-        let input = vec![b' '; 54];
+        let p: Vec<u8> = (0..F as u8).map(|i| 0x41 + i).collect();
+        let filler: Vec<u8> = (0..30u8).map(|i| 0xC0 + i).collect();
+        let mut input = Vec::new();
+        input.extend_from_slice(&p);
+        input.extend_from_slice(&p);
+        input.extend_from_slice(&filler);
+        input.extend_from_slice(&p);
         let toks = compress_okumura_rank1_minage(&input);
-        assert_eq!(toks.len(), 3);
-        assert_eq!(toks[0], Token::Match { pos: 0, len: F as u8 });
-        assert_eq!(toks[1], Token::Match { pos: 4095, len: F as u8 });
-        assert_eq!(toks[2], Token::Match { pos: 17, len: F as u8 });
+        // 最後のトークンが 3 回目の P の full-F match で、min-age の 2 回目
+        // コピー (ring pos 0) を指すこと
+        let last = *toks.last().unwrap();
+        assert_eq!(last, Token::Match { pos: 0, len: F as u8 });
+    }
+
+    /// Stage 3: 巨大 tie (n_max > 32, 全候補未書込みの縮退 tie) では override
+    /// せず Basic (insert_node) の選択を維持すること。
+    #[test]
+    fn rank1_minage_degenerate_huge_tie_keeps_basic_choice() {
+        let input = vec![b' '; 54];
+        let a = compress_okumura(&input);
+        let b = compress_okumura_rank1_minage(&input);
+        assert_eq!(a, b);
     }
 
     /// Stage 3: full-F match が出ない入力では Basic (compress_okumura) と
