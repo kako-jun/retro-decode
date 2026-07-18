@@ -5523,7 +5523,98 @@ fn encode_loop(
     }
 }
 
+/// Stage 3 (Issue #14) の full-F min-age override 用 shadow 状態。
+///
+/// Leaf decoder と同一の ring 状態 (`ring`) と、各 slot の最終書込み tick
+/// (`write_tick`、v12 dataset の `cand_age_start` と同一定義) を、
+/// エンコード進行に合わせて teacher-forcing なしで維持する。
+struct MinAgeFullFHook {
+    ring: [u8; N],
+    write_tick: [u32; N],
+    shadow_r: usize,
+    input_pos: usize,
+}
+
+impl MinAgeFullFHook {
+    fn new() -> Self {
+        Self {
+            ring: [0x20u8; N],
+            write_tick: [u32::MAX; N],
+            shadow_r: N - F,
+            input_pos: 0,
+        }
+    }
+
+    /// full-F tie 規則: full-F 候補から cand_age_start 最小を採用。
+    /// ただし Stage 2 の検証データは n_max <= 32 (v12 N_MAX_CAP) の
+    /// グループに限られるため、それを超える巨大 tie (未書込み 0x20
+    /// 領域の縮退 tie 等) は規則の適用範囲外 → insert_node の選択を維持。
+    /// 最小 age が一意でない場合 (全候補未書込み u32::MAX 等) も
+    /// 規則では決められないので insert_node の選択を維持する。
+    fn override_full_f_pos(&self, input: &[u8]) -> Option<u16> {
+        use super::lf2_tokens::enumerate_match_candidates_with_writeback;
+        const N_MAX_CAP: usize = 32;
+        let candidates = enumerate_match_candidates_with_writeback(
+            &self.ring,
+            input,
+            self.input_pos,
+            self.shadow_r,
+        );
+        let full: Vec<(u32, u16)> = candidates
+            .iter()
+            .filter(|c| c.len as usize == F)
+            .map(|c| {
+                let ps = (c.pos as usize) & 0x0fff;
+                let age = if self.write_tick[ps] == u32::MAX {
+                    u32::MAX
+                } else {
+                    (self.input_pos as u32).saturating_sub(self.write_tick[ps])
+                };
+                (age, c.pos)
+            })
+            .collect();
+        if full.len() >= 2 && full.len() <= N_MAX_CAP {
+            let min_age = full.iter().map(|&(a, _)| a).min().unwrap();
+            let mins: Vec<u16> = full
+                .iter()
+                .filter(|&&(a, _)| a == min_age)
+                .map(|&(_, p)| p)
+                .collect();
+            if mins.len() == 1 && min_age != u32::MAX {
+                return Some(mins[0]);
+            }
+        }
+        None
+    }
+
+    /// shadow ring を出力バイト分進める (v12 の ring/write_tick 更新と同一)
+    fn advance(&mut self, input: &[u8], emitted: usize) {
+        for _ in 0..emitted {
+            if self.input_pos >= input.len() {
+                break;
+            }
+            self.ring[self.shadow_r] = input[self.input_pos];
+            self.write_tick[self.shadow_r] = self.input_pos as u32;
+            self.shadow_r = (self.shadow_r + 1) & (N - 1);
+            self.input_pos += 1;
+        }
+    }
+}
+
 fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
+    compress_okumura_impl_hooked(input, tie_mode, None)
+}
+
+/// 奥村 lzss.c `Encode()` 逐語移植の共通実装。
+///
+/// `hook` が `None` のとき従来の `compress_okumura_impl` と完全に同一の挙動。
+/// `Some` のときのみ、出力 Match の `match_length == F` の箇所で
+/// `MinAgeFullFHook::override_full_f_pos` による `match_position` 差し替えを試みる。
+fn compress_okumura_impl_hooked(
+    input: &[u8],
+    tie_mode: TieMode,
+    mut hook: Option<&mut MinAgeFullFHook>,
+) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
     st.init_tree();
@@ -5566,13 +5657,25 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
             out.push(Token::Literal(st.text_buf[r as usize]));
         } else {
             // match_position は InsertNode 内で必ず 0..N の範囲に収まる（ring index）
+            let mut pos = (st.match_position as u16) & ((N as u16) - 1);
+            if st.match_length as usize == F {
+                if let Some(h) = hook.as_deref() {
+                    if let Some(p) = h.override_full_f_pos(input) {
+                        pos = p;
+                    }
+                }
+            }
             out.push(Token::Match {
-                pos: (st.match_position as u16) & ((N as u16) - 1),
+                pos,
                 len: st.match_length as u8,
             });
         }
 
         let last_match_length = st.match_length as usize;
+
+        if let Some(h) = hook.as_deref_mut() {
+            h.advance(input, last_match_length);
+        }
 
         // last_match_length 回 ring を進める
         let mut i = 0usize;
@@ -5625,144 +5728,18 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
 /// - Stage 2 検証: max_len==F の tie 522,913 グループで min-age 規則の的中率 100.00%
 /// - max_len < F は奥村 insert_node (rank=1) の返す match をそのまま使う (99.73%)
 ///
+/// **Stage 3 実測の負結果 (2026-07-17)**: 本 variant の 522 本 byte-exact は
+/// 165/522 で素の Basic と完全同一集合 (トークン相違 0 ファイル)。規則 1 は
+/// 「Basic の insert_node 選択の記述」であり、Basic を超える修正力は無い。
+///
 /// age の定義は `lf2_pairwise_dataset_v12.rs` の `cand_age_start` を踏襲:
 ///   pos_start = cand_pos & 0x0fff
 ///   age = write_tick[pos_start] == u32::MAX ? u32::MAX
 ///                                          : input_pos - write_tick[pos_start]
 /// (write_tick[slot] = その slot に最後に書いた byte の input_pos)
 pub fn compress_okumura_rank1_minage(input: &[u8]) -> Vec<Token> {
-    use super::lf2_tokens::enumerate_match_candidates_with_writeback;
-
-    let mut st = Okumura::new(0x20);
-    st.tie_mode = TieMode::StrictGt;
-    st.init_tree();
-
-    let mut out: Vec<Token> = Vec::new();
-
-    let mut r: i32 = (N - F) as i32;
-    let mut s: i32 = 0;
-
-    let mut input_idx: usize = 0;
-    let mut len: usize = 0;
-    while len < F && input_idx < input.len() {
-        st.text_buf[r as usize + len] = input[input_idx];
-        input_idx += 1;
-        len += 1;
-    }
-
-    if len == 0 {
-        return out;
-    }
-
-    for i in 1..=F {
-        st.insert_node(r - i as i32);
-    }
-    st.insert_node(r);
-
-    // shadow: Leaf decoder と同じ ring 状態 + 各 slot の最終書込み tick (v12 と同一)
-    let mut ring = [0x20u8; N];
-    let mut write_tick: [u32; N] = [u32::MAX; N];
-    let mut shadow_r: usize = N - F;
-    let mut input_pos: usize = 0;
-
-    loop {
-        if st.match_length as usize > len {
-            st.match_length = len as i32;
-        }
-
-        if (st.match_length as usize) <= THRESHOLD {
-            st.match_length = 1;
-            out.push(Token::Literal(st.text_buf[r as usize]));
-        } else {
-            let mut pos = (st.match_position as u16) & ((N as u16) - 1);
-            if st.match_length as usize == F {
-                // full-F tie 規則: full-F 候補から cand_age_start 最小を採用。
-                // ただし Stage 2 の検証データは n_max <= 32 (v12 N_MAX_CAP) の
-                // グループに限られるため、それを超える巨大 tie (未書込み 0x20
-                // 領域の縮退 tie 等) は規則の適用範囲外 → insert_node の選択を維持。
-                // 最小 age が一意でない場合 (全候補未書込み u32::MAX 等) も
-                // 規則では決められないので insert_node の選択を維持する。
-                const N_MAX_CAP: usize = 32;
-                let candidates =
-                    enumerate_match_candidates_with_writeback(&ring, input, input_pos, shadow_r);
-                let full: Vec<(u32, u16)> = candidates
-                    .iter()
-                    .filter(|c| c.len as usize == F)
-                    .map(|c| {
-                        let ps = (c.pos as usize) & 0x0fff;
-                        let age = if write_tick[ps] == u32::MAX {
-                            u32::MAX
-                        } else {
-                            (input_pos as u32).saturating_sub(write_tick[ps])
-                        };
-                        (age, c.pos)
-                    })
-                    .collect();
-                if full.len() >= 2 && full.len() <= N_MAX_CAP {
-                    let min_age = full.iter().map(|&(a, _)| a).min().unwrap();
-                    let mins: Vec<u16> = full
-                        .iter()
-                        .filter(|&&(a, _)| a == min_age)
-                        .map(|&(_, p)| p)
-                        .collect();
-                    if mins.len() == 1 && min_age != u32::MAX {
-                        pos = mins[0];
-                    }
-                }
-            }
-            out.push(Token::Match {
-                pos,
-                len: st.match_length as u8,
-            });
-        }
-
-        let last_match_length = st.match_length as usize;
-
-        // shadow ring を出力バイト分進める (v12 の ring/write_tick 更新と同一)
-        for _ in 0..last_match_length {
-            if input_pos >= input.len() {
-                break;
-            }
-            ring[shadow_r] = input[input_pos];
-            write_tick[shadow_r] = input_pos as u32;
-            shadow_r = (shadow_r + 1) & (N - 1);
-            input_pos += 1;
-        }
-
-        let mut i = 0usize;
-        while i < last_match_length && input_idx < input.len() {
-            st.delete_node(s);
-            let c = input[input_idx];
-            input_idx += 1;
-
-            st.text_buf[s as usize] = c;
-            if (s as usize) < F - 1 {
-                st.text_buf[s as usize + N] = c;
-            }
-
-            s = (s + 1) & (N as i32 - 1);
-            r = (r + 1) & (N as i32 - 1);
-            st.insert_node(r);
-            i += 1;
-        }
-
-        while i < last_match_length {
-            st.delete_node(s);
-            s = (s + 1) & (N as i32 - 1);
-            r = (r + 1) & (N as i32 - 1);
-            len -= 1;
-            if len > 0 {
-                st.insert_node(r);
-            }
-            i += 1;
-        }
-
-        if len == 0 {
-            break;
-        }
-    }
-
-    out
+    let mut hook = MinAgeFullFHook::new();
+    compress_okumura_impl_hooked(input, TieMode::StrictGt, Some(&mut hook))
 }
 
 #[cfg(test)]

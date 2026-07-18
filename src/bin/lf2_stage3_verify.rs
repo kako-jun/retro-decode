@@ -172,6 +172,9 @@ fn main() -> ExitCode {
         let reenc = tokens_to_lf2_payload(&tokens);
         let orig = &data[ps..];
 
+        // 注: 元ファイル末尾に decoder が消費しない trailing bytes がある場合、
+        // 再圧縮ペイロードは短くなり不一致側に倒れる。既存 verify 系
+        // (lf2_okumura_bench 等) と同じ割り切りで byte-exact を判定する。
         let is_match = orig == reenc.as_slice();
         let first_diff = if is_match {
             String::from("-")
@@ -195,6 +198,11 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
     if let Ok(mut f) = fs::File::create(&out_path) {
         for n in &matched_names {
             let _ = writeln!(f, "{}", n);

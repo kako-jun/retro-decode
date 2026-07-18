@@ -1,7 +1,13 @@
 //! Stage 3 デバッグ: 新 variant のトークン列と Leaf 実トークン列の最初の相違点を
 //! 特定し、その時点の候補集合・age・tie 状況を表示する (Issue #14)。
 //!
-//! usage: cargo run --release --bin lf2_stage3_debug -- <FILE.LF2>
+//! usage:
+//!   cargo run --release --bin lf2_stage3_debug -- <FILE.LF2>
+//!   cargo run --release --bin lf2_stage3_debug -- --summary <DIR> [N]
+//!   cargo run --release --bin lf2_stage3_debug -- --vsbasic <DIR> [N]
+//!
+//! --summary / --vsbasic の CSV は全行 4 列 (name,class,diff_idx,input_pos。
+//! 該当なしの列は "-")
 
 use std::env;
 use std::fs;
@@ -25,17 +31,21 @@ const LF2_MAGIC: &[u8] = b"LEAF256\0";
 fn summarize(path: &std::path::Path) {
     let name = path.file_name().unwrap().to_str().unwrap();
     let data = fs::read(path).unwrap();
-    if &data[0..8] != LF2_MAGIC {
-        println!("{},PARSE_FAIL,,", name);
+    if data.len() < 0x18 || &data[0..8] != LF2_MAGIC {
+        println!("{},PARSE_FAIL,-,-", name);
         return;
     }
     let width = u16::from_le_bytes([data[12], data[13]]);
     let height = u16::from_le_bytes([data[14], data[15]]);
     let ps = 0x18 + (data[0x16] as usize) * 3;
+    if ps > data.len() {
+        println!("{},PARSE_FAIL,-,-", name);
+        return;
+    }
     let decoded = match decompress_to_tokens(&data[ps..], width, height) {
         Ok(d) => d,
         Err(_) => {
-            println!("{},DECODE_FAIL,,", name);
+            println!("{},DECODE_FAIL,-,-", name);
             return;
         }
     };
@@ -57,7 +67,7 @@ fn summarize(path: &std::path::Path) {
         }
     }
     let Some(di) = diff_idx else {
-        println!("{},MATCH,{},", name, decoded.tokens.len());
+        println!("{},MATCH,-,-", name);
         return;
     };
 
@@ -111,6 +121,14 @@ fn summarize(path: &std::path::Path) {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("usage: {} <FILE.LF2> | --summary <DIR> [N] | --vsbasic <DIR> [N]", args[0]);
+        return ExitCode::from(2);
+    }
+    if (args[1] == "--summary" || args[1] == "--vsbasic") && args.len() < 3 {
+        eprintln!("usage: {} {} <DIR> [N]", args[0], args[1]);
+        return ExitCode::from(2);
+    }
     if args[1] == "--summary" {
         // dir 内全ファイルの最初の相違を1行分類で出す
         let mut files: Vec<_> = fs::read_dir(&args[2])
@@ -153,7 +171,7 @@ fn main() -> ExitCode {
         let mut total = 0usize;
         for f in &files {
             let data = fs::read(f).unwrap();
-            if &data[0..8] != LF2_MAGIC {
+            if data.len() < 0x18 || &data[0..8] != LF2_MAGIC {
                 continue;
             }
             let width = u16::from_le_bytes([data[12], data[13]]);
@@ -171,14 +189,18 @@ fn main() -> ExitCode {
                 + a.len().abs_diff(b.len());
             if ndiff > 0 {
                 files_diff += 1;
-                println!("{},{}", f.file_name().unwrap().to_str().unwrap(), ndiff);
+                println!(
+                    "{},DIFF_VS_BASIC,{},-",
+                    f.file_name().unwrap().to_str().unwrap(),
+                    ndiff
+                );
             }
         }
         eprintln!("files={} files_with_diff_vs_basic={}", total, files_diff);
         return ExitCode::SUCCESS;
     }
     let data = fs::read(&args[1]).expect("read");
-    assert_eq!(&data[0..8], LF2_MAGIC);
+    assert!(data.len() >= 0x18 && &data[0..8] == LF2_MAGIC, "not an LF2 file");
     let width = u16::from_le_bytes([data[12], data[13]]);
     let height = u16::from_le_bytes([data[14], data[15]]);
     let colors = data[0x16] as usize;
