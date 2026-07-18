@@ -22,7 +22,11 @@
 //! 使い方:
 //!   cargo run --release --bin lf2_stage6_event_edit -- \
 //!     [--file .local_data/lvns3/C0602.LF2] [--ti 861] [--window 4114] \
-//!     [--limit N] [--self-test]
+//!     [--limit N] [--self-test] [--dump-ties PATH]
+//!
+//! 注意: 判定は窓内 [snap_ti, target.ti] の tie に限定した割り切り。
+//! 「broken=0」は窓内副作用ゼロの意味であり、窓外への影響は測っていない。
+//! --ti には違反でない tie も指定できる (編集で正常 tie を壊さないかの検証用途)。
 
 use std::env;
 use std::fs;
@@ -102,7 +106,7 @@ fn decode_tokens(comp: &[u8], w: u16, h: u16) -> (Vec<Token>, Vec<u8>) {
                 produced += 1;
             }
         }
-        flag = (flag << 1) & 0xff;
+        flag <<= 1;
         fc -= 1;
     }
     (tokens, ring_input)
@@ -498,7 +502,6 @@ struct TieInfo {
 fn baseline_run(tokens: &[Token], input: &[u8]) -> Vec<TieInfo> {
     let mut sim = Sim::new(input.to_vec());
     let mut ties = Vec::new();
-    let mut tick: u64 = 0;
     for (ti, tok) in tokens.iter().enumerate() {
         if let Token::Match { pos, len } = tok {
             if *len < F as u8 {
@@ -506,7 +509,7 @@ fn baseline_run(tokens: &[Token], input: &[u8]) -> Vec<TieInfo> {
                 if !tr.is_empty() {
                     ties.push(TieInfo {
                         ti,
-                        tick_start: tick,
+                        tick_start: sim.tick,
                         max_len: *len,
                         chosen: *pos as i32,
                         baseline_ok: tr[0] == *pos as i32,
@@ -516,7 +519,6 @@ fn baseline_run(tokens: &[Token], input: &[u8]) -> Vec<TieInfo> {
             }
         }
         sim.advance(tok.emit_len());
-        tick += tok.emit_len() as u64;
     }
     ties
 }
@@ -534,6 +536,18 @@ struct Args {
     dump_ties: Option<String>,
 }
 
+fn usage_exit(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    eprintln!(
+        "usage: lf2_stage6_event_edit [--file PATH] [--ti N] [--window N] \
+         [--limit N] [--self-test] [--dump-ties PATH]"
+    );
+    eprintln!(
+        "  --ti は違反でない tie も指定可 (編集で正常 tie を壊さないかの検証用途)"
+    );
+    std::process::exit(2);
+}
+
 fn parse_args() -> Args {
     let mut args = Args {
         file: ".local_data/lvns3/C0602.LF2".to_string(),
@@ -544,23 +558,39 @@ fn parse_args() -> Args {
         dump_ties: None,
     };
     let argv: Vec<String> = env::args().skip(1).collect();
+    let next_val = |argv: &[String], i: usize| -> String {
+        match argv.get(i + 1) {
+            Some(v) => v.clone(),
+            None => usage_exit(&format!("{} には値が必要", argv[i])),
+        }
+    };
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
             "--file" => {
-                args.file = argv[i + 1].clone();
+                args.file = next_val(&argv, i);
                 i += 2;
             }
             "--ti" => {
-                args.ti = Some(argv[i + 1].parse().expect("--ti"));
+                args.ti = Some(
+                    next_val(&argv, i)
+                        .parse()
+                        .unwrap_or_else(|_| usage_exit("--ti は整数")),
+                );
                 i += 2;
             }
             "--window" => {
-                args.window = argv[i + 1].parse().expect("--window");
+                args.window = next_val(&argv, i)
+                    .parse()
+                    .unwrap_or_else(|_| usage_exit("--window は整数"));
                 i += 2;
             }
             "--limit" => {
-                args.limit = Some(argv[i + 1].parse().expect("--limit"));
+                args.limit = Some(
+                    next_val(&argv, i)
+                        .parse()
+                        .unwrap_or_else(|_| usage_exit("--limit は整数")),
+                );
                 i += 2;
             }
             "--self-test" => {
@@ -568,10 +598,10 @@ fn parse_args() -> Args {
                 i += 1;
             }
             "--dump-ties" => {
-                args.dump_ties = Some(argv[i + 1].clone());
+                args.dump_ties = Some(next_val(&argv, i));
                 i += 2;
             }
-            other => panic!("unknown arg: {}", other),
+            other => usage_exit(&format!("unknown arg: {}", other)),
         }
     }
     args
@@ -621,6 +651,8 @@ fn main() {
     }
 
     // 2. 対象 ti と窓
+    // --ti は違反でない tie の指定も意図的に許容する
+    // (編集が正常 tie を壊さないことを検証する用途)
     let target = match args.ti {
         Some(ti) => *ties
             .iter()
@@ -741,7 +773,8 @@ fn main() {
 
     // 5. 総当たり: 各イベント × 適用可能編集で差分再生
     let t1 = std::time::Instant::now();
-    let mut solutions: Vec<(u64, EditType, usize, usize)> = Vec::new(); // (tick, edit, broken, fixed_others)
+    // (op_id, tick, edit, broken, fixed_others)
+    let mut solutions: Vec<(u64, u64, EditType, usize, usize)> = Vec::new();
     let mut tried: usize = 0;
     let event_iter: Vec<&Event> = match args.limit {
         Some(l) => events.iter().take(l).collect(),
@@ -778,7 +811,7 @@ fn main() {
                 }
             }
             if target_ok {
-                solutions.push((ev.tick, edit, broken, fixed_others));
+                solutions.push((ev.op_id, ev.tick, edit, broken, fixed_others));
             }
         }
     }
@@ -796,18 +829,22 @@ fn main() {
             event_iter.len()
         );
     } else {
-        solutions.sort_by_key(|&(_, _, broken, _)| broken);
-        println!("==> 解 {} 件 (event_tick, edit_type, 壊れる正常tie数, 直る他違反数):", solutions.len());
-        for (tick, edit, broken, fixed) in &solutions {
+        solutions.sort_by_key(|&(_, _, _, broken, _)| broken);
+        println!(
+            "==> 解 {} 件 (op_id, event_tick, edit_type, 壊れる正常tie数, 直る他違反数):",
+            solutions.len()
+        );
+        for (op_id, tick, edit, broken, fixed) in &solutions {
             println!(
-                "  tick={} edit={} broken={} fixed_others={}",
+                "  op={} tick={} edit={} broken={} fixed_others={}",
+                op_id,
                 tick,
                 edit.name(),
                 broken,
                 fixed
             );
         }
-        let clean = solutions.iter().filter(|s| s.2 == 0).count();
+        let clean = solutions.iter().filter(|s| s.3 == 0).count();
         println!("  うち副作用ゼロ (broken=0): {}", clean);
     }
 }
@@ -850,6 +887,117 @@ mod tests {
         assert_eq!(a.op_counter, b.op_counter);
         // trace も一致
         assert_eq!(a.trace(a.r, 5), b.trace(b.r, 5));
+    }
+
+    /// BST 不変条件の検証: dad/lson/rson の相互整合・256 root からの
+    /// 全ノード到達可能性 (dad!=NIL のノード集合と一致)・循環なし。
+    fn assert_bst_invariants(sim: &Sim) {
+        // 相互整合: 各ノードの子の dad は自分、dad の子リンクは自分
+        for p in 0..N as i32 {
+            if sim.dad[p as usize] == NIL {
+                continue;
+            }
+            let dp = sim.dad[p as usize];
+            assert!(
+                sim.rson[dp as usize] == p || sim.lson[dp as usize] == p,
+                "node {} is not a child of its dad {}",
+                p,
+                dp
+            );
+            for &c in &[sim.lson[p as usize], sim.rson[p as usize]] {
+                if c != NIL {
+                    assert_eq!(sim.dad[c as usize], p, "child {} dad != {}", c, p);
+                }
+            }
+        }
+        // 到達可能性と循環なし: root の rson 部分木を DFS
+        let mut visited = vec![false; N];
+        for root in (N + 1)..(N + 257) {
+            let mut stack = vec![sim.rson[root]];
+            while let Some(n) = stack.pop() {
+                if n == NIL {
+                    continue;
+                }
+                assert!(!visited[n as usize], "cycle or duplicate at node {}", n);
+                visited[n as usize] = true;
+                stack.push(sim.lson[n as usize]);
+                stack.push(sim.rson[n as usize]);
+            }
+        }
+        for p in 0..N {
+            assert_eq!(
+                visited[p],
+                sim.dad[p] != NIL,
+                "reachability mismatch at node {}",
+                p
+            );
+        }
+    }
+
+    /// del_promote_other / swap_leaf_attach の各編集適用後も BST 不変条件
+    /// (相互整合・到達可能性・循環なし) が保たれることを確認。
+    #[test]
+    fn edits_preserve_bst_invariants() {
+        // 前半: 周期 500 の反復 (full-F 一致 → ins-swap がすぐ発生)
+        // 後半: 64 記号の擬似乱数 (分岐の多い木を作り、実削除が始まる
+        // tick 4078 以降に del-two を発生させる)
+        let mut x: u32 = 0xcafe1234;
+        let block: Vec<u8> = (0..500)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x & 0x3f) as u8
+            })
+            .collect();
+        let mut input = Vec::new();
+        for _ in 0..4 {
+            input.extend_from_slice(&block);
+        }
+        input.extend((0..5000).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x & 0x3f) as u8
+        }));
+        // 無編集でイベントを列挙し、del-two / ins-swap の op を集める
+        let mut probe = Sim::new(input.clone());
+        probe.advance(400);
+        let base = probe.clone();
+        let mut enumr = base.clone();
+        enumr.record = Some(Vec::new());
+        enumr.advance(6600);
+        let events = enumr.record.take().unwrap();
+        let del_twos: Vec<u64> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::DelTwo)
+            .map(|e| e.op_id)
+            .take(20)
+            .collect();
+        let ins_swaps: Vec<u64> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InsSwap)
+            .map(|e| e.op_id)
+            .take(20)
+            .collect();
+        assert!(!del_twos.is_empty(), "no del-two events in probe input");
+        assert!(!ins_swaps.is_empty(), "no ins-swap events in probe input");
+        for (ops, edit) in [
+            (&del_twos, EditType::DelPromoteOther),
+            (&ins_swaps, EditType::SwapLeafAttach),
+        ] {
+            for &op in ops.iter() {
+                let mut sim = base.clone();
+                sim.edit_op = Some(op);
+                sim.edit_type = edit;
+                sim.advance(6600);
+                assert_bst_invariants(&sim);
+            }
+        }
+        // 無編集でも成り立つこと (検証関数自体の健全性)
+        let mut plain = base.clone();
+        plain.advance(6600);
+        assert_bst_invariants(&plain);
     }
 
     /// 無編集 (edit_op=None) の clone 再生が、clone 元をそのまま進めた場合と
