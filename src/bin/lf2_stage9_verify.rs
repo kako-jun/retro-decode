@@ -17,7 +17,7 @@
 //! 出力:
 //!   stdout: 1 ファイル 1 行 (name,payload_len,reenc_len,match,first_diff)
 //!   stderr: サマリ (一致本数 / 総数)
-//!   --out: 一致ファイル名リスト (デフォルト .local_data/stage3_matched.txt)
+//!   --out: 一致ファイル名リスト (デフォルト .local_data/stage9_matched.txt)
 
 use std::env;
 use std::fs;
@@ -90,7 +90,7 @@ fn main() -> ExitCode {
     }
     let dir = PathBuf::from(&args[1]);
     let mut limit: Option<usize> = None;
-    let mut out_path = String::from(".local_data/stage3_matched.txt");
+    let mut out_path = String::from(".local_data/stage9_matched.txt");
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {

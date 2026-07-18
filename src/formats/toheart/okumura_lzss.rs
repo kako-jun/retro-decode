@@ -5751,8 +5751,12 @@ fn compress_okumura_impl_hooked_traced(
         }
 
         // 入力が尽きた後の残り処理: len を減らしつつ DeleteNode
-        // tail_relax で match_length が len を超えることがあるため、
-        // len が 0 に達したら (すでにエンコード完了のため) それ以上進めない。
+        // `&& len > 0` は underflow ガード。TailMode::Unbounded / Plus1 では
+        // `last_match_length > len` (出力 match が実残り入力より長い) が起こり得て、
+        // このガードが無いと `len -= 1` が len==0 の状態で呼ばれ usize underflow
+        // で panic する。TailMode::Clip では match_length を必ず len 以下に
+        // クリップするため (`if st.match_length as usize > cap { ... }` 参照)、
+        // この分岐は絶対に発火しない (このガードは Unbounded/Plus1 専用の保険)。
         while i < last_match_length && len > 0 {
             st.delete_node(s);
             s = (s + 1) & (N as i32 - 1);
