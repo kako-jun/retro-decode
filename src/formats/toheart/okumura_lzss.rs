@@ -5613,6 +5613,143 @@ fn compress_okumura_impl(input: &[u8], tie_mode: TieMode) -> Vec<Token> {
     out
 }
 
+/// Stage 3 (Issue #14): Stage 2 で確定した Leaf タイブレイク複合規則のエンコーダ。
+///
+/// ベースは `compress_okumura` (Basic: dummy 挿入あり・StrictGt) と完全に同じ。
+/// ただし出力 Match の `match_length == F` のとき**のみ**、Leaf 実 ring の
+/// 全候補列挙 (`enumerate_match_candidates_with_writeback`) から full-F
+/// (len == F) 候補を集め、`cand_age_start` (= 候補開始 slot の最終書込みから
+/// の経過 input_pos。v12 データセットと同一定義。未書込み slot は u32::MAX)
+/// が最小 = ring に最も新しく書かれた候補へ `match_position` を差し替える。
+///
+/// - Stage 2 検証: max_len==F の tie 522,913 グループで min-age 規則の的中率 100.00%
+/// - max_len < F は奥村 insert_node (rank=1) の返す match をそのまま使う (99.73%)
+///
+/// age の定義は `lf2_pairwise_dataset_v12.rs` の `cand_age_start` を踏襲:
+///   pos_start = cand_pos & 0x0fff
+///   age = write_tick[pos_start] == u32::MAX ? u32::MAX
+///                                          : input_pos - write_tick[pos_start]
+/// (write_tick[slot] = その slot に最後に書いた byte の input_pos)
+pub fn compress_okumura_rank1_minage(input: &[u8]) -> Vec<Token> {
+    use super::lf2_tokens::enumerate_match_candidates_with_writeback;
+
+    let mut st = Okumura::new(0x20);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return out;
+    }
+
+    for i in 1..=F {
+        st.insert_node(r - i as i32);
+    }
+    st.insert_node(r);
+
+    // shadow: Leaf decoder と同じ ring 状態 + 各 slot の最終書込み tick (v12 と同一)
+    let mut ring = [0x20u8; N];
+    let mut write_tick: [u32; N] = [u32::MAX; N];
+    let mut shadow_r: usize = N - F;
+    let mut input_pos: usize = 0;
+
+    loop {
+        if st.match_length as usize > len {
+            st.match_length = len as i32;
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            let mut pos = (st.match_position as u16) & ((N as u16) - 1);
+            if st.match_length as usize == F {
+                // full-F tie 規則: 全 full-F 候補から cand_age_start 最小を採用
+                let candidates =
+                    enumerate_match_candidates_with_writeback(&ring, input, input_pos, shadow_r);
+                let mut best: Option<(u32, u16)> = None;
+                for c in candidates.iter().filter(|c| c.len as usize == F) {
+                    let ps = (c.pos as usize) & 0x0fff;
+                    let age = if write_tick[ps] == u32::MAX {
+                        u32::MAX
+                    } else {
+                        (input_pos as u32).saturating_sub(write_tick[ps])
+                    };
+                    if best.map_or(true, |(best_age, _)| age < best_age) {
+                        best = Some((age, c.pos));
+                    }
+                }
+                if let Some((_, best_pos)) = best {
+                    pos = best_pos;
+                }
+            }
+            out.push(Token::Match {
+                pos,
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        // shadow ring を出力バイト分進める (v12 の ring/write_tick 更新と同一)
+        for _ in 0..last_match_length {
+            if input_pos >= input.len() {
+                break;
+            }
+            ring[shadow_r] = input[input_pos];
+            write_tick[shadow_r] = input_pos as u32;
+            shadow_r = (shadow_r + 1) & (N - 1);
+            input_pos += 1;
+        }
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5683,6 +5820,51 @@ mod tests {
                 idx += 1;
             }
         }
+    }
+
+    /// Stage 3: full-F tie の override で min-age (最も新しく書かれた) 候補が
+    /// 選ばれることを確認する。
+    ///
+    /// 入力 = スペース 54 個。初期 ring は全 slot 0x20 なので毎トークン
+    /// full-F 候補が大量に tie する。
+    /// - token0 (input_pos=0): 全 slot 未書込み → 全候補 age=u32::MAX で同着、
+    ///   列挙順 (pos 昇順) 先頭の pos=0 を採用
+    /// - token1 (input_pos=18): slot 4078..4095 が tick 0..17 で書込み済み。
+    ///   min age = 直近書込み slot 4095 (age=1)
+    /// - token2 (input_pos=36): slot 0..17 が tick 18..35 → min age = pos 17
+    #[test]
+    fn rank1_minage_full_f_override_picks_most_recent_write() {
+        let input = vec![b' '; 54];
+        let toks = compress_okumura_rank1_minage(&input);
+        assert_eq!(toks.len(), 3);
+        assert_eq!(toks[0], Token::Match { pos: 0, len: F as u8 });
+        assert_eq!(toks[1], Token::Match { pos: 4095, len: F as u8 });
+        assert_eq!(toks[2], Token::Match { pos: 17, len: F as u8 });
+    }
+
+    /// Stage 3: full-F match が出ない入力では Basic (compress_okumura) と
+    /// 完全一致すること (override は F 限定)。
+    #[test]
+    fn rank1_minage_matches_basic_when_no_full_f() {
+        // 擬似乱数 (LCG) に短い反復を混ぜる。18 連続一致は出ない
+        let mut input: Vec<u8> = Vec::new();
+        let mut x: u32 = 12345;
+        for k in 0..600usize {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            input.push((x >> 16) as u8);
+            if k % 40 == 0 {
+                // 短いマッチ (len 4) を誘発する反復
+                input.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+            }
+        }
+        let a = compress_okumura(&input);
+        let b = compress_okumura_rank1_minage(&input);
+        assert!(
+            a.iter()
+                .all(|t| !matches!(t, Token::Match { len, .. } if *len as usize == F)),
+            "test input must not produce full-F matches"
+        );
+        assert_eq!(a, b);
     }
 
     #[test]
