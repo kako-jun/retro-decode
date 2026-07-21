@@ -278,6 +278,9 @@ struct Okumura {
     /// index 1..F) のバイト解釈モード。root byte0 によるバケツ選択 (256分木の
     /// インデックス) には影響しない — あくまで木内部の大小比較だけを変える。
     cmp_mode: CmpMode,
+    /// Stage 12-7 (Issue #14): `delete_node` の両子ケースで昇格させる
+    /// in-order 隣接ノードの側 (前任者=左部分木最右 / 後継者=右部分木最左)。
+    del_mode: DelMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +288,16 @@ pub enum KeyMode {
     Byte0,
     XorByte01,
     AddByte01Mod256,
+}
+
+/// Stage 12-7 (Issue #14 脈: 削除昇格側 / 鏡像等価性検証)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelMode {
+    /// 原典: 両子ケースは in-order **前任者** (左部分木の最右子孫) を昇格。
+    Predecessor,
+    /// `Predecessor` の全域鏡像 (単一子ケースの昇格方向も含め `lson`⇔`rson`
+    /// を総入れ替え)。両子ケースは in-order **後継者** (右部分木の最左子孫) を昇格。
+    Successor,
 }
 
 /// Stage 12-6 (Issue #14 脈: signed char 比較仮説)。奥村原典の
@@ -316,6 +329,7 @@ impl Okumura {
             bst_mode: BstMode::Standard,
             key_mode: KeyMode::Byte0,
             cmp_mode: CmpMode::Unsigned,
+            del_mode: DelMode::Predecessor,
         }
     }
 
@@ -486,8 +500,17 @@ impl Okumura {
         self.dad[p as usize] = NIL; // remove p
     }
 
-    /// 原典 `DeleteNode(int p)` 逐語移植。
+    /// Stage 12-7 (Issue #14): `del_mode` に応じて削除昇格側を切り替える。
     fn delete_node(&mut self, p: i32) {
+        match self.del_mode {
+            DelMode::Predecessor => self.delete_node_predecessor(p),
+            DelMode::Successor => self.delete_node_successor(p),
+        }
+    }
+
+    /// 原典 `DeleteNode(int p)` 逐語移植。両子ケースは in-order **前任者**
+    /// (左部分木の最右子孫) を昇格させる (`DelMode::Predecessor`、既定)。
+    fn delete_node_predecessor(&mut self, p: i32) {
         if self.dad[p as usize] == NIL {
             return; // not in tree
         }
@@ -537,6 +560,53 @@ impl Okumura {
         }
         self.dad[p as usize] = NIL;
     }
+
+    /// Stage 12-7 (Issue #14 脈: 鏡像等価性検証): `delete_node_predecessor` の
+    /// 全域鏡像 (`lson` ⇔ `rson` を機械的に総入れ替えしたもの)。両子ケースは
+    /// in-order **後継者** (右部分木の最左子孫) を昇格させる。単一子ケースの
+    /// 昇格方向も対称に反転する (`DelMode::Successor`)。
+    fn delete_node_successor(&mut self, p: i32) {
+        if self.dad[p as usize] == NIL {
+            return; // not in tree
+        }
+        let q: i32;
+        if self.lson[p as usize] == NIL {
+            q = self.rson[p as usize];
+        } else if self.rson[p as usize] == NIL {
+            q = self.lson[p as usize];
+        } else {
+            // 両子。rson[p] の最左子孫 q を見つけて p と挿げ替える
+            let mut qv = self.rson[p as usize];
+            if self.lson[qv as usize] != NIL {
+                loop {
+                    qv = self.lson[qv as usize];
+                    if self.lson[qv as usize] == NIL {
+                        break;
+                    }
+                }
+                let dad_q = self.dad[qv as usize];
+                self.lson[dad_q as usize] = self.rson[qv as usize];
+                let rq = self.rson[qv as usize];
+                self.dad[rq as usize] = dad_q;
+                self.rson[qv as usize] = self.rson[p as usize];
+                let rp = self.rson[p as usize];
+                self.dad[rp as usize] = qv;
+            }
+            self.lson[qv as usize] = self.lson[p as usize];
+            let lp = self.lson[p as usize];
+            self.dad[lp as usize] = qv;
+            q = qv;
+        }
+
+        self.dad[q as usize] = self.dad[p as usize];
+        let dad_p = self.dad[p as usize];
+        if self.lson[dad_p as usize] == p {
+            self.lson[dad_p as usize] = q;
+        } else {
+            self.rson[dad_p as usize] = q;
+        }
+        self.dad[p as usize] = NIL;
+    }
 }
 
 /// `OkumuraSim` の初期化バリアント (Issue #14 v12)。
@@ -575,6 +645,16 @@ pub enum SimMode {
     ReversedCmp,
     /// `SignedCmp` + `WriteTimeDescending` の併用形 (直交する2軸なので両立を確認)。
     SignedCmpWriteTimeDescending,
+    /// Stage 12-7 (Issue #14 脈: 削除昇格側)。木構造・比較は Basic と同一、
+    /// `delete_node` の両子ケースのみ `DelMode::Successor` (右部分木の最左
+    /// 子孫=in-order後継者を昇格) に差し替える。
+    DelSuccessor,
+    /// 鏡像等価性サニティ用: `ReversedCmp` (`CmpMode::Reversed`) +
+    /// `DelSuccessor` の併用形。完全鏡像閉包の仮説が正しければ
+    /// `Basic`(=Unsigned cmp + Predecessor del) と token 列が一致するはず。
+    ReversedCmpDelSuccessor,
+    /// `DelSuccessor` + `WriteTimeDescending` の併用形 (直交確認、余力があれば)。
+    DelSuccessorWriteTimeDescending,
 }
 
 /// Leaf の実トークン列で BST 状態を teacher-forcing 進行させるシミュレータ
@@ -617,8 +697,16 @@ impl<'a> OkumuraSim<'a> {
         // Stage 12-6: cmp_mode は最初の insert_node より前に設定する必要がある。
         st.cmp_mode = match mode {
             SimMode::SignedCmp | SimMode::SignedCmpWriteTimeDescending => CmpMode::Signed,
-            SimMode::ReversedCmp => CmpMode::Reversed,
+            SimMode::ReversedCmp | SimMode::ReversedCmpDelSuccessor => CmpMode::Reversed,
             _ => CmpMode::Unsigned,
+        };
+        // Stage 12-7: del_mode は delete_node (advance 側) でのみ参照するが、
+        // 一貫性のためここで設定する。
+        st.del_mode = match mode {
+            SimMode::DelSuccessor | SimMode::ReversedCmpDelSuccessor | SimMode::DelSuccessorWriteTimeDescending => {
+                DelMode::Successor
+            }
+            _ => DelMode::Predecessor,
         };
         st.init_tree();
 
@@ -638,10 +726,15 @@ impl<'a> OkumuraSim<'a> {
         let mut skip_inserts: usize = 0;
         if len > 0 {
             match mode {
-                SimMode::Basic | SimMode::LeftFirst | SimMode::SignedCmp | SimMode::ReversedCmp => {
+                SimMode::Basic
+                | SimMode::LeftFirst
+                | SimMode::SignedCmp
+                | SimMode::ReversedCmp
+                | SimMode::DelSuccessor
+                | SimMode::ReversedCmpDelSuccessor => {
                     // 原典 for (i = 1; i <= F; i++) InsertNode(r - i)
-                    // (SignedCmp/ReversedCmp は木構造・挿入タイミングは Basic と同一、
-                    // ノード内比較だけ cmp_mode で変わる)
+                    // (比較/削除昇格側だけが変わる variant は木構造・挿入タイミング
+                    // は Basic と同一)
                     for i in 1..=F {
                         st.insert_node(r - i as i32);
                     }
@@ -676,7 +769,8 @@ impl<'a> OkumuraSim<'a> {
                 }
                 SimMode::WriteTimeDescending
                 | SimMode::WriteTimeDescendingKeepDummy
-                | SimMode::SignedCmpWriteTimeDescending => {
+                | SimMode::SignedCmpWriteTimeDescending
+                | SimMode::DelSuccessorWriteTimeDescending => {
                     if matches!(mode, SimMode::WriteTimeDescendingKeepDummy) {
                         for i in 1..=F {
                             st.insert_node(r - i as i32);
@@ -5819,13 +5913,42 @@ pub struct TailTraceStep {
 fn compress_okumura_impl_hooked_traced(
     input: &[u8],
     tie_mode: TieMode,
+    hook: Option<&mut MinAgeFullFHook>,
+    tail_mode: TailMode,
+    dummy_mode: DummyMode,
+    trace: Option<&mut Vec<TailTraceStep>>,
+) -> Vec<Token> {
+    // 既定 (cmp_mode=Unsigned, del_mode=Predecessor) = 従来と完全同一の挙動。
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        tie_mode,
+        hook,
+        tail_mode,
+        dummy_mode,
+        trace,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+    )
+}
+
+/// Stage 12-7 (Issue #14): `compress_okumura_impl_hooked_traced` に
+/// `cmp_mode` / `del_mode` を追加したフル版。既存呼び出しは全て上の薄い
+/// ラッパー経由で `CmpMode::Unsigned` / `DelMode::Predecessor` (= 無変更) を渡す。
+#[allow(clippy::too_many_arguments)]
+fn compress_okumura_impl_hooked_traced_full(
+    input: &[u8],
+    tie_mode: TieMode,
     mut hook: Option<&mut MinAgeFullFHook>,
     tail_mode: TailMode,
     dummy_mode: DummyMode,
     mut trace: Option<&mut Vec<TailTraceStep>>,
+    cmp_mode: CmpMode,
+    del_mode: DelMode,
 ) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
+    st.cmp_mode = cmp_mode;
+    st.del_mode = del_mode;
     st.init_tree();
 
     // Stage 10-3: 各リングスロットへの最終書込み input_pos。u32::MAX = 未書込み。
@@ -6289,6 +6412,23 @@ pub fn compress_okumura_plus1_no_bootstrap_v3_eq(input: &[u8]) -> Vec<Token> {
         TailMode::Plus1,
         DummyMode::RejectBootstrapEdge,
         None,
+    )
+}
+
+/// Stage 12-7 (Issue #14 脈: 鏡像等価性検証)。自走エンコーダの `cmp_mode`/
+/// `del_mode` パラメータ化版。tie_mode=StrictGt (First) / tail_mode=Clip /
+/// dummy_mode=Allow 固定。`OkumuraSim` の teacher-forcing 経路とは独立に、
+/// 自走 (self-driven) の完全な token 列比較で鏡像等価性をサニティ検証する用途。
+pub fn compress_okumura_cmp_del_variant(input: &[u8], cmp_mode: CmpMode, del_mode: DelMode) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        cmp_mode,
+        del_mode,
     )
 }
 
