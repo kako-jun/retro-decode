@@ -521,6 +521,21 @@ pub enum SimMode {
     NoDummy,
     DummyThenDrop,
     LeftFirst,
+    /// Stage 12-4 (Issue #14 脈3 再解釈): 「挿入タイミング=書込み時」仮説。
+    /// 原典の dummy F 個挿入は行わず、代わりに初期先読み充填 18 バイト分
+    /// (`r_init..r_init+F-1` = [4078,4095]、実際に「書き込まれた」データ)
+    /// を開始時に**昇順** (4078→4095) で全て挿入する。session844 の物証
+    /// (token 3-4 で 4092/4093 が候補に見える = 奥村の消費時挿入では原理的に
+    /// 不可能) を説明しうる構造。
+    WriteTimeAscending,
+    /// 同上、挿入順を**降順** (4095→4078) にした亜種 (挿入順で木の形が
+    /// 変わりうるため、順序を軸として分離検証する)。
+    WriteTimeDescending,
+    /// `WriteTimeAscending` に加え、原典の dummy F 個 (`r-F..r-1` = [4060,4077])
+    /// も先に挿入したまま残す亜種 (dummy → 実データ18個・昇順の順)。
+    WriteTimeAscendingKeepDummy,
+    /// `WriteTimeDescending` + dummy 保持版 (dummy → 実データ18個・降順の順)。
+    WriteTimeDescendingKeepDummy,
 }
 
 /// Leaf の実トークン列で BST 状態を teacher-forcing 進行させるシミュレータ
@@ -546,6 +561,10 @@ pub struct OkumuraSim<'a> {
     mode: SimMode,
     dummy_positions: Vec<i32>,
     first_token_done: bool,
+    /// Stage 12-4 `WriteTime*` 系専用: 初期バッチ挿入で既にカバー済みの
+    /// 位置に対応する、`advance` 内の per-byte `insert_node(r)` 呼び出しを
+    /// 何回スキップするか (F-1 = 17 から開始し、消費するたびに減る)。
+    skip_inserts: usize,
 }
 
 impl<'a> OkumuraSim<'a> {
@@ -571,6 +590,7 @@ impl<'a> OkumuraSim<'a> {
         }
 
         let mut dummy_positions: Vec<i32> = Vec::new();
+        let mut skip_inserts: usize = 0;
         if len > 0 {
             match mode {
                 SimMode::Basic | SimMode::LeftFirst => {
@@ -578,17 +598,47 @@ impl<'a> OkumuraSim<'a> {
                     for i in 1..=F {
                         st.insert_node(r - i as i32);
                     }
+                    st.insert_node(r);
                 }
-                SimMode::NoDummy => {}
+                SimMode::NoDummy => {
+                    st.insert_node(r);
+                }
                 SimMode::DummyThenDrop => {
                     for i in 1..=F {
                         let p = ((r - i as i32) + N as i32) & (N as i32 - 1);
                         st.insert_node(p);
                         dummy_positions.push(p);
                     }
+                    st.insert_node(r);
+                }
+                SimMode::WriteTimeAscending | SimMode::WriteTimeAscendingKeepDummy => {
+                    if matches!(mode, SimMode::WriteTimeAscendingKeepDummy) {
+                        for i in 1..=F {
+                            st.insert_node(r - i as i32);
+                        }
+                    }
+                    // 初期先読み充填 [r, r+F-1] = [4078,4095] を「書込み時挿入」
+                    // 原則で昇順に全て挿入する (r 自身も含めて F 個)。
+                    for k in 0..F as i32 {
+                        st.insert_node(r + k);
+                    }
+                    // 通常ループの per-byte insert_node は F-1 回分だけ重複するので
+                    // (r 自身の1回は本挿入と同じ、残り F-1 個は per-byte ループが
+                    // 本来 r++ のたびに呼ぶはずだった分)、advance 側で F-1 回スキップする。
+                    skip_inserts = F - 1;
+                }
+                SimMode::WriteTimeDescending | SimMode::WriteTimeDescendingKeepDummy => {
+                    if matches!(mode, SimMode::WriteTimeDescendingKeepDummy) {
+                        for i in 1..=F {
+                            st.insert_node(r - i as i32);
+                        }
+                    }
+                    for k in (0..F as i32).rev() {
+                        st.insert_node(r + k);
+                    }
+                    skip_inserts = F - 1;
                 }
             }
-            st.insert_node(r);
         }
 
         Self {
@@ -601,6 +651,7 @@ impl<'a> OkumuraSim<'a> {
             mode,
             dummy_positions,
             first_token_done: false,
+            skip_inserts,
         }
     }
 
@@ -705,7 +756,13 @@ impl<'a> OkumuraSim<'a> {
 
             self.s = (self.s + 1) & (N as i32 - 1);
             self.r = (self.r + 1) & (N as i32 - 1);
-            self.inner.insert_node(self.r);
+            // Stage 12-4 WriteTime*: 初期バッチ挿入が既にカバー済みの位置は
+            // ここで重複挿入しない (skip_inserts は他モードでは常に 0 で no-op)。
+            if self.skip_inserts > 0 {
+                self.skip_inserts -= 1;
+            } else {
+                self.inner.insert_node(self.r);
+            }
             i += 1;
         }
 
@@ -715,7 +772,11 @@ impl<'a> OkumuraSim<'a> {
             self.r = (self.r + 1) & (N as i32 - 1);
             self.len -= 1;
             if self.len > 0 {
-                self.inner.insert_node(self.r);
+                if self.skip_inserts > 0 {
+                    self.skip_inserts -= 1;
+                } else {
+                    self.inner.insert_node(self.r);
+                }
             }
             i += 1;
         }
