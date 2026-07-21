@@ -274,6 +274,10 @@ struct Okumura {
     bst_mode: BstMode,
     /// BST root key 計算モード (Standard = text_buf[r], XorByte2 = text_buf[r] ^ text_buf[r+1])
     key_mode: KeyMode,
+    /// Stage 12-6 (Issue #14): ノード内比較 (`cmp = key[i] - text_buf[p+i]`、
+    /// index 1..F) のバイト解釈モード。root byte0 によるバケツ選択 (256分木の
+    /// インデックス) には影響しない — あくまで木内部の大小比較だけを変える。
+    cmp_mode: CmpMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +285,21 @@ pub enum KeyMode {
     Byte0,
     XorByte01,
     AddByte01Mod256,
+}
+
+/// Stage 12-6 (Issue #14 脈: signed char 比較仮説)。奥村原典の
+/// `cmp = key[i] - text_buf[p+i]` は Leaf 時代のコンパイラ (Turbo C/VC++)
+/// では `char` が既定で符号付きだった可能性がある。現行 Rust 移植は
+/// `u8 as i32` (無符号拡張) で比較しており、0x80 以上のバイトで大小関係が
+/// 反転しうる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpMode {
+    /// 現行 (無変更): `byte as i32`。
+    Unsigned,
+    /// 仮説本体: `(byte as i8) as i32` (= `(byte ^ 0x80)` の unsigned 比較と等価)。
+    Signed,
+    /// 対照用: 大小を完全反転 (`-(byte as i32)`)。
+    Reversed,
 }
 
 impl Okumura {
@@ -296,6 +315,18 @@ impl Okumura {
             cur_r: 0,
             bst_mode: BstMode::Standard,
             key_mode: KeyMode::Byte0,
+            cmp_mode: CmpMode::Unsigned,
+        }
+    }
+
+    /// ノード内比較 (index 1..F) 用にバイトを比較可能な値へ変換する
+    /// (`cmp_mode` 参照)。root byte0 のバケツ選択には使わない。
+    #[inline]
+    fn cmp_val(&self, byte: u8) -> i32 {
+        match self.cmp_mode {
+            CmpMode::Unsigned => byte as i32,
+            CmpMode::Signed => (byte as i8) as i32,
+            CmpMode::Reversed => -(byte as i32),
         }
     }
 
@@ -371,8 +402,8 @@ impl Okumura {
             let mut i: usize = 1;
             cmp = 0;
             while i < F {
-                let a = self.text_buf[key_start + i] as i32;
-                let b = self.text_buf[p as usize + i] as i32;
+                let a = self.cmp_val(self.text_buf[key_start + i]);
+                let b = self.cmp_val(self.text_buf[p as usize + i]);
                 let d = a - b;
                 if d != 0 {
                     cmp = d;
@@ -536,6 +567,14 @@ pub enum SimMode {
     WriteTimeAscendingKeepDummy,
     /// `WriteTimeDescending` + dummy 保持版 (dummy → 実データ18個・降順の順)。
     WriteTimeDescendingKeepDummy,
+    /// Stage 12-6 (Issue #14 脈: signed char 比較仮説)。木構造は原典 (Basic)
+    /// と同一 (dummy F 個挿入 + 通常の per-byte insert)、ノード内比較だけ
+    /// `CmpMode::Signed` に差し替える。
+    SignedCmp,
+    /// 対照用: ノード内比較を全反転 (`CmpMode::Reversed`)。木構造は Basic と同一。
+    ReversedCmp,
+    /// `SignedCmp` + `WriteTimeDescending` の併用形 (直交する2軸なので両立を確認)。
+    SignedCmpWriteTimeDescending,
 }
 
 /// Leaf の実トークン列で BST 状態を teacher-forcing 進行させるシミュレータ
@@ -575,6 +614,12 @@ impl<'a> OkumuraSim<'a> {
             // init_tree が LeftFirst のとき lson root も初期化するため、先に設定する
             st.bst_mode = BstMode::LeftFirst;
         }
+        // Stage 12-6: cmp_mode は最初の insert_node より前に設定する必要がある。
+        st.cmp_mode = match mode {
+            SimMode::SignedCmp | SimMode::SignedCmpWriteTimeDescending => CmpMode::Signed,
+            SimMode::ReversedCmp => CmpMode::Reversed,
+            _ => CmpMode::Unsigned,
+        };
         st.init_tree();
 
         let r: i32 = (N - F) as i32;
@@ -593,8 +638,10 @@ impl<'a> OkumuraSim<'a> {
         let mut skip_inserts: usize = 0;
         if len > 0 {
             match mode {
-                SimMode::Basic | SimMode::LeftFirst => {
+                SimMode::Basic | SimMode::LeftFirst | SimMode::SignedCmp | SimMode::ReversedCmp => {
                     // 原典 for (i = 1; i <= F; i++) InsertNode(r - i)
+                    // (SignedCmp/ReversedCmp は木構造・挿入タイミングは Basic と同一、
+                    // ノード内比較だけ cmp_mode で変わる)
                     for i in 1..=F {
                         st.insert_node(r - i as i32);
                     }
@@ -627,7 +674,9 @@ impl<'a> OkumuraSim<'a> {
                     // 本来 r++ のたびに呼ぶはずだった分)、advance 側で F-1 回スキップする。
                     skip_inserts = F - 1;
                 }
-                SimMode::WriteTimeDescending | SimMode::WriteTimeDescendingKeepDummy => {
+                SimMode::WriteTimeDescending
+                | SimMode::WriteTimeDescendingKeepDummy
+                | SimMode::SignedCmpWriteTimeDescending => {
                     if matches!(mode, SimMode::WriteTimeDescendingKeepDummy) {
                         for i in 1..=F {
                             st.insert_node(r - i as i32);
@@ -701,8 +750,8 @@ impl<'a> OkumuraSim<'a> {
             let mut j: usize = 1;
             cmp = 0;
             while j < F {
-                let a = self.inner.text_buf[key_start + j] as i32;
-                let b = self.inner.text_buf[i as usize + j] as i32;
+                let a = self.inner.cmp_val(self.inner.text_buf[key_start + j]);
+                let b = self.inner.cmp_val(self.inner.text_buf[i as usize + j]);
                 let d = a - b;
                 if d != 0 {
                     cmp = d;
@@ -882,8 +931,8 @@ impl<'a> OkumuraSim<'a> {
             let mut j: usize = 1;
             cmp = 0;
             while j < F {
-                let a = self.inner.text_buf[key_start + j] as i32;
-                let b = self.inner.text_buf[i as usize + j] as i32;
+                let a = self.inner.cmp_val(self.inner.text_buf[key_start + j]);
+                let b = self.inner.cmp_val(self.inner.text_buf[i as usize + j]);
                 let d = a - b;
                 if d != 0 {
                     cmp = d;
