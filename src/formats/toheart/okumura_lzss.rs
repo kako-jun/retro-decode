@@ -722,12 +722,21 @@ impl Okumura {
             q = qv;
         }
 
+        // Stage 12-9 バグ修正: この最終リンク付け替えは「p が自分の親から見て
+        // lson 側の子か rson 側の子か」という p 自身の位置の話であり、
+        // Predecessor/Successor どちらの昇格方式を使うかとは無関係 (この行は
+        // 鏡像対象ではない)。dad_p がルート疑似ノード (N+1..=N+256) のとき、
+        // Standard モードでは lson[root] が init_tree で初期化されず (常に
+        // 配列既定値 0 のまま)、`p==0` だと `lson[dad_p]==p` が偽陽性で成立し
+        // 誤った枝に書き込んでしまう (rson[root] が p を指したまま残り、
+        // 後で木が循環する原因になっていた)。原典 delete_node_predecessor と
+        // 同じ「rson を先にチェック」の順序に統一する。
         self.dad[q as usize] = self.dad[p as usize];
         let dad_p = self.dad[p as usize];
-        if self.lson[dad_p as usize] == p {
-            self.lson[dad_p as usize] = q;
-        } else {
+        if self.rson[dad_p as usize] == p {
             self.rson[dad_p as usize] = q;
+        } else {
+            self.lson[dad_p as usize] = q;
         }
         self.dad[p as usize] = NIL;
     }
