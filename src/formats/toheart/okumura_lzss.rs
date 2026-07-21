@@ -972,6 +972,12 @@ impl<'a> OkumuraSim<'a> {
         }
     }
 
+    /// 現在の ring 削除ヘッド `s` を返す (Stage 12-12: none-of-6 profiling で
+    /// insert/delete イベントのタイミングを外部から追跡するための読み取り専用アクセサ)。
+    pub fn s(&self) -> i32 {
+        self.s
+    }
+
     /// tie token 直前に呼ぶ read-only トレース。木を一切 mutate しない。
     ///
     /// `insert_node` の探索経路 (KeyMode::Byte0 の root key、index 1 からの
