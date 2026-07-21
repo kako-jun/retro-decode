@@ -389,7 +389,14 @@ impl Okumura {
         self.match_length = 0;
         self.cur_r = r;
 
+        let mut guard: u32 = 0;
         loop {
+            guard += 1;
+            if guard > 4 * N as u32 {
+                eprintln!("WARN insert_node: traversal guard tripped (r={}, guard={}) — likely a tree cycle, aborting insert", r, guard);
+                self.dad[r as usize] = NIL;
+                return;
+            }
             let go_right = match self.bst_mode {
                 BstMode::LeftFirst => cmp > 0,
                 _ => cmp >= 0,
@@ -400,6 +407,7 @@ impl Okumura {
                 } else {
                     self.rson[p as usize] = r;
                     self.dad[r as usize] = p;
+                    self.debug_check_after_insert(r, p, "rson");
                     return;
                 }
             } else {
@@ -408,6 +416,7 @@ impl Okumura {
                 } else {
                     self.lson[p as usize] = r;
                     self.dad[r as usize] = p;
+                    self.debug_check_after_insert(r, p, "lson");
                     return;
                 }
             }
@@ -504,8 +513,114 @@ impl Okumura {
     fn delete_node(&mut self, p: i32) {
         match self.del_mode {
             DelMode::Predecessor => self.delete_node_predecessor(p),
-            DelMode::Successor => self.delete_node_successor(p),
+            DelMode::Successor => {
+                // Stage 12-8 一時診断: 呼び出しごとに木の整合性 (循環なし) を検証する。
+                let debug = std::env::var("OKU_DEBUG_TREE_CHECK").is_ok();
+                thread_local! {
+                    static CALL_COUNT: std::cell::Cell<u64> = std::cell::Cell::new(0);
+                    static RECENT: std::cell::RefCell<std::collections::VecDeque<String>> =
+                        std::cell::RefCell::new(std::collections::VecDeque::new());
+                }
+                let (dad_p, lson_p, rson_p) = (self.dad[p as usize], self.lson[p as usize], self.rson[p as usize]);
+                self.delete_node_successor(p);
+                if debug {
+                    let n = CALL_COUNT.with(|c| {
+                        let v = c.get() + 1;
+                        c.set(v);
+                        v
+                    });
+                    let dad_p_now = self.dad[p as usize];
+                    RECENT.with(|r| {
+                        let mut r = r.borrow_mut();
+                        if r.len() >= 15 {
+                            r.pop_front();
+                        }
+                        r.push_back(format!(
+                            "call#{} p={} before(dad={},lson={},rson={}) after(dad[p]={})",
+                            n, p, dad_p, lson_p, rson_p, dad_p_now
+                        ));
+                    });
+                    if let Err(msg) = self.tree_is_consistent_raw() {
+                        eprintln!("BUG: tree inconsistent detected at call#{}: {}", n, msg);
+                        eprintln!("recent delete_node_successor calls (oldest first):");
+                        RECENT.with(|r| {
+                            for line in r.borrow().iter() {
+                                eprintln!("  {}", line);
+                            }
+                        });
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
+    }
+
+    /// Stage 12-8 一時診断用: `OkumuraSim::tree_is_consistent` と同じロジックを
+    /// `Okumura` 自身に対して直接行う (循環検出 + 親子リンク相互整合)。
+    /// Stage 12-8 一時診断用: insert_node がノードを attach した直後に木の整合性を確認する
+    /// (del_mode==Successor かつ環境変数指定時のみ)。
+    fn debug_check_after_insert(&self, r: i32, parent: i32, side: &str) {
+        if !matches!(self.del_mode, DelMode::Successor) || std::env::var("OKU_DEBUG_TREE_CHECK").is_err() {
+            return;
+        }
+        thread_local! {
+            static ICALL: std::cell::Cell<u64> = std::cell::Cell::new(0);
+        }
+        let n = ICALL.with(|c| {
+            let v = c.get() + 1;
+            c.set(v);
+            v
+        });
+        if let Err(msg) = self.tree_is_consistent_raw() {
+            eprintln!(
+                "BUG: tree inconsistent right after insert_node call#{} (attached r={} under parent={} via {}): {}",
+                n, r, parent, side, msg
+            );
+            std::process::exit(1);
+        }
+    }
+
+    fn tree_is_consistent_raw(&self) -> Result<(), String> {
+        for pos in 0..N {
+            let d = self.dad[pos];
+            if d == NIL {
+                continue;
+            }
+            let du = d as usize;
+            if !(du < N || ((N + 1)..=(N + 256)).contains(&du)) {
+                return Err(format!("pos={} dad={} out of range", pos, d));
+            }
+            if self.lson[du] != pos as i32 && self.rson[du] != pos as i32 {
+                return Err(format!(
+                    "pos={} dad={} but dad.lson={} dad.rson={} (neither == pos)",
+                    pos, d, self.lson[du], self.rson[du]
+                ));
+            }
+        }
+        let mut reached = 0usize;
+        let mut stack: Vec<i32> = Vec::new();
+        for root in (N + 1)..=(N + 256) {
+            if self.rson[root] != NIL {
+                stack.push(self.rson[root]);
+            }
+            if matches!(self.bst_mode, BstMode::LeftFirst) && self.lson[root] != NIL {
+                stack.push(self.lson[root]);
+            }
+        }
+        while let Some(p) = stack.pop() {
+            reached += 1;
+            if reached > N {
+                return Err(format!("cycle: reached > N at node {}", p));
+            }
+            let pu = p as usize;
+            if self.lson[pu] != NIL {
+                stack.push(self.lson[pu]);
+            }
+            if self.rson[pu] != NIL {
+                stack.push(self.rson[pu]);
+            }
+        }
+        Ok(())
     }
 
     /// 原典 `DeleteNode(int p)` 逐語移植。両子ケースは in-order **前任者**
@@ -578,9 +693,18 @@ impl Okumura {
             // 両子。rson[p] の最左子孫 q を見つけて p と挿げ替える
             let mut qv = self.rson[p as usize];
             if self.lson[qv as usize] != NIL {
+                let mut guard = 0u32;
                 loop {
                     qv = self.lson[qv as usize];
                     if self.lson[qv as usize] == NIL {
+                        break;
+                    }
+                    guard += 1;
+                    if guard > 2 * N as u32 {
+                        eprintln!(
+                            "WARN delete_node_successor: descent guard tripped (p={}, guard={}) — treating as cycle, breaking out",
+                            p, guard
+                        );
                         break;
                     }
                 }
@@ -824,8 +948,14 @@ impl<'a> OkumuraSim<'a> {
         };
         let mut visit: u32 = 0;
         let mut depth: u8 = 0;
+        let mut guard: u32 = 0;
 
         loop {
+            guard += 1;
+            if guard > 4 * N as u32 {
+                eprintln!("WARN search_trace: traversal guard tripped (r={}, guard={}) — likely a tree cycle (Stage 12-8 known DelSuccessor bug), aborting trace early", r, guard);
+                break;
+            }
             let go_right = match self.inner.bst_mode {
                 BstMode::LeftFirst => cmp > 0,
                 _ => cmp >= 0,
@@ -5918,7 +6048,8 @@ fn compress_okumura_impl_hooked_traced(
     dummy_mode: DummyMode,
     trace: Option<&mut Vec<TailTraceStep>>,
 ) -> Vec<Token> {
-    // 既定 (cmp_mode=Unsigned, del_mode=Predecessor) = 従来と完全同一の挙動。
+    // 既定 (cmp_mode=Unsigned, del_mode=Predecessor, write_time_descending=false)
+    // = 従来と完全同一の挙動。
     compress_okumura_impl_hooked_traced_full(
         input,
         tie_mode,
@@ -5928,12 +6059,19 @@ fn compress_okumura_impl_hooked_traced(
         trace,
         CmpMode::Unsigned,
         DelMode::Predecessor,
+        false,
     )
 }
 
-/// Stage 12-7 (Issue #14): `compress_okumura_impl_hooked_traced` に
-/// `cmp_mode` / `del_mode` を追加したフル版。既存呼び出しは全て上の薄い
-/// ラッパー経由で `CmpMode::Unsigned` / `DelMode::Predecessor` (= 無変更) を渡す。
+/// Stage 12-7/12-8 (Issue #14): `compress_okumura_impl_hooked_traced` に
+/// `cmp_mode` / `del_mode` / `write_time_descending` を追加したフル版。
+/// 既存呼び出しは全て上の薄いラッパー経由で `CmpMode::Unsigned` /
+/// `DelMode::Predecessor` / `write_time_descending=false` (= 無変更) を渡す。
+///
+/// `write_time_descending=true` のとき、Stage 12-4 の `SimMode::WriteTimeDescending`
+/// と同じ初期化 (dummy F 個挿入なし、初期先読み充填 [r,r+F-1] を降順で
+/// 開始時に一括挿入、以降 F-1 回分の per-byte insert_node をスキップ) を
+/// 自走エンコーダ側でも再現する。
 #[allow(clippy::too_many_arguments)]
 fn compress_okumura_impl_hooked_traced_full(
     input: &[u8],
@@ -5944,6 +6082,7 @@ fn compress_okumura_impl_hooked_traced_full(
     mut trace: Option<&mut Vec<TailTraceStep>>,
     cmp_mode: CmpMode,
     del_mode: DelMode,
+    write_time_descending: bool,
 ) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
@@ -5977,12 +6116,23 @@ fn compress_okumura_impl_hooked_traced_full(
         return out;
     }
 
-    // 最初に F 個のダミー挿入（奥村原典 for (i = 1; i <= F; i++) InsertNode(r - i)）
-    for i in 1..=F {
-        st.insert_node(r - i as i32);
+    // Stage 12-8: write_time_descending のときは Stage 12-4 の
+    // WriteTimeDescending と同じ初期化 (dummy なし、初期先読み充填を降順で
+    // 一括挿入) にし、以降 F-1 回分の per-byte insert_node をスキップする。
+    let mut skip_inserts: usize = 0;
+    if write_time_descending {
+        for k in (0..F as i32).rev() {
+            st.insert_node(r + k);
+        }
+        skip_inserts = F - 1;
+    } else {
+        // 最初に F 個のダミー挿入（奥村原典 for (i = 1; i <= F; i++) InsertNode(r - i)）
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+        // 最初の本挿入
+        st.insert_node(r);
     }
-    // 最初の本挿入
-    st.insert_node(r);
 
     loop {
         // match_length をフレーム残量に丸める (Clip のみ)。Unbounded は丸めなし、
@@ -6103,7 +6253,11 @@ fn compress_okumura_impl_hooked_traced_full(
 
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
-            st.insert_node(r);
+            if skip_inserts > 0 {
+                skip_inserts -= 1;
+            } else {
+                st.insert_node(r);
+            }
             i += 1;
         }
 
@@ -6120,7 +6274,11 @@ fn compress_okumura_impl_hooked_traced_full(
             r = (r + 1) & (N as i32 - 1);
             len -= 1;
             if len > 0 {
-                st.insert_node(r);
+                if skip_inserts > 0 {
+                    skip_inserts -= 1;
+                } else {
+                    st.insert_node(r);
+                }
             }
             i += 1;
         }
@@ -6429,6 +6587,69 @@ pub fn compress_okumura_cmp_del_variant(input: &[u8], cmp_mode: CmpMode, del_mod
         None,
         cmp_mode,
         del_mode,
+        false,
+    )
+}
+
+/// Stage 12-8 (Issue #14): Clip + `DelMode::Successor` (削除昇格側を鏡像化、
+/// 比較は無変更)。522本フル計測用。
+pub fn compress_okumura_clip_del_successor(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Successor,
+        false,
+    )
+}
+
+/// Stage 12-8 (Issue #14): Plus1 + `DelMode::Successor`。
+pub fn compress_okumura_plus1_del_successor(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Successor,
+        false,
+    )
+}
+
+/// Stage 12-8 (Issue #14): Clip + `DelMode::Successor` + `WriteTimeDescending`
+/// (自走エンコーダ側での write_time_descending 再現込み)。
+pub fn compress_okumura_clip_del_successor_wtd(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Successor,
+        true,
+    )
+}
+
+/// Stage 12-8 (Issue #14): Plus1 + `DelMode::Successor` + `WriteTimeDescending`。
+pub fn compress_okumura_plus1_del_successor_wtd(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Successor,
+        true,
     )
 }
 
