@@ -289,6 +289,13 @@ struct Okumura {
     /// する際にダングリング防止のため構造的 unlink を行う (詳細は
     /// `insert_node` 冒頭のコメント参照)。
     rot_no_delete: bool,
+    /// Stage 12-14 (Issue #14 脈1 Prong A): `delete_node_predecessor` の両子
+    /// ケースで昇格したノード位置 `q` を記録する (読み取り専用ログ、木構造には
+    /// 影響しない)。`OkumuraSim::take_promotion_log` で drain する。
+    promotion_log: Vec<i32>,
+    /// Stage 12-14: `insert_node` の EQ (F バイト完全一致) 置換で追い出された
+    /// 旧ノード位置 `p` を記録する (読み取り専用ログ)。
+    replace_log: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +346,8 @@ impl Okumura {
             cmp_mode: CmpMode::Unsigned,
             del_mode: DelMode::Predecessor,
             rot_no_delete: false,
+            promotion_log: Vec::new(),
+            replace_log: Vec::new(),
         }
     }
 
@@ -530,6 +539,9 @@ impl Okumura {
             self.lson[dad_p as usize] = r;
         }
         self.dad[p as usize] = NIL; // remove p
+        // Stage 12-14 (Issue #14 脈1 Prong A): EQ (F バイト完全一致) で追い出された
+        // 旧ノード p を記録する (読み取り専用ログ、挙動には影響しない)。
+        self.replace_log.push(p);
     }
 
     /// Stage 12-7 (Issue #14): `del_mode` に応じて削除昇格側を切り替える。
@@ -688,6 +700,9 @@ impl Okumura {
             let rp = self.rson[p as usize];
             self.dad[rp as usize] = qv;
             q = qv;
+            // Stage 12-14 (Issue #14 脈1 Prong A): 両子ケースで昇格したノード qv を
+            // 記録する (読み取り専用ログ、挙動には影響しない)。
+            self.promotion_log.push(qv);
         }
 
         // dad[q] = dad[p]; fix parent link
@@ -1000,6 +1015,20 @@ impl<'a> OkumuraSim<'a> {
     pub fn text_window(&self, pos: i32, len: usize) -> Vec<u8> {
         let start = pos as usize;
         self.inner.text_buf[start..start + len].to_vec()
+    }
+
+    /// Stage 12-14 (Issue #14 脈1 Prong A): `delete_node_predecessor` の両子
+    /// ケースで昇格したノード位置のログを drain して返す (呼び出し側で
+    /// advance() 1回ごとに回収し、外部の履歴特徴 (promotion_count /
+    /// last_promotion_event) を組み立てる用途)。木構造・挙動には影響しない。
+    pub fn take_promotion_log(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.inner.promotion_log)
+    }
+
+    /// Stage 12-14: `insert_node` の EQ (F バイト完全一致) 置換で追い出された
+    /// 旧ノード位置のログを drain して返す。
+    pub fn take_replace_log(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.inner.replace_log)
     }
 
     /// tie token 直前に呼ぶ read-only トレース。木を一切 mutate しない。
