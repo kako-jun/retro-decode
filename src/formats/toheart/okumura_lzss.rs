@@ -978,6 +978,30 @@ impl<'a> OkumuraSim<'a> {
         self.s
     }
 
+    /// 指定ノードの親 (dad[pos]) を返す (Stage 12-13: diverge ノード精査用の
+    /// 読み取り専用アクセサ)。root 疑似ノード (N+1..=N+256) の親は NIL。
+    pub fn dad_of(&self, pos: i32) -> i32 {
+        self.inner.dad[pos as usize]
+    }
+
+    /// 指定ノードの左子を返す (読み取り専用)。
+    pub fn lson_of(&self, pos: i32) -> i32 {
+        self.inner.lson[pos as usize]
+    }
+
+    /// 指定ノードの右子を返す (読み取り専用)。
+    pub fn rson_of(&self, pos: i32) -> i32 {
+        self.inner.rson[pos as usize]
+    }
+
+    /// `text_buf[pos..pos+len]` を読み取り専用でコピーして返す (Stage 12-13:
+    /// diverge ノードでの実バイト比較・挿入時内容スナップショット取得用)。
+    /// `pos` は 0..N の実位置、`len` は通常 F (18)。
+    pub fn text_window(&self, pos: i32, len: usize) -> Vec<u8> {
+        let start = pos as usize;
+        self.inner.text_buf[start..start + len].to_vec()
+    }
+
     /// tie token 直前に呼ぶ read-only トレース。木を一切 mutate しない。
     ///
     /// `insert_node` の探索経路 (KeyMode::Byte0 の root key、index 1 からの
