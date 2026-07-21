@@ -6091,6 +6091,97 @@ pub fn compress_okumura_plus1_no_bootstrap_v3(input: &[u8]) -> Vec<Token> {
     )
 }
 
+/// Stage 12-3 (Issue #14 脈1 EQ_UPDATE 仮説): `TieMode::AllowEq` (`>=`。同一長
+/// 候補は BST 探索経路上で最後に訪れたノードを採用) 版一式。既存 8 variant
+/// (Clip/Plus1 × Allow/v1/v2/v3) の tie_mode だけを `StrictGt` → `AllowEq` に
+/// 差し替えた対。
+///
+/// 動機: Stage 12-2b (binary tie 50件) で「両候補が BST 探索経路上にある
+/// 32件全てで Leaf 採用位置が sim (StrictGt, 経路上最初のノード) より**後**に
+/// 訪問される」というシグナルが確認された。これは奥村原典の
+/// `if (i > match_length)` を `>=` に変えるだけで「同一長候補は経路上
+/// 最後に訪れたノードが勝つ」動作になり、上記シグナルを直接説明しうる。
+pub fn compress_okumura_clip_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(input, TieMode::AllowEq, None, TailMode::Clip, DummyMode::Allow, None)
+}
+
+/// Stage 12-3: Plus1 + `TieMode::AllowEq`。
+pub fn compress_okumura_plus1_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(input, TieMode::AllowEq, None, TailMode::Plus1, DummyMode::Allow, None)
+}
+
+/// Stage 12-3: Clip + v1 (`DummyMode::RejectBootstrapUnwritten`) + `TieMode::AllowEq`。
+pub fn compress_okumura_clip_no_bootstrap_v1_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::AllowEq,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectBootstrapUnwritten,
+        None,
+    )
+}
+
+/// Stage 12-3: Plus1 + v1 + `TieMode::AllowEq`。
+pub fn compress_okumura_plus1_no_bootstrap_v1_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::AllowEq,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectBootstrapUnwritten,
+        None,
+    )
+}
+
+/// Stage 12-3: Clip + v2 (`DummyMode::RejectBootstrapUnwrittenLenGt10`) + `TieMode::AllowEq`。
+pub fn compress_okumura_clip_no_bootstrap_v2_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::AllowEq,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectBootstrapUnwrittenLenGt10,
+        None,
+    )
+}
+
+/// Stage 12-3: Plus1 + v2 + `TieMode::AllowEq`。
+pub fn compress_okumura_plus1_no_bootstrap_v2_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::AllowEq,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectBootstrapUnwrittenLenGt10,
+        None,
+    )
+}
+
+/// Stage 12-3: Clip + v3 (`DummyMode::RejectBootstrapEdge`) + `TieMode::AllowEq`。
+pub fn compress_okumura_clip_no_bootstrap_v3_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::AllowEq,
+        None,
+        TailMode::Clip,
+        DummyMode::RejectBootstrapEdge,
+        None,
+    )
+}
+
+/// Stage 12-3: Plus1 + v3 + `TieMode::AllowEq`。
+pub fn compress_okumura_plus1_no_bootstrap_v3_eq(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced(
+        input,
+        TieMode::AllowEq,
+        None,
+        TailMode::Plus1,
+        DummyMode::RejectBootstrapEdge,
+        None,
+    )
+}
+
 /// Stage 11-4 (Issue #14) v4: Clip + `DummyMode::RejectPureBootstrap`。
 pub fn compress_okumura_clip_no_bootstrap_v4(input: &[u8]) -> Vec<Token> {
     compress_okumura_impl_hooked_traced(
