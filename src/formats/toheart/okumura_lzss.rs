@@ -281,6 +281,14 @@ struct Okumura {
     /// Stage 12-7 (Issue #14): `delete_node` の両子ケースで昇格させる
     /// in-order 隣接ノードの側 (前任者=左部分木最右 / 後継者=右部分木最左)。
     del_mode: DelMode,
+    /// Stage 12-11 (Issue #14 脈: 「腐った木」仮説)。true のとき、呼び出し側
+    /// (自走エンコーダ・`OkumuraSim::advance`) は消費バイトの `delete_node(s)`
+    /// 呼び出しを一切スキップする。ノードは自分の位置が次に `insert_node` で
+    /// 再挿入されるまで、リング上書き後も**古い鍵のまま**木に残留し続ける
+    /// (=「腐った」ノード)。`insert_node` 側は、既に木に居る位置 r を再挿入
+    /// する際にダングリング防止のため構造的 unlink を行う (詳細は
+    /// `insert_node` 冒頭のコメント参照)。
+    rot_no_delete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +338,7 @@ impl Okumura {
             key_mode: KeyMode::Byte0,
             cmp_mode: CmpMode::Unsigned,
             del_mode: DelMode::Predecessor,
+            rot_no_delete: false,
         }
     }
 
@@ -367,6 +376,20 @@ impl Okumura {
     /// text_buf[r..r+F-1] を木に挿入し、同時に最長一致を探索する。
     /// 結果は `self.match_position` / `self.match_length` に格納される。
     fn insert_node(&mut self, r: i32) {
+        // Stage 12-11 (Issue #14 脈: 「腐った木」仮説): `rot_no_delete` のとき
+        // `delete_node(s)` が一切呼ばれないため、位置 r が既に木に残留して
+        // いる (前サイクルの「腐った」ノードとして) 場合がある。この関数は
+        // 直後に `rson[r]=NIL; lson[r]=NIL;` で r の子リンクを無条件に潰して
+        // 新規ノードとして挿入するため、既存の dad[r] リンク (r の古い親から
+        // 見た子リンク) を直さないまま進めると、その古い親が r を指したまま
+        // ダングリングになる。ここで**構造的unlink** (内容比較なし、
+        // del_mode に従った splice) を先に行い、ダングリング/循環を防ぐ。
+        // これは「腐敗」そのもの (古い鍵のまま残留すること) には無関係で、
+        // あくまで「同じ物理位置に2つのツリーエントリが同時に存在する」
+        // という構造的に不正な状態を避けるための処理。
+        if self.rot_no_delete && self.dad[r as usize] != NIL {
+            self.delete_node(r);
+        }
         // BstMode::LeftFirst: cmp = -1 初期 + cmp > 0 のみ右へ (奥村の左右反転)
         let mut cmp: i32 = match self.bst_mode {
             BstMode::LeftFirst => -1,
@@ -557,10 +580,12 @@ impl Okumura {
 
     /// Stage 12-8 一時診断用: `OkumuraSim::tree_is_consistent` と同じロジックを
     /// `Okumura` 自身に対して直接行う (循環検出 + 親子リンク相互整合)。
-    /// Stage 12-8 一時診断用: insert_node がノードを attach した直後に木の整合性を確認する
-    /// (del_mode==Successor かつ環境変数指定時のみ)。
+    /// Stage 12-8/12-11 一時診断用: insert_node がノードを attach した直後に
+    /// 木の**構造的**整合性 (循環なし・dad/子の相互整合。順序は見ない) を確認する
+    /// (del_mode==Successor または rot_no_delete のいずれか、かつ環境変数指定時のみ)。
     fn debug_check_after_insert(&self, r: i32, parent: i32, side: &str) {
-        if !matches!(self.del_mode, DelMode::Successor) || std::env::var("OKU_DEBUG_TREE_CHECK").is_err() {
+        let relevant = matches!(self.del_mode, DelMode::Successor) || self.rot_no_delete;
+        if !relevant || std::env::var("OKU_DEBUG_TREE_CHECK").is_err() {
             return;
         }
         thread_local! {
@@ -788,6 +813,14 @@ pub enum SimMode {
     ReversedCmpDelSuccessor,
     /// `DelSuccessor` + `WriteTimeDescending` の併用形 (直交確認、余力があれば)。
     DelSuccessorWriteTimeDescending,
+    /// Stage 12-11 (Issue #14 脈: 「腐った木」仮説) RotA。木構造・比較・
+    /// 削除昇格側は Basic (Predecessor) と同一初期化だが、`rot_no_delete=true`
+    /// にして消費時の `delete_node(s)` を一切呼ばない。ノードは自分の位置が
+    /// 次に `insert_node` で再挿入されるまで古い鍵のまま木に残留する。
+    RotANoDelete,
+    /// RotA に加え、full-F 一致時のノード置換 (swap-with-r) も省略する
+    /// (`BstMode::NoSwap` を併用)。
+    RotBNoDeleteNoReplace,
 }
 
 /// Leaf の実トークン列で BST 状態を teacher-forcing 進行させるシミュレータ
@@ -841,6 +874,12 @@ impl<'a> OkumuraSim<'a> {
             }
             _ => DelMode::Predecessor,
         };
+        // Stage 12-11: 「腐った木」仮説。RotB はさらに full-F 一致時の
+        // ノード置換 (swap-with-r) も省略する (`BstMode::NoSwap` を併用)。
+        st.rot_no_delete = matches!(mode, SimMode::RotANoDelete | SimMode::RotBNoDeleteNoReplace);
+        if matches!(mode, SimMode::RotBNoDeleteNoReplace) {
+            st.bst_mode = BstMode::NoSwap;
+        }
         st.init_tree();
 
         let r: i32 = (N - F) as i32;
@@ -864,7 +903,9 @@ impl<'a> OkumuraSim<'a> {
                 | SimMode::SignedCmp
                 | SimMode::ReversedCmp
                 | SimMode::DelSuccessor
-                | SimMode::ReversedCmpDelSuccessor => {
+                | SimMode::ReversedCmpDelSuccessor
+                | SimMode::RotANoDelete
+                | SimMode::RotBNoDeleteNoReplace => {
                     // 原典 for (i = 1; i <= F; i++) InsertNode(r - i)
                     // (比較/削除昇格側だけが変わる variant は木構造・挿入タイミング
                     // は Basic と同一)
@@ -1027,7 +1068,11 @@ impl<'a> OkumuraSim<'a> {
         let last_match_length = emitted_bytes.len();
         let mut i = 0usize;
         while i < last_match_length && self.input_idx < self.input.len() {
-            self.inner.delete_node(self.s);
+            // Stage 12-11: 「腐った木」仮説の rot_no_delete モードでは
+            // delete_node(s) を一切呼ばない。
+            if !self.inner.rot_no_delete {
+                self.inner.delete_node(self.s);
+            }
             let c = self.input[self.input_idx];
             self.input_idx += 1;
 
@@ -1049,7 +1094,9 @@ impl<'a> OkumuraSim<'a> {
         }
 
         while i < last_match_length {
-            self.inner.delete_node(self.s);
+            if !self.inner.rot_no_delete {
+                self.inner.delete_node(self.s);
+            }
             self.s = (self.s + 1) & (N as i32 - 1);
             self.r = (self.r + 1) & (N as i32 - 1);
             self.len -= 1;
@@ -6057,8 +6104,8 @@ fn compress_okumura_impl_hooked_traced(
     dummy_mode: DummyMode,
     trace: Option<&mut Vec<TailTraceStep>>,
 ) -> Vec<Token> {
-    // 既定 (cmp_mode=Unsigned, del_mode=Predecessor, write_time_descending=false)
-    // = 従来と完全同一の挙動。
+    // 既定 (cmp_mode=Unsigned, del_mode=Predecessor, write_time_descending=false,
+    // rot_no_delete=false, no_swap=false) = 従来と完全同一の挙動。
     compress_okumura_impl_hooked_traced_full(
         input,
         tie_mode,
@@ -6069,18 +6116,24 @@ fn compress_okumura_impl_hooked_traced(
         CmpMode::Unsigned,
         DelMode::Predecessor,
         false,
+        false,
+        false,
     )
 }
 
-/// Stage 12-7/12-8 (Issue #14): `compress_okumura_impl_hooked_traced` に
-/// `cmp_mode` / `del_mode` / `write_time_descending` を追加したフル版。
-/// 既存呼び出しは全て上の薄いラッパー経由で `CmpMode::Unsigned` /
-/// `DelMode::Predecessor` / `write_time_descending=false` (= 無変更) を渡す。
+/// Stage 12-7/12-8/12-11 (Issue #14): `compress_okumura_impl_hooked_traced` に
+/// `cmp_mode` / `del_mode` / `write_time_descending` / `rot_no_delete` /
+/// `no_swap` を追加したフル版。既存呼び出しは全て上の薄いラッパー経由で
+/// 無変更値を渡す。
 ///
 /// `write_time_descending=true` のとき、Stage 12-4 の `SimMode::WriteTimeDescending`
 /// と同じ初期化 (dummy F 個挿入なし、初期先読み充填 [r,r+F-1] を降順で
 /// 開始時に一括挿入、以降 F-1 回分の per-byte insert_node をスキップ) を
 /// 自走エンコーダ側でも再現する。
+///
+/// `rot_no_delete=true` のとき「腐った木」仮説 (Stage 12-11):
+/// 消費時の `delete_node(s)` を一切呼ばない。`no_swap=true` を併用すると
+/// full-F 一致時のノード置換 (swap-with-r) も省略する (RotB)。
 #[allow(clippy::too_many_arguments)]
 fn compress_okumura_impl_hooked_traced_full(
     input: &[u8],
@@ -6092,11 +6145,17 @@ fn compress_okumura_impl_hooked_traced_full(
     cmp_mode: CmpMode,
     del_mode: DelMode,
     write_time_descending: bool,
+    rot_no_delete: bool,
+    no_swap: bool,
 ) -> Vec<Token> {
     let mut st = Okumura::new(0x20);
     st.tie_mode = tie_mode;
     st.cmp_mode = cmp_mode;
     st.del_mode = del_mode;
+    st.rot_no_delete = rot_no_delete;
+    if no_swap {
+        st.bst_mode = BstMode::NoSwap;
+    }
     st.init_tree();
 
     // Stage 10-3: 各リングスロットへの最終書込み input_pos。u32::MAX = 未書込み。
@@ -6243,7 +6302,11 @@ fn compress_okumura_impl_hooked_traced_full(
         // last_match_length 回 ring を進める
         let mut i = 0usize;
         while i < last_match_length && input_idx < input.len() {
-            st.delete_node(s);
+            // Stage 12-11: rot_no_delete のときは delete_node(s) を一切呼ばない
+            // (「腐った木」仮説: Leaf は消費時の DeleteNode を省略している)。
+            if !st.rot_no_delete {
+                st.delete_node(s);
+            }
             let c = input[input_idx];
             input_idx += 1;
 
@@ -6278,7 +6341,9 @@ fn compress_okumura_impl_hooked_traced_full(
         // クリップするため (`if st.match_length as usize > cap { ... }` 参照)、
         // この分岐は絶対に発火しない (このガードは Unbounded/Plus1 専用の保険)。
         while i < last_match_length && len > 0 {
-            st.delete_node(s);
+            if !st.rot_no_delete {
+                st.delete_node(s);
+            }
             s = (s + 1) & (N as i32 - 1);
             r = (r + 1) & (N as i32 - 1);
             len -= 1;
@@ -6597,6 +6662,8 @@ pub fn compress_okumura_cmp_del_variant(input: &[u8], cmp_mode: CmpMode, del_mod
         cmp_mode,
         del_mode,
         false,
+        false,
+        false,
     )
 }
 
@@ -6613,6 +6680,8 @@ pub fn compress_okumura_clip_del_successor(input: &[u8]) -> Vec<Token> {
         CmpMode::Unsigned,
         DelMode::Successor,
         false,
+        false,
+        false,
     )
 }
 
@@ -6627,6 +6696,8 @@ pub fn compress_okumura_plus1_del_successor(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Successor,
+        false,
+        false,
         false,
     )
 }
@@ -6644,6 +6715,8 @@ pub fn compress_okumura_clip_del_successor_wtd(input: &[u8]) -> Vec<Token> {
         CmpMode::Unsigned,
         DelMode::Successor,
         true,
+        false,
+        false,
     )
 }
 
@@ -6658,6 +6731,77 @@ pub fn compress_okumura_plus1_del_successor_wtd(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Successor,
+        true,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-11 (Issue #14 脈: 「腐った木」仮説) RotA: Clip + `rot_no_delete=true`
+/// (消費時の delete_node(s) を一切呼ばない)。522本フル計測用。
+pub fn compress_okumura_clip_rot_a(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        false,
+        true,
+        false,
+    )
+}
+
+/// Stage 12-11 (Issue #14): Plus1 + RotA。
+pub fn compress_okumura_plus1_rot_a(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        false,
+        true,
+        false,
+    )
+}
+
+/// Stage 12-11 (Issue #14): RotA + full-F 一致時のノード置換も省略 (RotB)。
+pub fn compress_okumura_clip_rot_b(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        false,
+        true,
+        true,
+    )
+}
+
+/// Stage 12-11 (Issue #14): Plus1 + RotB。
+pub fn compress_okumura_plus1_rot_b(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        false,
+        true,
         true,
     )
 }
