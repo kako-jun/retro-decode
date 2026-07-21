@@ -23,66 +23,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use retro_decode::formats::toheart::lf2_tokens::decompress_to_tokens;
 use retro_decode::formats::toheart::okumura_lzss::{
     compress_okumura, compress_okumura_clip_no_bootstrap_v1, compress_okumura_clip_no_bootstrap_v2,
     compress_okumura_clip_no_bootstrap_v3, compress_okumura_plus1_no_bootstrap_v1,
     compress_okumura_plus1_no_bootstrap_v2, compress_okumura_plus1_no_bootstrap_v3,
-    compress_okumura_tail_plus1, Token,
+    compress_okumura_tail_plus1,
 };
-
-const LF2_MAGIC: &[u8] = b"LEAF256\0";
-
-fn parse_lf2(data: &[u8]) -> Option<(u16, u16, usize)> {
-    if data.len() < 0x18 || &data[0..8] != LF2_MAGIC {
-        return None;
-    }
-    let width = u16::from_le_bytes([data[12], data[13]]);
-    let height = u16::from_le_bytes([data[14], data[15]]);
-    let colors = data[0x16];
-    let payload_start = 0x18 + (colors as usize) * 3;
-    if payload_start > data.len() {
-        return None;
-    }
-    Some((width, height, payload_start))
-}
-
-fn tokens_to_lf2_payload(tokens: &[Token]) -> Vec<u8> {
-    let mut compressed: Vec<u8> = Vec::new();
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let flag_pos = compressed.len();
-        compressed.push(0);
-        let mut flag_byte: u8 = 0;
-        let mut bits_used = 0;
-        while bits_used < 8 && i < tokens.len() {
-            match tokens[i] {
-                Token::Literal(b) => {
-                    flag_byte |= 1 << (7 - bits_used);
-                    compressed.push(b ^ 0xff);
-                }
-                Token::Match { pos, len } => {
-                    let encoded_pos = (pos as usize) & 0x0fff;
-                    let encoded_len = ((len as usize) - 3) & 0x0f;
-                    let upper = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
-                    let lower = ((encoded_pos >> 4) & 0xff) as u8;
-                    compressed.push(upper ^ 0xff);
-                    compressed.push(lower ^ 0xff);
-                }
-            }
-            bits_used += 1;
-            i += 1;
-        }
-        compressed[flag_pos] = flag_byte ^ 0xff;
-    }
-    compressed
-}
-
-fn matches(ring_input: &[u8], orig: &[u8], f: impl Fn(&[u8]) -> Vec<Token>) -> bool {
-    let toks = f(ring_input);
-    let reenc = tokens_to_lf2_payload(&toks);
-    orig == reenc.as_slice()
-}
+use retro_decode::formats::toheart::verify_harness::{self, matches};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -108,22 +55,13 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("LF2"))
-                    .unwrap_or(false)
-            })
-            .collect(),
+    let files: Vec<PathBuf> = match verify_harness::list_lf2_files(&dir, None) {
+        Ok(f) => f,
         Err(e) => {
             eprintln!("failed to read dir {:?}: {}", dir, e);
             return ExitCode::from(1);
         }
     };
-    files.sort();
 
     println!(
         "name,payload_len,clip,plus1,clip_v1,plus1_v1,clip_v2,plus1_v2,clip_v3,plus1_v3,best_mode"
@@ -140,37 +78,17 @@ fn main() -> ExitCode {
     let mut errors = 0usize;
 
     for path in &files {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        let data = match fs::read(path) {
+        let decoded = match verify_harness::load_and_decode(path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("read fail {}: {}", name, e);
-                errors += 1;
-                continue;
-            }
-        };
-        let (width, height, ps) = match parse_lf2(&data) {
-            Some(x) => x,
-            None => {
-                eprintln!("parse fail {}", name);
-                errors += 1;
-                continue;
-            }
-        };
-        let decoded = match decompress_to_tokens(&data[ps..], width, height) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("decode fail {}: {}", name, e);
+                eprintln!("{}", e);
                 errors += 1;
                 continue;
             }
         };
         total += 1;
-        let orig = &data[ps..];
+        let name = decoded.name.clone();
+        let orig = decoded.payload.as_slice();
         let ring_input = &decoded.ring_input;
 
         let flags = [

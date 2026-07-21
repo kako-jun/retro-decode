@@ -15,6 +15,7 @@ pub mod okumura_lzss;
 pub mod naive_scan_lzss;
 pub mod lf2_tokens;
 pub mod decision_tree;
+pub mod verify_harness;
 
 pub mod test_transparency;
 

@@ -17,53 +17,7 @@ use retro_decode::formats::toheart::lf2_tokens::{decompress_to_tokens, LeafToken
 use retro_decode::formats::toheart::okumura_lzss::{
     compress_okumura, compress_okumura_tail_plus1_traced, Token, F, N,
 };
-
-const LF2_MAGIC: &[u8] = b"LEAF256\0";
-
-fn parse_lf2(data: &[u8]) -> Option<(u16, u16, usize)> {
-    if data.len() < 0x18 || &data[0..8] != LF2_MAGIC {
-        return None;
-    }
-    let width = u16::from_le_bytes([data[12], data[13]]);
-    let height = u16::from_le_bytes([data[14], data[15]]);
-    let colors = data[0x16];
-    let payload_start = 0x18 + (colors as usize) * 3;
-    if payload_start > data.len() {
-        return None;
-    }
-    Some((width, height, payload_start))
-}
-
-fn tokens_to_lf2_payload(tokens: &[Token]) -> Vec<u8> {
-    let mut compressed: Vec<u8> = Vec::new();
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let flag_pos = compressed.len();
-        compressed.push(0);
-        let mut flag_byte: u8 = 0;
-        let mut bits_used = 0;
-        while bits_used < 8 && i < tokens.len() {
-            match tokens[i] {
-                Token::Literal(b) => {
-                    flag_byte |= 1 << (7 - bits_used);
-                    compressed.push(b ^ 0xff);
-                }
-                Token::Match { pos, len } => {
-                    let encoded_pos = (pos as usize) & 0x0fff;
-                    let encoded_len = ((len as usize) - 3) & 0x0f;
-                    let upper = (encoded_len | ((encoded_pos & 0x0f) << 4)) as u8;
-                    let lower = ((encoded_pos >> 4) & 0xff) as u8;
-                    compressed.push(upper ^ 0xff);
-                    compressed.push(lower ^ 0xff);
-                }
-            }
-            bits_used += 1;
-            i += 1;
-        }
-        compressed[flag_pos] = flag_byte ^ 0xff;
-    }
-    compressed
-}
+use retro_decode::formats::toheart::verify_harness::{parse_lf2, tokens_to_lf2_payload};
 
 fn pick_sim(ring_input: &[u8], orig_payload: &[u8]) -> Vec<Token> {
     let clip_tokens = compress_okumura(ring_input);
