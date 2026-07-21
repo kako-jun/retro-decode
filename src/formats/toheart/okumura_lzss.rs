@@ -296,6 +296,11 @@ struct Okumura {
     /// Stage 12-14: `insert_node` の EQ (F バイト完全一致) 置換で追い出された
     /// 旧ノード位置 `p` を記録する (読み取り専用ログ)。
     replace_log: Vec<i32>,
+    /// Stage 12-15 (Issue #14 脈1 Prong B): 「書込み時挿入」変種 (自走エンコーダの
+    /// `write_time_descending`) を使っているかどうか。挙動には一切影響せず、
+    /// `OKU_DEBUG_TREE_CHECK` 環境変数指定時の毎操作不変条件チェックを
+    /// この変種でも有効にするためだけに使う。
+    write_time_variant: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +353,7 @@ impl Okumura {
             rot_no_delete: false,
             promotion_log: Vec::new(),
             replace_log: Vec::new(),
+            write_time_variant: false,
         }
     }
 
@@ -547,7 +553,18 @@ impl Okumura {
     /// Stage 12-7 (Issue #14): `del_mode` に応じて削除昇格側を切り替える。
     fn delete_node(&mut self, p: i32) {
         match self.del_mode {
-            DelMode::Predecessor => self.delete_node_predecessor(p),
+            DelMode::Predecessor => {
+                // Stage 12-15 (Issue #14 脈1 Prong B): 「書込み時挿入」変種でも
+                // 毎操作不変条件チェックを有効にする (Successor 側の既存診断と同型)。
+                let debug = self.write_time_variant && std::env::var("OKU_DEBUG_TREE_CHECK").is_ok();
+                self.delete_node_predecessor(p);
+                if debug {
+                    if let Err(msg) = self.tree_is_consistent_raw() {
+                        eprintln!("BUG: tree inconsistent after delete_node_predecessor(p={}) [write_time_variant]: {}", p, msg);
+                        std::process::exit(1);
+                    }
+                }
+            }
             DelMode::Successor => {
                 // Stage 12-8 一時診断: 呼び出しごとに木の整合性 (循環なし) を検証する。
                 let debug = std::env::var("OKU_DEBUG_TREE_CHECK").is_ok();
@@ -596,7 +613,7 @@ impl Okumura {
     /// 木の**構造的**整合性 (循環なし・dad/子の相互整合。順序は見ない) を確認する
     /// (del_mode==Successor または rot_no_delete のいずれか、かつ環境変数指定時のみ)。
     fn debug_check_after_insert(&self, r: i32, parent: i32, side: &str) {
-        let relevant = matches!(self.del_mode, DelMode::Successor) || self.rot_no_delete;
+        let relevant = matches!(self.del_mode, DelMode::Successor) || self.rot_no_delete || self.write_time_variant;
         if !relevant || std::env::var("OKU_DEBUG_TREE_CHECK").is_err() {
             return;
         }
@@ -6212,6 +6229,9 @@ fn compress_okumura_impl_hooked_traced_full(
     st.cmp_mode = cmp_mode;
     st.del_mode = del_mode;
     st.rot_no_delete = rot_no_delete;
+    // Stage 12-15 (Issue #14 脈1 Prong B): write_time_descending 使用時は
+    // OKU_DEBUG_TREE_CHECK での毎操作不変条件チェック対象に含める。
+    st.write_time_variant = write_time_descending;
     if no_swap {
         st.bst_mode = BstMode::NoSwap;
     }
@@ -6756,6 +6776,44 @@ pub fn compress_okumura_plus1_del_successor(input: &[u8]) -> Vec<Token> {
         CmpMode::Unsigned,
         DelMode::Successor,
         false,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-15 (Issue #14 脈1 Prong B): 「書込み時挿入」フル変種本命。
+/// Clip + 奥村原典どおりの比較・削除 (`DelMode::Predecessor`、比較は Unsigned) +
+/// `WriteTimeDescending`。C120x token3-4 を 14/14 満点で説明した挿入モデル
+/// (Stage 12-4 `SimMode::WriteTimeDescending`) を、削除昇格側は変更せず
+/// ベース P-F に単独適用したもの (Prong A close-out で本命に格上げ)。
+pub fn compress_okumura_clip_writetime_descending(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        true,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-15: Plus1 + `DelMode::Predecessor` + `WriteTimeDescending`。
+pub fn compress_okumura_plus1_writetime_descending(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        true,
         false,
         false,
     )
