@@ -440,6 +440,86 @@ impl Okumura {
         }
     }
 
+    /// Stage 14-4 (Issue #14 脈: ⑲ 大規模タイ集合内での候補選定規則)。
+    ///
+    /// `insert_node` と全く同じ木構造・同じノード内比較ロジックで最長一致を
+    /// 探索するが、木の変更 (ノード挿入・delete_node の呼び出し) は一切
+    /// 行わない読み取り専用版。呼び出し時点で `r` 自身が既に木に挿入済み
+    /// (`insert_node(r)` 呼び出し後) であっても、`next == r` に到達したら
+    /// それを「まだ挿入されていない (NIL)」として扱うため、挿入前と同じ
+    /// 探索結果が得られる。`tie_mode` を渡すことでタイ勝者選定則だけを
+    /// 差し替えられる (例: `AllowEq` は「最初に見つかった同着」ではなく
+    /// 「木を下りながら最後に見つかった同着」を勝者にする)。
+    fn search_match_readonly(&self, r: i32, tie_mode: TieMode) -> (i32, i32) {
+        let mut cmp: i32 = match self.bst_mode {
+            BstMode::LeftFirst => -1,
+            _ => 1,
+        };
+        let key_start = r as usize;
+        let p_root_byte = match self.key_mode {
+            KeyMode::Byte0 => self.text_buf[key_start],
+            KeyMode::XorByte01 => self.text_buf[key_start] ^ self.text_buf[key_start + 1],
+            KeyMode::AddByte01Mod256 => {
+                self.text_buf[key_start].wrapping_add(self.text_buf[key_start + 1])
+            }
+        };
+        let p_root_idx = N as i32 + 1 + p_root_byte as i32;
+        let mut p: i32 = p_root_idx;
+        let mut match_length: i32 = 0;
+        let mut match_position: i32 = 0;
+
+        let mut guard: u32 = 0;
+        loop {
+            guard += 1;
+            if guard > 4 * N as u32 {
+                break;
+            }
+            let go_right = match self.bst_mode {
+                BstMode::LeftFirst => cmp > 0,
+                _ => cmp >= 0,
+            };
+            let next = if go_right {
+                self.rson[p as usize]
+            } else {
+                self.lson[p as usize]
+            };
+            // `r` 自身は (呼び出し時点で既に挿入済みなら) 見かけ上の
+            // リーフとして木に存在するが、挿入前の状態を再現するため
+            // NIL 到達と同一視して打ち切る。
+            if next == NIL || next == r {
+                break;
+            }
+            p = next;
+
+            let mut i: usize = 1;
+            cmp = 0;
+            while i < self.f_bound {
+                let a = self.cmp_val(self.text_buf[key_start + i]);
+                let b = self.cmp_val(self.text_buf[p as usize + i]);
+                let d = a - b;
+                if d != 0 {
+                    cmp = d;
+                    break;
+                }
+                i += 1;
+            }
+
+            let take = match tie_mode {
+                TieMode::StrictGt => (i as i32) > match_length,
+                TieMode::AllowEq => (i as i32) >= match_length,
+                _ => (i as i32) > match_length,
+            };
+            if take {
+                match_position = p;
+                match_length = i as i32;
+                if i >= self.f_bound {
+                    break;
+                }
+            }
+        }
+        (match_position, match_length)
+    }
+
     /// 原典 `InsertNode(int r)` 逐語移植。
     ///
     /// text_buf[r..r+F-1] を木に挿入し、同時に最長一致を探索する。
@@ -7771,6 +7851,13 @@ pub enum EofTieRule {
     /// 実データ一致 (len バイト) タイの中で、text_buf 上でさらに F バイトまで
     /// 延長比較したときの一致長 (phantom 込み) が最大の候補。同点なら距離最小。
     MaxPhantomExtension,
+    /// Stage 14-4 (Issue #14 脈: ⑲ 大規模タイ集合内での候補選定規則)。
+    /// タイ再選定発火**前**の生 BST 探索が返す `match_position` (raw_pos、
+    /// 自身は候補から除外) に絶対 ring index で最も近い候補。同点
+    /// (raw_pos ± 同じ距離に候補がある) は back distance (r に近い方) で
+    /// 決める。17本中4本 (C0805/C080D/C1201/C1709) で raw_pos の隣接位置が
+    /// 実際の Leaf 選択と一致することが分かった (台帳 ⑲)。
+    ClosestToRawPos,
 }
 
 pub fn compress_okumura_eof_retie(input: &[u8], base: TaxBase, tie_rule: EofTieRule) -> Vec<Token> {
@@ -7814,6 +7901,7 @@ pub fn compress_okumura_eof_retie(input: &[u8], base: TaxBase, tie_rule: EofTieR
         // EOF境界タイの再選定: len < F かつ raw match_length が len ちょうど
         // (Literal閾値は超えている) のときだけ発火。
         if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let raw_pos = st.match_position;
             let mut best: Option<(usize, i32)> = None; // (score, pos) — score の意味は tie_rule 依存
             for p in 0..N as i32 {
                 if p == r {
@@ -7821,6 +7909,11 @@ pub fn compress_okumura_eof_retie(input: &[u8], base: TaxBase, tie_rule: EofTieR
                     // しているだけの degenerate ケース (text_buf[r] は N 周期前の
                     // 古いデータであり `written` は true だが、自分自身との比較は
                     // 常に自明に一致してしまうため除外する)。
+                    continue;
+                }
+                if tie_rule == EofTieRule::ClosestToRawPos && p == raw_pos {
+                    // raw_pos 自身は「タイ再選定」の意味がないので除外
+                    // (常に dist_to_raw=0 で自明に勝ってしまう)。
                     continue;
                 }
                 if !written[p as usize] {
@@ -7853,6 +7946,17 @@ pub fn compress_okumura_eof_retie(input: &[u8], base: TaxBase, tie_rule: EofTieR
                         }
                         // 主キー: phantom 延長長 (大きいほど優先)。副キー: 距離最小。
                         (j << 16) | (usize::MAX - dist).min(0xffff)
+                    }
+                    EofTieRule::ClosestToRawPos => {
+                        let dist_to_raw = {
+                            let d = (p - raw_pos) & (N as i32 - 1);
+                            (d.min(N as i32 - d)) as usize
+                        };
+                        // 主キー: raw_pos に近いほど優先。副キー: r に近いほど優先
+                        // (raw_pos の両隣が同着したときの決め手、C1709 で確認)。
+                        // dist/dist_to_raw は共に < N = 4096 (12bit) なので
+                        // 32bit ずつシフトしても usize (64bit) で安全に収まる。
+                        ((N - dist_to_raw) << 32) | (N - dist)
                     }
                 };
                 if best.map(|(bs, _)| score > bs).unwrap_or(true) {
@@ -7915,6 +8019,388 @@ pub fn compress_okumura_eof_retie(input: &[u8], base: TaxBase, tie_rule: EofTieR
     out
 }
 
+/// Stage 14-4 (Issue #14 脈: ⑲ 大規模タイ集合内での候補選定規則) 診断専用。
+///
+/// `compress_okumura_eof_retie` と同じタイ条件・同じ (overlap を正しく
+/// 扱う) 静的窓比較でタイ候補集合を再列挙するが、勝者を選ばず**最後に
+/// 発火した局面の候補一覧**をそのまま返す (pos, back distance, write_tick)。
+/// 独立の (BST を経由しない) `lf2_stage14_3_oracle` は overlap 候補
+/// (dist < len の自己参照RLE的パターン) を正しく判定できない既知の限界が
+/// あるため、この関数は実際の候補選定ロジックと同じ静的窓比較
+/// (`text_buf[p+j] == text_buf[r+j]`) を再利用し、overlap を含めて正しい
+/// タイ集合を返す。
+pub fn compress_okumura_eof_retie_last_candidates(
+    input: &[u8],
+    base: TaxBase,
+) -> Option<(i32, usize, i32, Vec<(i32, i32, u32)>)> {
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut written = vec![false; N];
+    let mut write_tick = vec![0u32; N];
+    let mut tick: u32 = 0;
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    for k in 0..len {
+        written[(r as usize + k) & (N - 1)] = true;
+        write_tick[(r as usize + k) & (N - 1)] = tick;
+        tick += 1;
+    }
+
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut last_dump: Option<(i32, usize, i32, Vec<(i32, i32, u32)>)> = None;
+
+    loop {
+        if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let raw_pos = st.match_position;
+            let mut cands: Vec<(i32, i32, u32)> = Vec::new();
+            for p in 0..N as i32 {
+                if p == r {
+                    continue;
+                }
+                if !written[p as usize] {
+                    continue;
+                }
+                let mut ok = true;
+                for j in 0..len {
+                    if st.text_buf[p as usize + j] != st.text_buf[r as usize + j] {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let dist = ((r - p) & (N as i32 - 1)) as i32;
+                cands.push((p, dist, write_tick[p as usize]));
+            }
+            last_dump = Some((r, len, raw_pos, cands));
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            written[s as usize] = true;
+            write_tick[s as usize] = tick;
+            tick += 1;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    last_dump
+}
+
+/// Stage 14-4 (Issue #14 脈: ⑲ 大規模タイ集合内での候補選定規則)。
+///
+/// 「巨大タイ集合から距離/pos/write_tick で選び直す」post-hoc 方式ではなく、
+/// 実際のBST構造 (`insert_node` が既に構築した木) を `search_match_readonly`
+/// で `AllowEq` タイモードにより**再探索**する方式。`StrictGt` (原典・現行既定)
+/// は「木を下りながら最初に見つかった同着」を勝者にするが、`AllowEq` は
+/// 「最後に見つかった同着」を勝者にする — 木構造上のタイブレイクという
+/// 全く別の原理。EOF境界 (`len < F` かつ raw match_length が `len` ちょうど)
+/// でだけ発火し、それ以外は既存 Basic/NoDummy/Fill00 と完全に同じ。
+pub fn compress_okumura_eof_retree_allow_eq(input: &[u8], base: TaxBase) -> Vec<Token> {
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    loop {
+        if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let (ae_pos, ae_len) = st.search_match_readonly(r, TieMode::AllowEq);
+            if ae_len as usize >= len {
+                st.match_position = ae_pos;
+                st.match_length = (len as i32 + 1).min(F as i32);
+            }
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// Stage 14-4 (Issue #14 脈: ⑲) 診断専用。`compress_okumura_eof_retree_allow_eq`
+/// と同じ発火条件で、最後に発火した局面の `(r, len, strict_gt_pos, allow_eq_pos,
+/// allow_eq_len)` を返す。
+/// Stage 14-4 (Issue #14 脈: ⑲) 診断専用。
+///
+/// `match_position` (木を下りながら「最初に見つかった同着」) とは別に、
+/// `insert_node(r)` が実際に `r` を挿入した**構造上の親ノード位置**
+/// (`dad[r]`) を返す。巨大タイ集合の内部では、`match_position` を更新する
+/// 条件 (`i > match_length`、厳密不等号) を満たすのは経路上で最初の1回だけ
+/// だが、木の物理的な挿入位置は経路の**末端**（NILの子に到達した時点）で
+/// 決まるため、両者は別の位置になりうる。`dad[r]` が `N` 以上 (256分木の
+/// pseudo-root) の場合は候補として無効 (呼び出し側で除外)。
+pub fn probe_eof_attach_point_last(
+    input: &[u8],
+    base: TaxBase,
+) -> Option<(i32, usize, i32, i32)> {
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut last: Option<(i32, usize, i32, i32)> = None;
+
+    loop {
+        if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let attach = st.dad[r as usize];
+            last = Some((r, len, st.match_position, attach));
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    last
+}
+
+pub fn probe_eof_retree_allow_eq_last(
+    input: &[u8],
+    base: TaxBase,
+) -> Option<(i32, usize, i32, i32, i32)> {
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut last: Option<(i32, usize, i32, i32, i32)> = None;
+
+    loop {
+        if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let (ae_pos, ae_len) = st.search_match_readonly(r, TieMode::AllowEq);
+            last = Some((r, len, st.match_position, ae_pos, ae_len));
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    last
+}
+
 /// Stage 14-3 (Issue #14 脈: ⑱ EOF終トークン分岐の掃討) 確定名。
 ///
 /// near-miss上位24本の実測 (`compress_okumura_eof_retie` の `ClosestDist`/
@@ -7942,6 +8428,24 @@ pub fn compress_okumura_no_dummy_eof_farthest_tie(input: &[u8]) -> Vec<Token> {
 }
 pub fn compress_okumura_fill00_eof_farthest_tie(input: &[u8]) -> Vec<Token> {
     compress_okumura_eof_retie(input, TaxBase::Fill00, EofTieRule::FarthestDist)
+}
+
+/// Stage 14-4 (Issue #14 脈: ⑲ 大規模タイ集合内での候補選定規則) 確定名。
+///
+/// 残17本の実測 (`compress_okumura_eof_retie` の `ClosestToRawPos` 掃討)
+/// で判明: 4本 (C0805/C080D/C1201/C1709) は「タイ再選定発火前の生 BST
+/// 探索勝者 (raw_pos) の隣接位置 (raw_pos±1)」が実際の Leaf 選択と一致する
+/// (raw_pos 自身ではなく、他の候補すべての中で raw_pos に最も近い位置)。
+/// `TaxBase` (Basic/NoDummy/Fill00) × 本ルールの直積を union264 候補プールに
+/// 追加するための命名ラッパー。
+pub fn compress_okumura_basic_eof_closest_to_raw_tie(input: &[u8]) -> Vec<Token> {
+    compress_okumura_eof_retie(input, TaxBase::Basic, EofTieRule::ClosestToRawPos)
+}
+pub fn compress_okumura_no_dummy_eof_closest_to_raw_tie(input: &[u8]) -> Vec<Token> {
+    compress_okumura_eof_retie(input, TaxBase::NoDummy, EofTieRule::ClosestToRawPos)
+}
+pub fn compress_okumura_fill00_eof_closest_to_raw_tie(input: &[u8]) -> Vec<Token> {
+    compress_okumura_eof_retie(input, TaxBase::Fill00, EofTieRule::ClosestToRawPos)
 }
 
 #[cfg(test)]
