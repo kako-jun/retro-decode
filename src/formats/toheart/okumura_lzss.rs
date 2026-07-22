@@ -320,6 +320,21 @@ pub enum DelMode {
     Successor,
 }
 
+/// Stage 12-16 (Issue #14 脈1 Prong B 続き): 自走エンコーダ
+/// (`compress_okumura_impl_hooked_traced_full`) 側の「書込み時挿入」順序。
+/// Stage 12-15 の `write_time_descending: bool` を、Ascending も自走側で
+/// 実装するために3値化した (`SimMode::WriteTimeDescending`/`WriteTimeAscending`
+/// と対応)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteTimeOrder {
+    /// 原典どおり dummy F 個挿入 + per-byte insert (書込み時挿入なし)。
+    None,
+    /// 初期先読み充填 [r, r+F-1] を降順 (r+F-1 → r) で一括挿入。
+    Descending,
+    /// 初期先読み充填 [r, r+F-1] を昇順 (r → r+F-1) で一括挿入。
+    Ascending,
+}
+
 /// Stage 12-6 (Issue #14 脈: signed char 比較仮説)。奥村原典の
 /// `cmp = key[i] - text_buf[p+i]` は Leaf 時代のコンパイラ (Turbo C/VC++)
 /// では `char` が既定で符号付きだった可能性がある。現行 Rust 移植は
@@ -6180,7 +6195,7 @@ fn compress_okumura_impl_hooked_traced(
     dummy_mode: DummyMode,
     trace: Option<&mut Vec<TailTraceStep>>,
 ) -> Vec<Token> {
-    // 既定 (cmp_mode=Unsigned, del_mode=Predecessor, write_time_descending=false,
+    // 既定 (cmp_mode=Unsigned, del_mode=Predecessor, write_time_order=None,
     // rot_no_delete=false, no_swap=false) = 従来と完全同一の挙動。
     compress_okumura_impl_hooked_traced_full(
         input,
@@ -6191,7 +6206,7 @@ fn compress_okumura_impl_hooked_traced(
         trace,
         CmpMode::Unsigned,
         DelMode::Predecessor,
-        false,
+        WriteTimeOrder::None,
         false,
         false,
     )
@@ -6220,7 +6235,7 @@ fn compress_okumura_impl_hooked_traced_full(
     mut trace: Option<&mut Vec<TailTraceStep>>,
     cmp_mode: CmpMode,
     del_mode: DelMode,
-    write_time_descending: bool,
+    write_time_order: WriteTimeOrder,
     rot_no_delete: bool,
     no_swap: bool,
 ) -> Vec<Token> {
@@ -6229,9 +6244,9 @@ fn compress_okumura_impl_hooked_traced_full(
     st.cmp_mode = cmp_mode;
     st.del_mode = del_mode;
     st.rot_no_delete = rot_no_delete;
-    // Stage 12-15 (Issue #14 脈1 Prong B): write_time_descending 使用時は
+    // Stage 12-15/12-16 (Issue #14 脈1 Prong B): write_time_order 使用時は
     // OKU_DEBUG_TREE_CHECK での毎操作不変条件チェック対象に含める。
-    st.write_time_variant = write_time_descending;
+    st.write_time_variant = !matches!(write_time_order, WriteTimeOrder::None);
     if no_swap {
         st.bst_mode = BstMode::NoSwap;
     }
@@ -6263,22 +6278,32 @@ fn compress_okumura_impl_hooked_traced_full(
         return out;
     }
 
-    // Stage 12-8: write_time_descending のときは Stage 12-4 の
-    // WriteTimeDescending と同じ初期化 (dummy なし、初期先読み充填を降順で
-    // 一括挿入) にし、以降 F-1 回分の per-byte insert_node をスキップする。
+    // Stage 12-8/12-16: write_time_order != None のときは Stage 12-4 の
+    // WriteTimeDescending/WriteTimeAscending と同じ初期化 (dummy なし、初期
+    // 先読み充填を降順/昇順で一括挿入) にし、以降 F-1 回分の per-byte
+    // insert_node をスキップする。
     let mut skip_inserts: usize = 0;
-    if write_time_descending {
-        for k in (0..F as i32).rev() {
-            st.insert_node(r + k);
+    match write_time_order {
+        WriteTimeOrder::Descending => {
+            for k in (0..F as i32).rev() {
+                st.insert_node(r + k);
+            }
+            skip_inserts = F - 1;
         }
-        skip_inserts = F - 1;
-    } else {
-        // 最初に F 個のダミー挿入（奥村原典 for (i = 1; i <= F; i++) InsertNode(r - i)）
-        for i in 1..=F {
-            st.insert_node(r - i as i32);
+        WriteTimeOrder::Ascending => {
+            for k in 0..F as i32 {
+                st.insert_node(r + k);
+            }
+            skip_inserts = F - 1;
         }
-        // 最初の本挿入
-        st.insert_node(r);
+        WriteTimeOrder::None => {
+            // 最初に F 個のダミー挿入（奥村原典 for (i = 1; i <= F; i++) InsertNode(r - i)）
+            for i in 1..=F {
+                st.insert_node(r - i as i32);
+            }
+            // 最初の本挿入
+            st.insert_node(r);
+        }
     }
 
     loop {
@@ -6740,7 +6765,7 @@ pub fn compress_okumura_cmp_del_variant(input: &[u8], cmp_mode: CmpMode, del_mod
         None,
         cmp_mode,
         del_mode,
-        false,
+        WriteTimeOrder::None,
         false,
         false,
     )
@@ -6758,7 +6783,7 @@ pub fn compress_okumura_clip_del_successor(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Successor,
-        false,
+        WriteTimeOrder::None,
         false,
         false,
     )
@@ -6775,7 +6800,7 @@ pub fn compress_okumura_plus1_del_successor(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Successor,
-        false,
+        WriteTimeOrder::None,
         false,
         false,
     )
@@ -6796,7 +6821,7 @@ pub fn compress_okumura_clip_writetime_descending(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Predecessor,
-        true,
+        WriteTimeOrder::Descending,
         false,
         false,
     )
@@ -6813,7 +6838,45 @@ pub fn compress_okumura_plus1_writetime_descending(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Predecessor,
-        true,
+        WriteTimeOrder::Descending,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-16 (Issue #14 脈1 Prong B 続き): Clip + `DelMode::Predecessor` +
+/// `WriteTimeAscending`。Stage 12-16 Step 1 の対比プロファイリングで、Ascending
+/// (`SimMode::WriteTimeAscending`) の per-tie 的中率が Descending (98.86%) より
+/// 高く (98.91%)、P-F退行も711→362に半減した一方 none-of-6救済90件中84件
+/// (93.3%) を維持することを確認済み。Descending より優先度の高い主軸候補。
+pub fn compress_okumura_clip_writetime_ascending(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        WriteTimeOrder::Ascending,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-16: Plus1 + `DelMode::Predecessor` + `WriteTimeAscending`。
+pub fn compress_okumura_plus1_writetime_ascending(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        WriteTimeOrder::Ascending,
         false,
         false,
     )
@@ -6831,7 +6894,7 @@ pub fn compress_okumura_clip_del_successor_wtd(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Successor,
-        true,
+        WriteTimeOrder::Descending,
         false,
         false,
     )
@@ -6848,7 +6911,42 @@ pub fn compress_okumura_plus1_del_successor_wtd(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Successor,
-        true,
+        WriteTimeOrder::Descending,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-16 (Issue #14 脈1 Prong B 続き): Clip + `DelMode::Successor` +
+/// `WriteTimeAscending` (削除昇格側と挿入順序の2軸併用、直交確認)。
+pub fn compress_okumura_clip_del_successor_wta(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Successor,
+        WriteTimeOrder::Ascending,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-16: Plus1 + `DelMode::Successor` + `WriteTimeAscending`。
+pub fn compress_okumura_plus1_del_successor_wta(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Successor,
+        WriteTimeOrder::Ascending,
         false,
         false,
     )
@@ -6866,7 +6964,7 @@ pub fn compress_okumura_clip_rot_a(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Predecessor,
-        false,
+        WriteTimeOrder::None,
         true,
         false,
     )
@@ -6883,7 +6981,7 @@ pub fn compress_okumura_plus1_rot_a(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Predecessor,
-        false,
+        WriteTimeOrder::None,
         true,
         false,
     )
@@ -6900,7 +6998,7 @@ pub fn compress_okumura_clip_rot_b(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Predecessor,
-        false,
+        WriteTimeOrder::None,
         true,
         true,
     )
@@ -6917,7 +7015,7 @@ pub fn compress_okumura_plus1_rot_b(input: &[u8]) -> Vec<Token> {
         None,
         CmpMode::Unsigned,
         DelMode::Predecessor,
-        false,
+        WriteTimeOrder::None,
         true,
         true,
     )
