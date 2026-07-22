@@ -520,6 +520,63 @@ impl Okumura {
         (match_position, match_length)
     }
 
+    /// Stage 14-5 (Issue #14 脈: ⑲続) 診断専用。現在の木構造上での in-order
+    /// 後続ノード (`p` の次に大きいキーを持つノード) を返す。標準アルゴリズム:
+    /// 右部分木があればその最左子孫、なければ「左の子として来た」最初の
+    /// 祖先。見つからなければ `NIL`。
+    fn inorder_successor(&self, p: i32) -> i32 {
+        if self.rson[p as usize] != NIL {
+            let mut q = self.rson[p as usize];
+            while self.lson[q as usize] != NIL {
+                q = self.lson[q as usize];
+            }
+            return q;
+        }
+        let mut child = p;
+        let mut parent = self.dad[p as usize];
+        let mut guard = 0u32;
+        while parent < N as i32 && self.rson[parent as usize] == child {
+            child = parent;
+            parent = self.dad[parent as usize];
+            guard += 1;
+            if guard > N as u32 {
+                return NIL;
+            }
+        }
+        if parent >= N as i32 {
+            NIL
+        } else {
+            parent
+        }
+    }
+
+    /// `inorder_successor` の鏡像 (in-order 前任ノード)。
+    fn inorder_predecessor(&self, p: i32) -> i32 {
+        if self.lson[p as usize] != NIL {
+            let mut q = self.lson[p as usize];
+            while self.rson[q as usize] != NIL {
+                q = self.rson[q as usize];
+            }
+            return q;
+        }
+        let mut child = p;
+        let mut parent = self.dad[p as usize];
+        let mut guard = 0u32;
+        while parent < N as i32 && self.lson[parent as usize] == child {
+            child = parent;
+            parent = self.dad[parent as usize];
+            guard += 1;
+            if guard > N as u32 {
+                return NIL;
+            }
+        }
+        if parent >= N as i32 {
+            NIL
+        } else {
+            parent
+        }
+    }
+
     /// 原典 `InsertNode(int r)` 逐語移植。
     ///
     /// text_buf[r..r+F-1] を木に挿入し、同時に最長一致を探索する。
@@ -8138,6 +8195,261 @@ pub fn compress_okumura_eof_retie_last_candidates(
     }
 
     last_dump
+}
+
+/// Stage 14-5 (Issue #14 脈: ⑲続 EOF巨大tie ブロック選択規則の特定) 1 候補分の診断情報。
+#[derive(Debug, Clone, Copy)]
+pub struct Stage145Candidate {
+    pub pos: i32,
+    pub dist: i32,
+    pub write_tick: u32,
+    /// 仮説1 (置換セマンティクス): この候補が発火時点で実際に BST に
+    /// 生存しているか (`dad[pos] != NIL`)。`written[]` ベースの brute-force
+    /// 走査 (実データ一致さえすれば無条件で候補に数える) とは別軸。
+    pub in_tree: bool,
+    /// 仮説2 (拡張比較長): `len` バイトだけでなく `len+1` バイト目
+    /// (宣言される token 長ぶんの phantom byte) まで text_buf の実内容で
+    /// 一致するか。
+    pub survives_extended: bool,
+}
+
+/// Stage 14-5 (Issue #14 脈: ⑲続) 診断専用。
+///
+/// `compress_okumura_eof_retie_last_candidates` と同じ発火条件・同じ
+/// (overlap を正しく扱う) 候補列挙を行うが、各候補に司令塔の2大仮説を
+/// 直接検証するためのフラグを付与する:
+///
+/// - 仮説1「同一文字列は置換」: 候補が発火時点で実際に BST に生存して
+///   いるか (`dad[pos] != NIL`)。brute-force 走査は `written[]` (実データ
+///   として書かれたか) しか見ないため、既に `insert_node` の EQ 置換で
+///   木から追い出されたノードも「候補」に数えてしまっている可能性がある。
+/// - 仮説2「比較長を宣言長 (len+1) まで伸ばす」: `len` バイト目の次
+///   (index `len`、phantom byte) まで実際の text_buf 内容で一致するか。
+///   一致すれば「len バイトだけのタイ」ではなく「len+1 バイトでも本当は
+///   タイのまま」であり、逆に不一致ならこの拡張比較で自然に脱落する。
+pub fn compress_okumura_eof_retie_probe_stage14_5(
+    input: &[u8],
+    base: TaxBase,
+) -> Option<(i32, usize, i32, Vec<Stage145Candidate>)> {
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut written = vec![false; N];
+    let mut write_tick = vec![0u32; N];
+    let mut tick: u32 = 0;
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    for k in 0..len {
+        written[(r as usize + k) & (N - 1)] = true;
+        write_tick[(r as usize + k) & (N - 1)] = tick;
+        tick += 1;
+    }
+
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut last_dump: Option<(i32, usize, i32, Vec<Stage145Candidate>)> = None;
+
+    loop {
+        if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let raw_pos = st.match_position;
+            let mut cands: Vec<Stage145Candidate> = Vec::new();
+            for p in 0..N as i32 {
+                if p == r {
+                    continue;
+                }
+                if !written[p as usize] {
+                    continue;
+                }
+                let mut ok = true;
+                for j in 0..len {
+                    if st.text_buf[p as usize + j] != st.text_buf[r as usize + j] {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let dist = ((r - p) & (N as i32 - 1)) as i32;
+                let in_tree = st.dad[p as usize] != NIL;
+                // len 番目 (0-index) = 宣言長 (len+1) の追加バイト。境界は
+                // p+len, r+len とも text_buf 配列内 (N+F-1 要素) に収まる
+                // (p < N, len < F <= 17 => p+len < N+F-1)。
+                let survives_extended = st.text_buf[p as usize + len] == st.text_buf[r as usize + len];
+                cands.push(Stage145Candidate {
+                    pos: p,
+                    dist,
+                    write_tick: write_tick[p as usize],
+                    in_tree,
+                    survives_extended,
+                });
+            }
+            last_dump = Some((r, len, raw_pos, cands));
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            written[s as usize] = true;
+            write_tick[s as usize] = tick;
+            tick += 1;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    last_dump
+}
+
+/// Stage 14-5 (Issue #14 脈: ⑲続) 診断専用。
+///
+/// `raw_pos` (タイ再選定発火前の生 BST 探索勝者) を起点に、**実際の木構造**
+/// (`raw_pos` と同じ 256分木バケツ = 同じ root byte0 の部分木) 内で in-order
+/// 前任/後続方向にそれぞれ `max_hops` 回まで辿り、途中で通過したノード位置
+/// (ring 絶対位置) の列を返す。「巨大タイ集合の中の正解ノードは、木構造上
+/// raw_pos の近傍 (in-order neighbor) にいる」という仮説の検証用。
+pub fn compress_okumura_eof_retie_probe_inorder_neighbors(
+    input: &[u8],
+    base: TaxBase,
+    max_hops: usize,
+) -> Option<(i32, i32, i32, Vec<i32>, Vec<i32>)> {
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut last_result: Option<(i32, i32, i32, Vec<i32>, Vec<i32>)> = None;
+
+    loop {
+        if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let raw_pos = st.match_position;
+            let mut succ_chain: Vec<i32> = Vec::new();
+            let mut q = raw_pos;
+            for _ in 0..max_hops {
+                q = st.inorder_successor(q);
+                if q == NIL {
+                    break;
+                }
+                succ_chain.push(q);
+            }
+            let mut pred_chain: Vec<i32> = Vec::new();
+            let mut q = raw_pos;
+            for _ in 0..max_hops {
+                q = st.inorder_predecessor(q);
+                if q == NIL {
+                    break;
+                }
+                pred_chain.push(q);
+            }
+            last_result = Some((r, len as i32, raw_pos, succ_chain, pred_chain));
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    last_result
 }
 
 /// Stage 14-4 (Issue #14 脈: ⑲ 大規模タイ集合内での候補選定規則)。
