@@ -333,6 +333,13 @@ pub enum WriteTimeOrder {
     Descending,
     /// 初期先読み充填 [r, r+F-1] を昇順 (r → r+F-1) で一括挿入。
     Ascending,
+    /// Stage 12-17 (Issue #14 脈1 Prong B 続き): Step 1 の外部シャドートラッカーで
+    /// 特定した「dummy 帯 [r-F,r-1] が一度も挿入されない空白」問題のハイブリッド修正。
+    /// `Descending` に加え、原典の dummy F 個 (`r-F..r-1`) も先に挿入したまま残す
+    /// (dummy → 実データ18個・降順の順。`SimMode::WriteTimeDescendingKeepDummy` 相当)。
+    DescendingKeepDummy,
+    /// `Ascending` + dummy 保持版 (`SimMode::WriteTimeAscendingKeepDummy` 相当)。
+    AscendingKeepDummy,
 }
 
 /// Stage 12-6 (Issue #14 脈: signed char 比較仮説)。奥村原典の
@@ -6284,13 +6291,26 @@ fn compress_okumura_impl_hooked_traced_full(
     // insert_node をスキップする。
     let mut skip_inserts: usize = 0;
     match write_time_order {
-        WriteTimeOrder::Descending => {
+        WriteTimeOrder::Descending | WriteTimeOrder::DescendingKeepDummy => {
+            // Stage 12-17: KeepDummy 版は原典と同じ dummy F 個 (r-F..r-1) を
+            // 先に挿入して残す (Step 1 で特定した「dummy 帯が一度も挿入されない
+            // 空白」を埋める)。
+            if matches!(write_time_order, WriteTimeOrder::DescendingKeepDummy) {
+                for i in 1..=F {
+                    st.insert_node(r - i as i32);
+                }
+            }
             for k in (0..F as i32).rev() {
                 st.insert_node(r + k);
             }
             skip_inserts = F - 1;
         }
-        WriteTimeOrder::Ascending => {
+        WriteTimeOrder::Ascending | WriteTimeOrder::AscendingKeepDummy => {
+            if matches!(write_time_order, WriteTimeOrder::AscendingKeepDummy) {
+                for i in 1..=F {
+                    st.insert_node(r - i as i32);
+                }
+            }
             for k in 0..F as i32 {
                 st.insert_node(r + k);
             }
@@ -6877,6 +6897,78 @@ pub fn compress_okumura_plus1_writetime_ascending(input: &[u8]) -> Vec<Token> {
         CmpMode::Unsigned,
         DelMode::Predecessor,
         WriteTimeOrder::Ascending,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-17 (Issue #14 脈1 Prong B 続き): Clip + `DelMode::Predecessor` +
+/// `WriteTimeDescendingKeepDummy`。Step 1 の外部シャドートラッカーで、退行711件中
+/// 173件 (24.3%) が「dummy帯 [4060,4077] が一度も挿入されない」ことに起因すると
+/// 特定 (already_deleted 0件、origin=never が100%その帯に集中)。dummy挿入を
+/// 復活させるハイブリッド修正。
+pub fn compress_okumura_clip_writetime_descending_keepdummy(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        WriteTimeOrder::DescendingKeepDummy,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-17: Plus1 + `WriteTimeDescendingKeepDummy`。
+pub fn compress_okumura_plus1_writetime_descending_keepdummy(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        WriteTimeOrder::DescendingKeepDummy,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-17: Clip + `WriteTimeAscendingKeepDummy`。
+pub fn compress_okumura_clip_writetime_ascending_keepdummy(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Clip,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        WriteTimeOrder::AscendingKeepDummy,
+        false,
+        false,
+    )
+}
+
+/// Stage 12-17: Plus1 + `WriteTimeAscendingKeepDummy`。
+pub fn compress_okumura_plus1_writetime_ascending_keepdummy(input: &[u8]) -> Vec<Token> {
+    compress_okumura_impl_hooked_traced_full(
+        input,
+        TieMode::StrictGt,
+        None,
+        TailMode::Plus1,
+        DummyMode::Allow,
+        None,
+        CmpMode::Unsigned,
+        DelMode::Predecessor,
+        WriteTimeOrder::AscendingKeepDummy,
         false,
         false,
     )
