@@ -379,6 +379,30 @@ impl Okumura {
         }
     }
 
+    /// Stage 14-2 (Issue #14 脈: per-file 小状態フィッティング)。`new(fill)` の
+    /// 一般化版で、text_buf の初期値を単一 fill バイトではなく任意のバイト列
+    /// (`N + F - 1` 要素) から構築する。ring 初期内容汚染仮説 (⑧/⑩) の検証専用。
+    fn new_from_buf(buf: [u8; N + F - 1]) -> Self {
+        Self {
+            text_buf: buf,
+            lson: [0; N + 257],
+            rson: [0; N + 257],
+            dad: [0; N + 1],
+            match_position: 0,
+            match_length: 0,
+            tie_mode: TieMode::StrictGt,
+            cur_r: 0,
+            bst_mode: BstMode::Standard,
+            key_mode: KeyMode::Byte0,
+            cmp_mode: CmpMode::Unsigned,
+            del_mode: DelMode::Predecessor,
+            rot_no_delete: false,
+            promotion_log: Vec::new(),
+            replace_log: Vec::new(),
+            write_time_variant: false,
+        }
+    }
+
     /// ノード内比較 (index 1..F) 用にバイトを比較可能な値へ変換する
     /// (`cmp_mode` 参照)。root byte0 のバケツ選択には使わない。
     #[inline]
@@ -7135,6 +7159,154 @@ pub fn compress_okumura_plus1_no_bootstrap_v4(input: &[u8]) -> Vec<Token> {
         DummyMode::RejectPureBootstrap,
         None,
     )
+}
+
+/// Stage 14-2 (Issue #14 脈: per-file 小状態フィッティング「⑧ ring 初期内容
+/// 汚染統合」)。`compress_okumura_clip/plus1_writetime_descending/ascending`
+/// (union257 の中核4系統) の一般化版。`Okumura::new(0x20)` 固定 fill を任意の
+/// 初期 ring バイト列 (`init_buf`、`N + F - 1` 要素) に差し替えられる点と、
+/// 先読み開始位置 `r_init = N - F` を `r_init_delta` で小さくずらせる点だけが
+/// 違う (tie_mode/dummy_mode/cmp_mode/del_mode は writetime 系4関数と同一)。
+///
+/// 戻り値はトークン列と、エンコード終了時点の ring 内容 (`text_buf[0..N]`)
+/// のスナップショット。後者はバッチ内直前ファイルの残留 ring を次ファイルへ
+/// 持ち込む仮説 (⑨) の材料に使う。
+pub fn compress_okumura_writetime_custom_ring_traced(
+    input: &[u8],
+    plus1: bool,
+    ascending: bool,
+    init_buf: [u8; N + F - 1],
+    r_init_delta: i32,
+) -> (Vec<Token>, Vec<u8>) {
+    let tail_mode = if plus1 { TailMode::Plus1 } else { TailMode::Clip };
+
+    let mut st = Okumura::new_from_buf(init_buf);
+    st.tie_mode = TieMode::StrictGt;
+    st.cmp_mode = CmpMode::Unsigned;
+    st.del_mode = DelMode::Predecessor;
+    st.write_time_variant = true;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+
+    // r_init_delta は「小整数パラメータ」探索用の小さなずれのみを想定する。
+    // `insert_node` 内の比較ループが text_buf[r..r+F-1] をマスクなしで直接
+    // 読むため `r_init+delta+F-1 <= N-1` (= delta<=0) が必須 (元の r_init=N-F は
+    // ちょうどこの上限に選ばれている定数)。呼び出し側は 0 以下の小さな値のみ
+    // 渡すこと (正方向はここで panic する)。
+    let r_init = (N - F) as i32 + r_init_delta;
+    assert!(
+        r_init >= 0 && r_init + F as i32 - 1 <= N as i32 - 1,
+        "r_init_delta out of safe range: r_init={} (N-F={}, F={})",
+        r_init,
+        N - F,
+        F
+    );
+    let mut r: i32 = r_init;
+    let mut s: i32 = 0;
+
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+
+    if len == 0 {
+        return (out, st.text_buf[0..N].to_vec());
+    }
+
+    if ascending {
+        for k in 0..F as i32 {
+            st.insert_node(r + k);
+        }
+    } else {
+        for k in (0..F as i32).rev() {
+            st.insert_node(r + k);
+        }
+    }
+    let mut skip_inserts: usize = F - 1;
+
+    loop {
+        let cap = match tail_mode {
+            TailMode::Clip => Some(len),
+            TailMode::Unbounded => None,
+            TailMode::Plus1 => Some(len + 1),
+        };
+        if let Some(cap) = cap {
+            if st.match_length as usize > cap {
+                st.match_length = cap as i32;
+            }
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            let pos = (st.match_position as u16) & ((N as u16) - 1);
+            out.push(Token::Match {
+                pos,
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+
+            st.text_buf[s as usize] = c;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            if skip_inserts > 0 {
+                skip_inserts -= 1;
+            } else {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+
+        while i < last_match_length && len > 0 {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                if skip_inserts > 0 {
+                    skip_inserts -= 1;
+                } else {
+                    st.insert_node(r);
+                }
+            }
+            i += 1;
+        }
+
+        if len == 0 {
+            break;
+        }
+    }
+
+    (out, st.text_buf[0..N].to_vec())
+}
+
+/// `compress_okumura_writetime_custom_ring_traced` のトークン列のみ返す
+/// 薄いラッパー (ring スナップショットが要らない呼び出し用)。
+pub fn compress_okumura_writetime_custom_ring(
+    input: &[u8],
+    plus1: bool,
+    ascending: bool,
+    init_buf: [u8; N + F - 1],
+    r_init_delta: i32,
+) -> Vec<Token> {
+    compress_okumura_writetime_custom_ring_traced(input, plus1, ascending, init_buf, r_init_delta).0
 }
 
 #[cfg(test)]
