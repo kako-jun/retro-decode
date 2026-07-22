@@ -8349,6 +8349,159 @@ pub fn compress_okumura_eof_retie_probe_stage14_5(
     last_dump
 }
 
+/// Stage 14-6 (Issue #14 脈: ⑲続々 奥村EOFドレインループの忠実再現) 診断専用。
+///
+/// 司令塔仮説「EOF近傍で `InsertNode` が縮んでいく実効長で挿入される」を、
+/// Stage 14-3 の `compress_okumura_eof_search_bound` と同じ `f_bound`
+/// 縮小機構 (`bound_for(len) = min(F, max(1, len + search_extra))`、
+/// `len < F` の間だけ発動) を、`len < F` に入った時点以降の**全て**の
+/// `insert_node` 呼び出しに適用したうえで、Stage 14-5 と同じ「実データ一致
+/// (overlap 込み静的窓比較)・実BST生存フラグ付き」候補列挙を行う。
+///
+/// Stage 14-3 は縮小窓のまま出力される生の `match_position` (最初に見つかる
+/// もの) をそのまま見て 24 本全数で勝者不変 (0/24) だったが、その検証は
+/// 「窓を縮めた結果ツリーに残る/追い出されるノード集合そのもの」までは見て
+/// いない。本関数は縮小窓ドレインが生む木構造の変化 (EQ 置換によるノード
+/// 追い出しのタイミングが早まる/遅まる) が、Stage 14-4/14-5 で確立した
+/// block_end-1 選択則の母集団 (`in_tree` 候補のブロック分割) を変えるか
+/// どうかを直接見るためのもの。`search_extra=0` のとき「今の実効長 = 残り
+/// 入力バイト数ちょうど」という司令塔仮説の最も素直な実装になる。
+pub fn compress_okumura_eof_fbound_retie_probe(
+    input: &[u8],
+    base: TaxBase,
+    search_extra: i32,
+) -> Option<(i32, usize, i32, Vec<Stage145Candidate>)> {
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut written = vec![false; N];
+    let mut write_tick = vec![0u32; N];
+    let mut tick: u32 = 0;
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    for k in 0..len {
+        written[(r as usize + k) & (N - 1)] = true;
+        write_tick[(r as usize + k) & (N - 1)] = tick;
+        tick += 1;
+    }
+
+    // f_bound(len) = min(F, max(1, len + search_extra)) — len>=F の通常時は
+    // 常に F (原典と同一、ファイル冒頭〜中盤は完全に無変更)。
+    let bound_for = |len: usize| -> usize {
+        if len >= F {
+            F
+        } else {
+            (len as i32 + search_extra).clamp(1, F as i32) as usize
+        }
+    };
+
+    st.f_bound = bound_for(len);
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut last_dump: Option<(i32, usize, i32, Vec<Stage145Candidate>)> = None;
+
+    loop {
+        // 発火判定・候補列挙そのものは Stage 14-5 と揃える (f_bound 縮小は
+        // 「木の形」だけに影響させ、比較可能性を保つ)。
+        if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+            let raw_pos = st.match_position;
+            let mut cands: Vec<Stage145Candidate> = Vec::new();
+            for p in 0..N as i32 {
+                if p == r {
+                    continue;
+                }
+                if !written[p as usize] {
+                    continue;
+                }
+                let mut ok = true;
+                for j in 0..len {
+                    if st.text_buf[p as usize + j] != st.text_buf[r as usize + j] {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let dist = ((r - p) & (N as i32 - 1)) as i32;
+                let in_tree = st.dad[p as usize] != NIL;
+                let survives_extended =
+                    st.text_buf[p as usize + len] == st.text_buf[r as usize + len];
+                cands.push(Stage145Candidate {
+                    pos: p,
+                    dist,
+                    write_tick: write_tick[p as usize],
+                    in_tree,
+                    survives_extended,
+                });
+            }
+            last_dump = Some((r, len, raw_pos, cands));
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            written[s as usize] = true;
+            write_tick[s as usize] = tick;
+            tick += 1;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.f_bound = bound_for(len);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.f_bound = bound_for(len);
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    last_dump
+}
+
 /// Stage 14-5 (Issue #14 脈: ⑲続) 診断専用。
 ///
 /// `raw_pos` (タイ再選定発火前の生 BST 探索勝者) を起点に、**実際の木構造**
