@@ -8914,6 +8914,246 @@ pub fn compress_okumura_fill00_eof_closest_to_raw_tie(input: &[u8]) -> Vec<Token
 }
 
 // ---------------------------------------------------------------------------
+// Stage 15-2 (Issue #14 脈: 既存3規則の全域再tie変種)
+// ---------------------------------------------------------------------------
+//
+// Stage 15-1 で、TF-miss=1 の新顔8本のうち4本 (V31/V32/C0E01/C0E02) の
+// 唯一の誤り決定点が、既存 `EofTieRule` (ClosestDist/FarthestDist/
+// ClosestToRawPos) のスコア式をそのまま適用すると一致することが分かった。
+// ただし8本の決定点はいずれも「残入力 = F」(EOF境界ではない、ファイル
+// 本体中盤のタイ) だったのに対し、`compress_okumura_eof_retie` は
+// `len < F` (EOF境界) のときにしか発火しない。本節はその発火条件だけを
+// ファイル全域に拡張する ("全域再tie")。**新しい比較規則・新しいスコア式は
+// 一切追加しない** — 使うのは既存3規則のみ。
+//
+// Stage 15-1 でもう1つ確立した不変条件「Leaf選択は実BST生ノード
+// (`dad[pos] != NIL`)」をここでも使う: EOF版 `compress_okumura_eof_retie`
+// は候補集合を `written[p]` (実データが一度でも書かれた ring 位置) だけで
+// 絞っていたが、全域版はそれに加えて `dad[p] != NIL` (現在も木に生存して
+// いる) を課す。EOF境界 (末尾の同色帯反復) では written 候補のほぼ全部が
+// in_tree のままなので実害がなかったが、ファイル中盤では insert_node の
+// EQ置換で木から追い出された stale な written 位置が普通に存在するため、
+// 絞り込みを省くと Stage 15-1 で確認した不変条件に反する候補まで拾って
+// しまう。
+pub enum GlobalRetieEofMode {
+    /// EOF境界 (残入力 len < F) のトークンは再tie を発火させず、
+    /// 既定の生BST探索結果をそのまま使う。
+    DefaultAtEof,
+    /// EOF境界にも同じ全域規則 (in_tree 絞り込み・同じスコア式) を
+    /// 一律適用する。`compress_okumura_eof_retie` 専用実装とは候補集合の
+    /// 絞り込み方が異なる別ロジックである点に注意。
+    SameRuleAtEof,
+}
+
+/// Stage 15-2 全域再tie変種。`compress_okumura_eof_retie` のタイ再選定
+/// ロジック (候補列挙・スコア式) を、EOF境界限定からファイル全域
+/// (残入力 = F の通常トークンも含む) に拡張しただけの追加実装。
+/// 既存関数 (`compress_okumura_eof_retie` 含む) は一切変更していない。
+pub fn compress_okumura_global_retie(
+    input: &[u8],
+    base: TaxBase,
+    tie_rule: EofTieRule,
+    eof_mode: GlobalRetieEofMode,
+) -> Vec<Token> {
+    let apply_at_eof = matches!(eof_mode, GlobalRetieEofMode::SameRuleAtEof);
+    let fill = if base == TaxBase::Fill00 { 0x00 } else { 0x20 };
+    let mut st = Okumura::new(fill);
+    st.tie_mode = TieMode::StrictGt;
+    st.init_tree();
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut written = vec![false; N];
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return out;
+    }
+    // 初期先読み充填領域 [r, r+len) は「実データ」として書込み済み扱い
+    // (`compress_okumura_eof_retie` と同一の扱い)。
+    for k in 0..len {
+        written[(r as usize + k) & (N - 1)] = true;
+    }
+
+    if base != TaxBase::NoDummy {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    loop {
+        // 全域再tie: 発火条件は「実際に Match として採用されうる長さ
+        // (> THRESHOLD)」に一般化 (EOF版の `match_length == len` という
+        // 「壁に当たった」限定条件は撤廃)。EOF境界 (len < F) は
+        // `apply_at_eof` で制御する。
+        if (st.match_length as usize) > THRESHOLD && (apply_at_eof || len >= F) {
+            let match_len = st.match_length as usize;
+            let raw_pos = st.match_position;
+            let mut best: Option<(usize, i32)> = None; // (score, pos)
+            for p in 0..N as i32 {
+                if p == r {
+                    // 自己参照 (distance=0) は除外 (EOF版と同一の理由)。
+                    continue;
+                }
+                if tie_rule == EofTieRule::ClosestToRawPos && p == raw_pos {
+                    continue;
+                }
+                if !written[p as usize] {
+                    continue;
+                }
+                // Stage 15-1 の不変条件 (a): Leaf選択は実BST生ノードのみ。
+                // EOF版にはないこの絞り込みが、全域版で新たに課す条件。
+                if st.dad[p as usize] == NIL {
+                    continue;
+                }
+                let mut ok = true;
+                for j in 0..match_len {
+                    if st.text_buf[p as usize + j] != st.text_buf[r as usize + j] {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let dist = ((r - p) & (N as i32 - 1)) as usize;
+                let score = match tie_rule {
+                    EofTieRule::ClosestDist => usize::MAX - dist,
+                    EofTieRule::FarthestDist => dist,
+                    EofTieRule::ClosestToRawPos => {
+                        let dist_to_raw = {
+                            let d = (p - raw_pos) & (N as i32 - 1);
+                            (d.min(N as i32 - d)) as usize
+                        };
+                        ((N - dist_to_raw) << 32) | (N - dist)
+                    }
+                    other => unreachable!(
+                        "Stage 15-2 は既存3規則 (ClosestDist/FarthestDist/ClosestToRawPos) \
+                         のみを対象とする。未対応規則: {:?}",
+                        other
+                    ),
+                };
+                if best.map(|(bs, _)| score > bs).unwrap_or(true) {
+                    best = Some((score, p));
+                }
+            }
+            if let Some((_, p)) = best {
+                st.match_position = p;
+                // 長さは変更しない: match_len は既に実データ範囲内で確定した
+                // 最大一致長であり (全域では EOF版のような「壁の先の phantom
+                // 延長」の必要が生じない)、pos の再選択のみを行う。
+            }
+        }
+
+        if (st.match_length as usize) <= THRESHOLD {
+            st.match_length = 1;
+            out.push(Token::Literal(st.text_buf[r as usize]));
+        } else {
+            out.push(Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            });
+        }
+
+        let last_match_length = st.match_length as usize;
+        let len_before = len;
+        let mut i = 0usize;
+        while i < last_match_length && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            written[s as usize] = true;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < last_match_length {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len = len.saturating_sub(1);
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+        if input_idx >= input.len() && last_match_length > len_before {
+            len = 0;
+        }
+        if len == 0 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// 6変種 (3規則 × EOF側の扱い2通り) の命名ラッパー。base は union の主力
+/// (`TaxBase::Basic`) に固定する (per-file チューニング禁止・1変種=1規則を
+/// 522本全部に一律適用するため)。
+pub fn compress_okumura_basic_global_closest_dist_eof_default(input: &[u8]) -> Vec<Token> {
+    compress_okumura_global_retie(
+        input,
+        TaxBase::Basic,
+        EofTieRule::ClosestDist,
+        GlobalRetieEofMode::DefaultAtEof,
+    )
+}
+pub fn compress_okumura_basic_global_closest_dist_eof_same(input: &[u8]) -> Vec<Token> {
+    compress_okumura_global_retie(
+        input,
+        TaxBase::Basic,
+        EofTieRule::ClosestDist,
+        GlobalRetieEofMode::SameRuleAtEof,
+    )
+}
+pub fn compress_okumura_basic_global_farthest_dist_eof_default(input: &[u8]) -> Vec<Token> {
+    compress_okumura_global_retie(
+        input,
+        TaxBase::Basic,
+        EofTieRule::FarthestDist,
+        GlobalRetieEofMode::DefaultAtEof,
+    )
+}
+pub fn compress_okumura_basic_global_farthest_dist_eof_same(input: &[u8]) -> Vec<Token> {
+    compress_okumura_global_retie(
+        input,
+        TaxBase::Basic,
+        EofTieRule::FarthestDist,
+        GlobalRetieEofMode::SameRuleAtEof,
+    )
+}
+pub fn compress_okumura_basic_global_closest_to_raw_eof_default(input: &[u8]) -> Vec<Token> {
+    compress_okumura_global_retie(
+        input,
+        TaxBase::Basic,
+        EofTieRule::ClosestToRawPos,
+        GlobalRetieEofMode::DefaultAtEof,
+    )
+}
+pub fn compress_okumura_basic_global_closest_to_raw_eof_same(input: &[u8]) -> Vec<Token> {
+    compress_okumura_global_retie(
+        input,
+        TaxBase::Basic,
+        EofTieRule::ClosestToRawPos,
+        GlobalRetieEofMode::SameRuleAtEof,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Stage 14-7 (Issue #14 脈: 残存戦場の TF-miss 地図)
 // ---------------------------------------------------------------------------
 //
