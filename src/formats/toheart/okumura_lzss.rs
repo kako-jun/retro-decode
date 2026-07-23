@@ -9805,6 +9805,295 @@ pub fn compress_okumura_tf_dissect(
     None
 }
 
+// --- Stage 15-3 (Issue #14 脈: TF-miss=2 27本の miss間相関) ---
+//
+// `compress_okumura_tf_dissect` は miss=1 (決定点1個) 前提の単一ターゲット版
+// だった。TF-miss=2 の27本は決定点が2個あるため、同一ファイルを2回別々に
+// teacher-forcing し直す (非効率だが、各呼び出しは独立した完全な
+// 再シミュレーションなので結果は同一) 代わりに、1回の走査で複数ターゲット
+// をまとめて拾う版を追加する。ロジックは `compress_okumura_tf_dissect` の
+// 逐語コピーであり、新しい比較規則・新しい選定規則は一切追加していない
+// (ターゲット判定を `t == target_token_idx` から `targets.contains(&t)` に
+// 変えて複数回ダンプを蓄積するだけ)。
+
+/// `compress_okumura_tf_dissect` の複数ターゲット版。`targets` に含まれる
+/// 全ての token_idx についてダンプを収集し、`targets` に現れた順ではなく
+/// トークン走査順 (昇順) の `Vec<Stage151Dump>` を返す。
+pub fn compress_okumura_tf_dissect_multi(
+    input: &[u8],
+    actual: &[Token],
+    cfg: &TfConfig,
+    targets: &[usize],
+) -> Vec<Stage151Dump> {
+    let mut results: Vec<Stage151Dump> = Vec::new();
+    if targets.is_empty() {
+        return results;
+    }
+    let max_target = *targets.iter().max().unwrap();
+
+    let mut st = Okumura::new(cfg.fill);
+    st.tie_mode = cfg.tie_mode;
+    st.bst_mode = cfg.bst_mode;
+    st.key_mode = cfg.key_mode;
+    st.cmp_mode = cfg.cmp_mode;
+    st.del_mode = cfg.del_mode;
+    st.init_tree();
+
+    let mut written = vec![false; N];
+    let mut write_tick = vec![0u32; N];
+    let mut tick: u32 = 0;
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 || actual.is_empty() || max_target >= actual.len() {
+        return results;
+    }
+    for k in 0..len {
+        let slot = (r as usize + k) & (N - 1);
+        written[slot] = true;
+        write_tick[slot] = tick;
+        tick += 1;
+    }
+
+    if cfg.dummy_init {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut decompressed_offset: usize = 0;
+
+    for (t, actual_tok) in actual.iter().enumerate() {
+        // EOF境界タイの再選定 (compress_okumura_tf と同一ロジック、逐語再利用)。
+        if let Some(tie_rule) = cfg.eof_retie {
+            if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+                let raw_pos = st.match_position;
+                let mut best: Option<(usize, i32)> = None;
+                for p in 0..N as i32 {
+                    if p == r {
+                        continue;
+                    }
+                    if tie_rule == EofTieRule::ClosestToRawPos && p == raw_pos {
+                        continue;
+                    }
+                    if !written[p as usize] {
+                        continue;
+                    }
+                    let mut ok = true;
+                    for j in 0..len {
+                        if st.text_buf[p as usize + j] != st.text_buf[r as usize + j] {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let dist = ((r - p) & (N as i32 - 1)) as usize;
+                    let score = match tie_rule {
+                        EofTieRule::ClosestDist => usize::MAX - dist,
+                        EofTieRule::FarthestDist => dist,
+                        EofTieRule::SmallestPos => usize::MAX - p as usize,
+                        EofTieRule::LargestPos => p as usize,
+                        EofTieRule::MostRecentWrite => write_tick[p as usize] as usize,
+                        EofTieRule::LeastRecentWrite => usize::MAX - write_tick[p as usize] as usize,
+                        EofTieRule::MaxPhantomExtension => {
+                            let mut j = len;
+                            while j < F && st.text_buf[p as usize + j] == st.text_buf[r as usize + j] {
+                                j += 1;
+                            }
+                            (j << 16) | (usize::MAX - dist).min(0xffff)
+                        }
+                        EofTieRule::ClosestToRawPos => {
+                            let dist_to_raw = {
+                                let d = (p - raw_pos) & (N as i32 - 1);
+                                (d.min(N as i32 - d)) as usize
+                            };
+                            ((N - dist_to_raw) << 32) | (N - dist)
+                        }
+                    };
+                    if best.map(|(bs, _)| score > bs).unwrap_or(true) {
+                        best = Some((score, p));
+                    }
+                }
+                if let Some((_, p)) = best {
+                    st.match_position = p;
+                    st.match_length = (len as i32 + 1).min(F as i32);
+                }
+            }
+        }
+
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let cap = if cfg.tail1_rle_plus1 && is_rle {
+            (len + 1).min(F)
+        } else {
+            len
+        };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+
+        let predicted = if (st.match_length as usize) <= THRESHOLD {
+            Token::Literal(st.text_buf[r as usize])
+        } else {
+            Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            }
+        };
+
+        if targets.contains(&t) {
+            let raw_pos = st.match_position & (N as i32 - 1);
+            let alen = match actual_tok {
+                Token::Match { len, .. } => *len as usize,
+                Token::Literal(_) => 0,
+            };
+            let mut candidates: Vec<Stage151Candidate> = Vec::new();
+            if alen > 0 {
+                for p in 0..N as i32 {
+                    if p == r || !written[p as usize] {
+                        continue;
+                    }
+                    let mut ok = true;
+                    for j in 0..alen {
+                        if st.text_buf[p as usize + j] != st.text_buf[r as usize + j] {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let raw_dist = (r - p) & (N as i32 - 1);
+                    let ring_dist = raw_dist.min(N as i32 - raw_dist);
+                    let in_tree = st.dad[p as usize] != NIL;
+                    let inorder_rank = if in_tree {
+                        let mut rank = 0usize;
+                        let mut q = p;
+                        let mut guard = 0u32;
+                        loop {
+                            q = st.inorder_predecessor(q);
+                            if q == NIL {
+                                break;
+                            }
+                            rank += 1;
+                            guard += 1;
+                            if guard > N as u32 {
+                                break;
+                            }
+                        }
+                        Some(rank)
+                    } else {
+                        None
+                    };
+                    candidates.push(Stage151Candidate {
+                        pos: p,
+                        raw_dist,
+                        ring_dist,
+                        in_tree,
+                        write_tick: write_tick[p as usize],
+                        dad: st.dad[p as usize],
+                        lson: st.lson[p as usize],
+                        rson: st.rson[p as usize],
+                        inorder_rank,
+                    });
+                }
+            }
+
+            let mut eof_rule_winner: Vec<(&'static str, Option<i32>)> = Vec::new();
+            for (name, rule) in [
+                ("ClosestDist", EofTieRule::ClosestDist),
+                ("FarthestDist", EofTieRule::FarthestDist),
+                ("ClosestToRawPos", EofTieRule::ClosestToRawPos),
+            ] {
+                let mut best: Option<(usize, i32)> = None;
+                for c in &candidates {
+                    if rule == EofTieRule::ClosestToRawPos && c.pos == raw_pos {
+                        continue;
+                    }
+                    let dist = c.raw_dist as usize;
+                    let score = match rule {
+                        EofTieRule::ClosestDist => usize::MAX - dist,
+                        EofTieRule::FarthestDist => dist,
+                        EofTieRule::ClosestToRawPos => {
+                            let d = (c.pos - raw_pos) & (N as i32 - 1);
+                            let dist_to_raw = (d.min(N as i32 - d)) as usize;
+                            ((N - dist_to_raw) << 32) | (N - dist)
+                        }
+                        _ => unreachable!("only 3 EofTieRule variants are dispatched here"),
+                    };
+                    if best.map(|(bs, _)| score > bs).unwrap_or(true) {
+                        best = Some((score, c.pos));
+                    }
+                }
+                eof_rule_winner.push((name, best.map(|(_, p)| p)));
+            }
+
+            results.push(Stage151Dump {
+                token_idx: t,
+                decompressed_offset,
+                residual: len,
+                predicted,
+                actual: *actual_tok,
+                raw_pos,
+                r,
+                candidates,
+                eof_rule_winner,
+            });
+
+            if results.len() == targets.len() {
+                return results;
+            }
+        }
+
+        let advance_len: usize = match actual_tok {
+            Token::Literal(_) => 1,
+            Token::Match { len: l, .. } => *l as usize,
+        };
+        decompressed_offset += advance_len;
+
+        let mut i = 0usize;
+        while i < advance_len && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            written[s as usize] = true;
+            write_tick[s as usize] = tick;
+            tick += 1;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < advance_len && len > 0 {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
