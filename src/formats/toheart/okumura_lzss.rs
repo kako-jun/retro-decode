@@ -8913,6 +8913,319 @@ pub fn compress_okumura_fill00_eof_closest_to_raw_tie(input: &[u8]) -> Vec<Token
     compress_okumura_eof_retie(input, TaxBase::Fill00, EofTieRule::ClosestToRawPos)
 }
 
+// ---------------------------------------------------------------------------
+// Stage 14-7 (Issue #14 脈: 残存戦場の TF-miss 地図)
+// ---------------------------------------------------------------------------
+//
+// near-miss 台帳 (Stage 14-2, `match_prefix_len`/`remaining_tokens`) は
+// 「最初の相違以降トークン列全体が生成しっぱなし」の自走比較であり、1個の
+// 誤選択が下流の BST 状態を丸ごとずらす雪崩効果を含む (真の難易度を過小に
+// 見せる)。ここでは既存の `Okumura` 状態機械・`insert_node`/`delete_node`・
+// 既存の `TieMode`/`BstMode`/`KeyMode`/`CmpMode`/`DelMode`/`EofTieRule` を
+// **一切変更せず**、外側のループだけを teacher-forcing 化する: 各トークン
+// 決定点で「現行設定がこの木の状態から選ぶトークン」と Leaf 実トークンを
+// 比較して不一致 (TF-miss) を数えるが、次の状態遷移 (ring 消費・delete_node
+// /insert_node) は Leaf 実トークンの長さで進める (誤選択の連鎖を切る)。
+// 新しいタイブレイク規則・新しいエンコーダ変種は一切追加していない
+// (既存軸の組み合わせを teacher-forcing で駆動するだけの診断)。
+
+/// TF-miss 計測対象の1変種設定。既存の `Okumura` フィールドの組み合わせを
+/// 名指しするだけで、新しい決定規則は含まない。
+#[derive(Clone, Copy, Debug)]
+pub struct TfConfig {
+    pub name: &'static str,
+    pub fill: u8,
+    pub dummy_init: bool,
+    pub tie_mode: TieMode,
+    pub bst_mode: BstMode,
+    pub key_mode: KeyMode,
+    pub cmp_mode: CmpMode,
+    pub del_mode: DelMode,
+    /// `compress_okumura_*_tail1*` 系と同じ規則: RLE 候補 (match_position ==
+    /// r-1) のときだけ cap を `len+1` (F 上限) にする。false なら常に cap=len
+    /// (`compress_okumura`/`compress_okumura_no_dummy` と同じ Clip)。
+    pub tail1_rle_plus1: bool,
+    /// `compress_okumura_eof_retie` と同じ EOF 境界タイ再選定規則 (Some のとき
+    /// のみ発火条件・スコア式とも既存実装を逐語再利用)。
+    pub eof_retie: Option<EofTieRule>,
+    /// true のとき、不一致点ごとに「実データのみで actual トークンと同じ長さ
+    /// に達する書込み済み候補数」を追加の O(N) 走査で数える (診断コスト付き、
+    /// 既定は false で通常の全件走査には使わない)。
+    pub count_ties: bool,
+}
+
+/// 1個の TF-miss の文脈。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TfMissKind {
+    /// 片方が Literal・もう片方が Match (トークン種別自体が違う)。
+    LiteralVsMatch,
+    /// 両方 Literal だがバイト値が違う (理論上は起こらないはずだが記録目的で残す)。
+    LiteralValueDiff,
+    /// 両方 Match・len は一致・pos だけ違う。
+    PosDiffOnly,
+    /// 両方 Match・len が違う (pos も違いうる)。
+    LenDiff,
+}
+
+#[derive(Debug, Clone)]
+pub struct TfMissEvent {
+    pub token_idx: usize,
+    pub total_tokens: usize,
+    /// このトークンを出す時点でのリング先読みバッファ残量 (`len`)。`F` 未満
+    /// なら EOF 近傍局面 (原典の一括ダミー窓が使い切れない領域) とみなす。
+    pub remaining_input: usize,
+    pub predicted: Token,
+    pub actual: Token,
+    pub kind: TfMissKind,
+    /// `count_ties=true` のときのみ Some。actual が Match のときだけ意味を持つ
+    /// (実データ一致で同じ長さに達する書込み済み候補数、raw_pos 自身を含む)。
+    pub tie_candidates: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TfResult {
+    pub total_tokens: usize,
+    pub miss_count: usize,
+    /// 不一致イベントの記録 (`TF_EVENT_CAP` 件まで、それ以降は miss_count
+    /// だけ数え続けメモリを抑える)。
+    pub events: Vec<TfMissEvent>,
+}
+
+const TF_EVENT_CAP: usize = 4096;
+
+/// teacher-forced miss 計測の共通ドライバ。`cfg` は既存の決定規則の組み合わせを
+/// 指すだけで、木構造・比較ロジック・EOF タイ規則は既存実装 (`insert_node` /
+/// `delete_node` / `compress_okumura_eof_retie` 相当) をそのまま呼ぶ。
+/// 状態遷移だけを `actual` (Leaf 実トークン列) の長さで駆動する。
+pub fn compress_okumura_tf(input: &[u8], actual: &[Token], cfg: &TfConfig) -> TfResult {
+    let mut st = Okumura::new(cfg.fill);
+    st.tie_mode = cfg.tie_mode;
+    st.bst_mode = cfg.bst_mode;
+    st.key_mode = cfg.key_mode;
+    st.cmp_mode = cfg.cmp_mode;
+    st.del_mode = cfg.del_mode;
+    st.init_tree();
+
+    // written/write_tick は eof_retie の発火条件判定・count_ties の走査どちらでも
+    // 必要になりうるので常に維持する (コストは O(N) の配列2本のみ)。
+    let mut written = vec![false; N];
+    let mut write_tick = vec![0u32; N];
+    let mut tick: u32 = 0;
+
+    let mut r: i32 = (N - F) as i32;
+    let mut s: i32 = 0;
+    let mut input_idx: usize = 0;
+    let mut len: usize = 0;
+    while len < F && input_idx < input.len() {
+        st.text_buf[r as usize + len] = input[input_idx];
+        input_idx += 1;
+        len += 1;
+    }
+    if len == 0 || actual.is_empty() {
+        return TfResult {
+            total_tokens: actual.len(),
+            miss_count: 0,
+            events: Vec::new(),
+        };
+    }
+    for k in 0..len {
+        let slot = (r as usize + k) & (N - 1);
+        written[slot] = true;
+        write_tick[slot] = tick;
+        tick += 1;
+    }
+
+    if cfg.dummy_init {
+        for i in 1..=F {
+            st.insert_node(r - i as i32);
+        }
+    }
+    st.insert_node(r);
+
+    let mut events: Vec<TfMissEvent> = Vec::new();
+    let mut miss_count = 0usize;
+
+    for (t, actual_tok) in actual.iter().enumerate() {
+        // EOF境界タイの再選定 (compress_okumura_eof_retie と同一ロジック)。
+        if let Some(tie_rule) = cfg.eof_retie {
+            if len < F && (st.match_length as usize) == len && len > THRESHOLD {
+                let raw_pos = st.match_position;
+                let mut best: Option<(usize, i32)> = None;
+                for p in 0..N as i32 {
+                    if p == r {
+                        continue;
+                    }
+                    if tie_rule == EofTieRule::ClosestToRawPos && p == raw_pos {
+                        continue;
+                    }
+                    if !written[p as usize] {
+                        continue;
+                    }
+                    let mut ok = true;
+                    for j in 0..len {
+                        if st.text_buf[p as usize + j] != st.text_buf[r as usize + j] {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let dist = ((r - p) & (N as i32 - 1)) as usize;
+                    let score = match tie_rule {
+                        EofTieRule::ClosestDist => usize::MAX - dist,
+                        EofTieRule::FarthestDist => dist,
+                        EofTieRule::SmallestPos => usize::MAX - p as usize,
+                        EofTieRule::LargestPos => p as usize,
+                        EofTieRule::MostRecentWrite => write_tick[p as usize] as usize,
+                        EofTieRule::LeastRecentWrite => usize::MAX - write_tick[p as usize] as usize,
+                        EofTieRule::MaxPhantomExtension => {
+                            let mut j = len;
+                            while j < F && st.text_buf[p as usize + j] == st.text_buf[r as usize + j] {
+                                j += 1;
+                            }
+                            (j << 16) | (usize::MAX - dist).min(0xffff)
+                        }
+                        EofTieRule::ClosestToRawPos => {
+                            let dist_to_raw = {
+                                let d = (p - raw_pos) & (N as i32 - 1);
+                                (d.min(N as i32 - d)) as usize
+                            };
+                            ((N - dist_to_raw) << 32) | (N - dist)
+                        }
+                    };
+                    if best.map(|(bs, _)| score > bs).unwrap_or(true) {
+                        best = Some((score, p));
+                    }
+                }
+                if let Some((_, p)) = best {
+                    st.match_position = p;
+                    st.match_length = (len as i32 + 1).min(F as i32);
+                }
+            }
+        }
+
+        // cap (tail1_rle_plus1 と通常 Clip の切り替え。既存 tail1 系と同一規則)。
+        let mp = (st.match_position & (N as i32 - 1)) as usize;
+        let r_minus_1 = ((r - 1 + N as i32) & (N as i32 - 1)) as usize;
+        let is_rle = mp == r_minus_1;
+        let cap = if cfg.tail1_rle_plus1 && is_rle {
+            (len + 1).min(F)
+        } else {
+            len
+        };
+        if st.match_length as usize > cap {
+            st.match_length = cap as i32;
+        }
+
+        let predicted = if (st.match_length as usize) <= THRESHOLD {
+            Token::Literal(st.text_buf[r as usize])
+        } else {
+            Token::Match {
+                pos: (st.match_position as u16) & ((N as u16) - 1),
+                len: st.match_length as u8,
+            }
+        };
+
+        if predicted != *actual_tok {
+            miss_count += 1;
+            let kind = match (&predicted, actual_tok) {
+                (Token::Literal(a), Token::Literal(b)) => {
+                    debug_assert_ne!(a, b);
+                    TfMissKind::LiteralValueDiff
+                }
+                (Token::Match { len: l1, .. }, Token::Match { len: l2, .. }) => {
+                    if l1 == l2 {
+                        TfMissKind::PosDiffOnly
+                    } else {
+                        TfMissKind::LenDiff
+                    }
+                }
+                _ => TfMissKind::LiteralVsMatch,
+            };
+            let tie_candidates = if cfg.count_ties {
+                match actual_tok {
+                    Token::Match { len: alen, .. } => {
+                        let alen = *alen as usize;
+                        let mut count = 0usize;
+                        for p in 0..N {
+                            if p == r as usize || !written[p] {
+                                continue;
+                            }
+                            let mut ok = true;
+                            for j in 0..alen {
+                                if st.text_buf[p + j] != st.text_buf[r as usize + j] {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                count += 1;
+                            }
+                        }
+                        Some(count)
+                    }
+                    Token::Literal(_) => None,
+                }
+            } else {
+                None
+            };
+            if events.len() < TF_EVENT_CAP {
+                events.push(TfMissEvent {
+                    token_idx: t,
+                    total_tokens: actual.len(),
+                    remaining_input: len,
+                    predicted,
+                    actual: *actual_tok,
+                    kind,
+                    tie_candidates,
+                });
+            }
+        }
+
+        // teacher forcing: 次状態への遷移は Leaf 実トークンの長さで駆動する
+        // (現行設定の予測が外れても、以降の判定はここで正しい木の状態から再開する)。
+        let advance_len: usize = match actual_tok {
+            Token::Literal(_) => 1,
+            Token::Match { len: l, .. } => *l as usize,
+        };
+
+        let mut i = 0usize;
+        while i < advance_len && input_idx < input.len() {
+            st.delete_node(s);
+            let c = input[input_idx];
+            input_idx += 1;
+            st.text_buf[s as usize] = c;
+            written[s as usize] = true;
+            write_tick[s as usize] = tick;
+            tick += 1;
+            if (s as usize) < F - 1 {
+                st.text_buf[s as usize + N] = c;
+            }
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            st.insert_node(r);
+            i += 1;
+        }
+        while i < advance_len && len > 0 {
+            st.delete_node(s);
+            s = (s + 1) & (N as i32 - 1);
+            r = (r + 1) & (N as i32 - 1);
+            len -= 1;
+            if len > 0 {
+                st.insert_node(r);
+            }
+            i += 1;
+        }
+    }
+
+    TfResult {
+        total_tokens: actual.len(),
+        miss_count,
+        events,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
